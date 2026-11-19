@@ -1,0 +1,461 @@
+//! Transport cases: the injected seams, the pinned handshake, the idle timer and
+//! the rebind.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use mahbot_peers::identity::Identity;
+use mahbot_peers::net::{DEFAULT_IDLE_TIMEOUT, Transport, TransportError};
+use mahbot_peers::tls::{ALPN, PeerPolicy};
+use quinn::AsyncUdpSocket;
+
+use crate::clock::{DRIVE_YIELDS, block_on};
+use crate::connect::{
+    ConnectError, Pair, SERVER_NAME, TrustSet, connect, connect_by, connect_over,
+};
+use crate::link::{AddressTaken, Fault, FaultPlan, Rates};
+use crate::machine::Machine;
+use crate::sim::Sim;
+
+use super::support::{endpoint_over, io_error, server_tls, within};
+
+pub(crate) fn endpoint_from_injected_seams() -> Result<(), String> {
+    block_on(async {
+        let sim = Sim::new().map_err(io_error)?;
+        let socket = sim.link().attach_next();
+        let addr = socket.addr();
+        let endpoint = Transport::default()
+            .endpoint(
+                Arc::clone(&socket) as Arc<dyn AsyncUdpSocket>,
+                sim.clock().runtime(),
+                &Identity::generate(),
+                Arc::new(TrustSet::default()),
+            )
+            .map_err(|error| error.to_string())?;
+        let local = endpoint.local_addr().map_err(|error| error.to_string())?;
+        if local != addr {
+            return Err(format!(
+                "the endpoint reports {local} but the injected socket is at {addr}"
+            ));
+        }
+        if sim.link().trace().iter().any(|event| event.delivered()) {
+            return Err("building an endpoint delivered a datagram".to_owned());
+        }
+        Ok(())
+    })
+}
+
+pub(crate) fn idle_timeout_bounds() -> Result<(), String> {
+    block_on(async {
+        let sim = Sim::new().map_err(io_error)?;
+        let socket = sim.link().attach_next();
+        let transport = Transport {
+            idle_timeout: Duration::MAX,
+        };
+        match transport.endpoint(
+            Arc::clone(&socket) as Arc<dyn AsyncUdpSocket>,
+            sim.clock().runtime(),
+            &Identity::generate(),
+            Arc::new(TrustSet::default()),
+        ) {
+            Err(TransportError::IdleTimeout) => {}
+            other => {
+                return Err(format!(
+                    "an unrepresentable idle timeout was accepted: {other:?}"
+                ));
+            }
+        }
+        let message = TransportError::IdleTimeout.to_string();
+        if !message.contains("idle timeout") {
+            return Err(format!("the refusal reads `{message}`"));
+        }
+        Ok(())
+    })
+}
+
+pub(crate) fn concurrent_dialers_pair_correctly() -> Result<(), String> {
+    block_on(async {
+        let sim = Sim::new().map_err(io_error)?;
+        let first = sim.machine().map_err(io_error)?;
+        let second = sim.machine().map_err(io_error)?;
+        let server = sim.machine().map_err(io_error)?;
+        for client in [&first, &second] {
+            client.trust(&server);
+            server.trust(client);
+        }
+        let (one, two) = tokio::join!(connect(&first, &server), connect(&second, &server));
+        let one = one.map_err(|error| error.to_string())?;
+        let two = two.map_err(|error| error.to_string())?;
+        if one.server.remote_address() != first.addr()
+            || two.server.remote_address() != second.addr()
+        {
+            return Err(format!(
+                "a dialer received the other's connection: {} and {}",
+                one.server.remote_address(),
+                two.server.remote_address()
+            ));
+        }
+        // The halves must belong to the same connection, not merely to the same
+        // pair of addresses: a datagram sent on one half must arrive on the
+        // other.
+        for (pair, payload) in [(&one, b"one"), (&two, b"two")] {
+            pair.client
+                .send_datagram(payload.as_slice().into())
+                .map_err(|error| error.to_string())?;
+            let received = within(&sim, Duration::from_secs(1), pair.server.read_datagram())
+                .await?
+                .map_err(|error| error.to_string())?;
+            if &received[..] != payload {
+                return Err(format!(
+                    "a datagram arrived on the wrong connection as {received:?}"
+                ));
+            }
+        }
+        Ok(())
+    })
+}
+
+pub(crate) fn pinned_handshake() -> Result<(), String> {
+    block_on(async {
+        let sim = Sim::new().map_err(io_error)?;
+        let (client, server) = sim.trusting_pair().map_err(io_error)?;
+        let pair = connect(&client, &server).await.map_err(|e| e.to_string())?;
+        if pair.server.remote_address() != client.addr() {
+            return Err(format!(
+                "the server sees {} but the client is at {}",
+                pair.server.remote_address(),
+                client.addr()
+            ));
+        }
+        pair.client
+            .send_datagram(b"hello".as_slice().into())
+            .map_err(|e| e.to_string())?;
+        let received = within(&sim, Duration::from_secs(1), pair.server.read_datagram())
+            .await?
+            .map_err(|e| e.to_string())?;
+        if &received[..] != b"hello" {
+            return Err(format!("the datagram arrived as {received:?}"));
+        }
+        Ok(())
+    })
+}
+
+pub(crate) fn untrusted_peer_is_refused() -> Result<(), String> {
+    block_on(async {
+        // The server does not trust the client.
+        let sim = Sim::new().map_err(io_error)?;
+        let client = sim.machine().map_err(io_error)?;
+        let server = sim.machine().map_err(io_error)?;
+        client.trust(&server);
+        match connect(&client, &server).await {
+            Ok(_) => {
+                return Err(
+                    "a handshake completed with a client the server does not trust".to_owned(),
+                );
+            }
+            Err(ConnectError::Connection(_)) => {}
+            Err(other) => return Err(format!("the refusal came from the wrong layer: {other}")),
+        }
+
+        // The client does not trust the server.
+        let sim = Sim::new().map_err(io_error)?;
+        let client = sim.machine().map_err(io_error)?;
+        let server = sim.machine().map_err(io_error)?;
+        server.trust(&client);
+        match connect(&client, &server).await {
+            Ok(_) => {
+                Err("a handshake completed with a server the client does not trust".to_owned())
+            }
+            Err(ConnectError::Connection(_)) => Ok(()),
+            Err(other) => Err(format!("the refusal came from the wrong layer: {other}")),
+        }
+    })
+}
+
+pub(crate) fn machine_address_can_change() -> Result<(), String> {
+    block_on(async {
+        let sim = Sim::new().map_err(io_error)?;
+        let (client, server) = sim.trusting_pair().map_err(io_error)?;
+        connect(&client, &server).await.map_err(|e| e.to_string())?;
+        let cutoff = sim.link().trace().len();
+        let before = client.addr();
+        let target = sim.link().alloc_addr();
+        if target == before {
+            return Err("the link handed out the address the client already holds".to_owned());
+        }
+        client.rebind(target).map_err(|error| error.to_string())?;
+        if client.addr() != target {
+            return Err(format!(
+                "an explicit rebind to {target} left the client at {}",
+                client.addr()
+            ));
+        }
+        match client.rebind(server.addr()) {
+            Err(AddressTaken(addr)) if addr == server.addr() => {}
+            other => {
+                return Err(format!(
+                    "a rebind onto the server's live address was not refused: {other:?}"
+                ));
+            }
+        }
+        let after = client.rebind_next();
+        if after == target || client.addr() != after {
+            return Err(format!(
+                "the second rebind did not move the address: {target} then {}",
+                client.addr()
+            ));
+        }
+        let pair = connect(&client, &server).await.map_err(|e| e.to_string())?;
+        if pair.server.remote_address() != after {
+            return Err(format!(
+                "after the rebind the server sees {} not {after}",
+                pair.server.remote_address()
+            ));
+        }
+        let trace = sim.link().trace();
+        if trace.len() <= cutoff {
+            return Err("the second connection sent nothing".to_owned());
+        }
+        if trace[cutoff..].iter().any(|event| event.from == target) {
+            return Err("a datagram still carried the address the client left".to_owned());
+        }
+        if !trace[cutoff..].iter().any(|event| event.from == after) {
+            return Err("no datagram carried the new address".to_owned());
+        }
+        Ok(())
+    })
+}
+
+/// Drive a connected pair to just before `timeout` and past it: it must still be
+/// open at `timeout - 1 s` and `TimedOut` at `timeout + 1 s`, on both ends. This
+/// is where the transport's timer meets the injected clock.
+async fn assert_idle_timeout(sim: &Sim, pair: &Pair, timeout: Duration) -> Result<(), String> {
+    if pair.client.close_reason().is_some() {
+        return Err("the connection closed before time moved".to_owned());
+    }
+    sim.clock().advance(timeout - Duration::from_secs(1)).await;
+    if pair.client.close_reason().is_some() {
+        return Err(format!(
+            "the connection closed before its {timeout:?} idle timeout"
+        ));
+    }
+    sim.clock().advance(Duration::from_secs(2)).await;
+    match pair.client.close_reason() {
+        Some(quinn::ConnectionError::TimedOut) => {}
+        other => {
+            return Err(format!(
+                "the idle timeout did not fire when the clock advanced: {other:?}"
+            ));
+        }
+    }
+    if pair.server.close_reason().is_none() {
+        return Err("the other end did not observe the idle timeout".to_owned());
+    }
+    Ok(())
+}
+
+pub(crate) fn transport_timer_follows_clock() -> Result<(), String> {
+    block_on(async {
+        let sim = Sim::new().map_err(io_error)?;
+        let idle = Duration::from_secs(5);
+        let (client, server) = sim.trusting_pair().map_err(io_error)?;
+        let client = client.with_idle_timeout(idle);
+        let server = server.with_idle_timeout(idle);
+        let pair = connect(&client, &server).await.map_err(|e| e.to_string())?;
+        assert_idle_timeout(&sim, &pair, idle).await
+    })
+}
+
+pub(crate) fn default_idle_timeout_applies() -> Result<(), String> {
+    block_on(async {
+        let sim = Sim::new().map_err(io_error)?;
+        let (client, server) = sim.trusting_pair().map_err(io_error)?;
+        let pair = connect(&client, &server).await.map_err(|e| e.to_string())?;
+        assert_idle_timeout(&sim, &pair, DEFAULT_IDLE_TIMEOUT).await
+    })
+}
+
+pub(crate) fn connect_times_out_on_a_dead_link() -> Result<(), String> {
+    block_on(async {
+        let sim = Sim::new().map_err(io_error)?;
+        let (client, server) = sim.trusting_pair().map_err(io_error)?;
+        // Every datagram is dropped, so the handshake can only end when its
+        // virtual budget runs out.
+        sim.link().set_plan(FaultPlan::Seeded {
+            seed: 1,
+            rates: Rates {
+                drop: 100,
+                ..Rates::default()
+            },
+        });
+        let budget = Duration::from_secs(1);
+        let started = sim.clock().elapsed();
+        match connect_by(&client, &server, budget).await {
+            Err(ConnectError::TimedOut { budget: spent_on }) if spent_on == budget => {}
+            other => {
+                return Err(format!(
+                    "a link that drops everything did not time out: {other:?}"
+                ));
+            }
+        }
+        let spent = sim.clock().elapsed() - started;
+        if spent != budget {
+            return Err(format!(
+                "the attempt gave up after {spent:?}, not at its {budget:?} budget"
+            ));
+        }
+        if sim.link().trace().iter().any(|event| event.delivered()) {
+            return Err("a datagram was delivered on a link that drops everything".to_owned());
+        }
+        Ok(())
+    })
+}
+
+pub(crate) fn retry_after_a_timeout() -> Result<(), String> {
+    block_on(async {
+        let sim = Sim::new().map_err(io_error)?;
+        let (client, server) = sim.trusting_pair().map_err(io_error)?;
+        server.start_accepting().await.map_err(|e| e.to_string())?;
+        // Two dials abandoned before an attempt takes their half: the server
+        // files both under the client's address, and the newer one replaces the
+        // older rather than accumulating.
+        abandon_dial(&client, &server).await?;
+        abandon_dial(&client, &server).await?;
+        if server.inbox.len() > 1 {
+            return Err(format!(
+                "the server filed {} connections for one dialer",
+                server.inbox.len()
+            ));
+        }
+        // The client's first datagram gets through, so the server holds a
+        // half-finished connection; the server's answer is late, so the client
+        // gives up with that half still on the server's side.
+        sim.link().set_plan(FaultPlan::Scripted(vec![
+            Vec::new(),
+            vec![Fault::Delay(Duration::from_millis(50))],
+        ]));
+        match connect_by(&client, &server, Duration::from_millis(10)).await {
+            Err(ConnectError::TimedOut { .. }) => {}
+            other => {
+                return Err(format!(
+                    "an attempt with no answer did not time out: {other:?}"
+                ));
+            }
+        }
+        sim.link().set_plan(FaultPlan::Clean);
+        let pair = connect(&client, &server)
+            .await
+            .map_err(|error| format!("the retry after a timeout failed: {error}"))?;
+        if pair.server.remote_address() != client.addr() {
+            return Err(format!(
+                "the retry paired {} with {}",
+                pair.server.remote_address(),
+                client.addr()
+            ));
+        }
+        // And it is a working connection, not merely a handshake.
+        pair.client
+            .send_datagram(b"retry".as_slice().into())
+            .map_err(|error| error.to_string())?;
+        let received = within(&sim, Duration::from_secs(1), pair.server.read_datagram())
+            .await?
+            .map_err(|error| error.to_string())?;
+        if &received[..] != b"retry" {
+            return Err(format!("the retried pair carried {received:?}"));
+        }
+        if !server.inbox.is_empty() {
+            return Err("the server kept an entry after the attempt took its own".to_owned());
+        }
+        Ok(())
+    })
+}
+
+/// Start a handshake and drop it before the server's half is taken.
+async fn abandon_dial(client: &Machine, server: &Machine) -> Result<(), String> {
+    let client_endpoint = client.endpoint().map_err(|error| error.to_string())?;
+    let dial = client_endpoint
+        .connect(server.addr(), SERVER_NAME)
+        .map_err(|error| error.to_string())?;
+    tokio::pin!(dial);
+    for _ in 0..DRIVE_YIELDS {
+        tokio::select! {
+            biased;
+            _ = &mut dial => return Err("an abandoned handshake completed without an accept".to_owned()),
+            () = tokio::task::yield_now() => {}
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn alpn_mismatch_is_refused() -> Result<(), String> {
+    block_on(async {
+        let sim = Sim::new().map_err(io_error)?;
+        let (client, server) = sim.trusting_pair().map_err(io_error)?;
+        // Both of the library's configurations offer the crate's protocol and
+        // nothing else.
+        let policy: Arc<dyn PeerPolicy> = Arc::new(TrustSet::default());
+        let client_alpn = mahbot_peers::tls::client_config(&client.identity, Arc::clone(&policy))
+            .map_err(|error| error.to_string())?
+            .alpn_protocols;
+        let server_alpn = mahbot_peers::tls::server_config(&server.identity, policy)
+            .map_err(|error| error.to_string())?
+            .alpn_protocols;
+        for (side, alpn) in [("client", client_alpn), ("server", server_alpn)] {
+            if alpn != vec![ALPN.to_vec()] {
+                return Err(format!(
+                    "the {side} configuration offers {alpn:?}, not the crate's ALPN"
+                ));
+            }
+        }
+        // A server that speaks another protocol must not complete a handshake,
+        // even though both sides pin each other's key.
+        let mut tls = server_tls(&server)?;
+        tls.alpn_protocols = vec![b"mahbot-peers/other".to_vec()];
+        let endpoint = endpoint_over(&sim, &server, tls)?;
+        match connect_over(&client, &server, &endpoint, Duration::from_secs(2)).await {
+            Ok(_) => Err("a peer speaking another ALPN completed the handshake".to_owned()),
+            Err(ConnectError::Connection(_)) => Ok(()),
+            Err(other) => Err(format!("the refusal came from the wrong layer: {other}")),
+        }
+    })
+}
+
+pub(crate) fn closed_custom_endpoint_is_reported() -> Result<(), String> {
+    block_on(async {
+        let sim = Sim::new().map_err(io_error)?;
+        let (client, server) = sim.trusting_pair().map_err(io_error)?;
+        let endpoint = endpoint_over(&sim, &server, server_tls(&server)?)?;
+        endpoint.close(0u32.into(), b"closed by the case");
+        match connect_over(&client, &server, &endpoint, Duration::from_secs(1)).await {
+            Err(ConnectError::Closed) => Ok(()),
+            other => Err(format!(
+                "a closed endpoint was not reported as closed: {other:?}"
+            )),
+        }
+    })
+}
+
+pub(crate) fn retry_after_an_abandoned_attempt() -> Result<(), String> {
+    block_on(async {
+        let sim = Sim::new().map_err(io_error)?;
+        let (client, server) = sim.trusting_pair().map_err(io_error)?;
+        // A server endpoint with no accept task: its half of a handshake is
+        // queued and never taken, so the client cannot finish.
+        let endpoint = endpoint_over(&sim, &server, server_tls(&server)?)?;
+        // Start a handshake and abandon it. The server keeps its half until an
+        // accept task takes it, and the abort is what the next attempt must
+        // refuse to take for its own.
+        abandon_dial(&client, &server).await?;
+        let pair = connect_over(&client, &server, &endpoint, Duration::from_secs(2))
+            .await
+            .map_err(|error| format!("the retry after an abandoned attempt failed: {error}"))?;
+        if pair.server.remote_address() != client.addr() {
+            return Err(format!(
+                "the retry paired {} with {}",
+                pair.server.remote_address(),
+                client.addr()
+            ));
+        }
+        Ok(())
+    })
+}

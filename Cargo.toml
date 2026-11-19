@@ -1,0 +1,42 @@
+[package]
+name = "mahbot-peers"
+version = "0.1.0"
+authors = ["edezhic <edezhic@gmail.com>"]
+description = "Direct peer layer between mahbot instances: identity, QUIC transport over raw public keys, rendezvous and delivery."
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/edezhic/mahbot-peers"
+homepage = "https://github.com/edezhic/mahbot-peers"
+readme = "README.md"
+keywords = ["p2p", "quic", "agent"]
+categories = ["network-programming"]
+rust-version = "1.96"
+# Not part of the package the registry builds: the test harness, this checkout's
+# toolchain file, its ignore list and the plan kept beside it.
+exclude = [
+    ".DS_Store",
+    ".gitignore",
+    "PLAN.md",
+    "harness",
+    "rust-toolchain.toml",
+]
+
+[workspace]
+members = ["harness"]
+# A workspace root that is also a package defaults to itself alone, which would
+# leave `cargo test` at the root running the library and skipping the harness.
+default-members = [".", "harness"]
+
+[dependencies]
+# QUIC over rustls with raw public keys (RFC 7250). No runtime feature: the
+# library is handed a `quinn::Runtime` and a socket by its caller, and must not
+# pull a runtime (or a timer driver) into a consumer's graph.
+quinn = { version = "0.11.12", default-features = false, features = ["rustls-ring"] }
+# Not an API: a floor. 0.11.19 is the lowest `quinn-proto` release with no open
+# RustSec advisory, and naming it here keeps a lock update from settling below
+# it. Default features are off so the pin does not turn on the `bloom`/`log` set
+# that `quinn` deliberately leaves off.
+quinn-proto = { version = "0.11.19", default-features = false }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
+ring = "0.17.14"
+async-trait = "0.1"

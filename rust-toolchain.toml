@@ -1,0 +1,7 @@
+# The compiler every build in this checkout uses. It is the channel the other
+# mahbot workspaces build with, not this crate's MSRV: `rust-version` in
+# `Cargo.toml` stays at 1.96, the product's floor, so the crate keeps building
+# wherever the product still does.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
