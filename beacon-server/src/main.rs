@@ -50,7 +50,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // The key is configuration, not state: the protocol never writes it, and a
     // restart must keep the same identity or every client's pin breaks. The rules
     // are the library's — one create, published only if the name is free, and a
-    // file other accounts can reach is refused rather than used. The beacon's key
+    // file the rule does not allow is refused rather than used. The beacon's key
     // is `identity.key` in the directory on the command line, the same name and the
     // same format as a machine's.
     let identity = keyfile::load_or_create(&config.root)?;

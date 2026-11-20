@@ -349,7 +349,7 @@ macro_rules! first_run {
 }
 macro_rules! protected_list {
     () => {
-        "icacls \"%key%\" /inheritance:r /grant:r \"%USERNAME%\":F *S-1-5-18:F *S-1-5-32-544:F"
+        "icacls \"%key%\" /inheritance:r /grant:r \"%USERNAME%\":F"
     };
 }
 macro_rules! stop_and_clean {
@@ -359,12 +359,12 @@ macro_rules! stop_and_clean {
 }
 
 // The recorded procedures. Each one names a scratch root of its own before it changes
-// anything, says which state it needs before it runs a command, and checks the key
-// still loads after each change — so a reader can follow it without filling in a
-// placeholder, and none of them touches the root the product uses. The inventory
-// check refuses a procedure that leaves an unfilled `<placeholder>`, quotes a repair
-// that ends in `it` instead of naming the file, or changes a key file without saying
-// its root is a scratch one.
+// anything, says which state it needs before it runs a command, and checks the result
+// of each change — the refusal it must raise, or the same identity once repaired — so a
+// reader can follow it without filling in a placeholder, and none of them touches the
+// root the product uses. The inventory check refuses a procedure that leaves an
+// unfilled `<placeholder>`, quotes a repair that ends in `it` instead of naming the
+// file, or changes a key file without saying its root is a scratch one.
 const UNIX_MODE_HOW: &str = concat!(
     "On a unix host, where `cargo test -p mahbot-peers-harness` runs the case `key_file_refuses_other_readers` itself. ",
     build_once!(),
@@ -400,13 +400,13 @@ const MACOS_ROOT_HOW: &str = concat!(
 );
 
 const UNIX_OWNER_HOW: &str = concat!(
-    "On a unix host with a second account, run as the account that should own the key — never as root, so that `sudo` is used only where a step says so; this suite runs as one unprivileged account and spawns no process, so it never produces a file owned by another. ",
+    "On a unix host with a second account, run the shell as the account that should own the key, not as root: every step that needs root says `sudo`, and the rest run as that account. This suite runs as one unprivileged account and spawns no process, so it never produces a file owned by another. ",
     build_once!(),
     loopback_port!(),
     unix_scratch_root!(),
     first_run!(),
     "(3) `sudo chown nobody \"$key\"` gives the file to a second account (`nobody` resolves on macOS and Linux). ",
-    "With that owner, run `sudo target/debug/mahbot-beacon-server --listen 127.0.0.1:0 --root \"$root\"`: root can still open the file, and the loader must refuse it, naming `nobody` with its number and `root` (0) — the account that owns the file and the account that runs the process — appending no command, because the file must belong to the account the product runs as, and writing nothing. ",
+    "With that owner, run `sudo target/debug/mahbot-beacon-server --listen 127.0.0.1:0 --root \"$root\"`: root can still open the file, and the loader must refuse it, naming `nobody` with its number and `root` (0) — the account that owns the file and the account that runs the process — appending no command, because the repair is a hand-back to the account the product runs as and is a command for that account rather than for the root-run process that found the file; nothing is written. ",
     "(4) `sudo chown \"$(id -un)\" \"$key\"` gives it back to the account you run as, and the same command without `sudo` prints the same `identity …` line as (2), because the key never changed. ",
     "On Windows the same fact is produced by step (8) of `library.identity.key_file.windows_dacl`. ",
     stop_and_clean!(),
@@ -421,13 +421,13 @@ const WINDOWS_DACL_HOW: &str = concat!(
     "(3) With no key there yet, run `target\\debug\\mahbot-beacon-server.exe --listen 127.0.0.1:0 --root \"%root%\"`: it loads the key before it binds, prints `identity …` and serves until Ctrl-C; `%key%` now exists, 83 bytes. ",
     "`dir /q \"%key%\"` names the account you ran as in the owner column, and `icacls \"%key%\"` lists that account and the two built-in accounts — the ones `S-1-5-18` and `S-1-5-32-544` name, spelled as this machine spells them — with full control and no (I) inherited mark: a protected list written by the create. ",
     "(4) `cargo test -p mahbot-peers-harness` — this harness's first Windows build — runs the rule and every all-host key-file case against the real reader and writer. The rest produces, one at a time, the states no case can: a command creates a state, the next clears it, and the run after the clearing prints the same `identity …` line again. ",
-    "(5) With the key from (3), a fourth account: `icacls \"%key%\" /grant *S-1-1-0:R` grants Everyone by its SID, so the command works whatever the display language. ",
-    "The same command must refuse, naming that SID's account as this machine spells it (`Everyone` on an English install) and saying that account is neither the owner, SYSTEM nor Administrators. The message appends no command, because the repair must name the account the message reports: `icacls \"%key%\" /remove:g *S-1-1-0` removes that entry in that one call, after which the same command prints the same `identity …` line. ",
-    "(6) With the key from (3), an absent list, which no `icacls` flag produces: run `powershell` from this command prompt — the child inherits `%key%` as `$env:key` — and in it run ",
+    "(5) With the key from (3), a fourth account: `icacls \"%key%\" /grant \"*S-1-1-0\":R` grants Everyone by its SID, so the command reads the same whatever the display language. ",
+    "The same command must refuse, naming that SID's account as this machine spells it (`Everyone` on an English install) and saying that account is neither the owner, SYSTEM nor Administrators. The message appends no command; `identity::access` gives the reason and the repair, and `icacls \"%key%\" /remove:g \"*S-1-1-0\"` removes the entry in that one call, after which the same command prints the same `identity …` line. ",
+    "(6) With the key from (3), an absent list, which no `icacls` flag writes: run `powershell` from this command prompt — the child inherits `%key%` as `$env:key` — and in it run ",
     "`$sig = '[DllImport(\"advapi32.dll\", SetLastError=true, CharSet=System.Runtime.InteropServices.CharSet.Unicode)] public static extern uint SetNamedSecurityInfo(string p, int t, uint s, System.IntPtr o, System.IntPtr g, System.IntPtr d, System.IntPtr sa);'`, ",
     "`$adv = Add-Type -MemberDefinition $sig -Name Adv -Namespace Win32 -PassThru`, then ",
     "`[void]$adv::SetNamedSecurityInfo($env:key, 1, 4, [IntPtr]::Zero, [IntPtr]::Zero, [IntPtr]::Zero, [IntPtr]::Zero)` — object type 1 is a file, security information 4 is its DACL, and a null DACL is the absent list. ",
-    "`exit` returns to this command prompt, where `%key%` is defined again and every remaining command belongs. ",
+    "`exit` returns to this command prompt, where `%key%` is still defined and every remaining command belongs. ",
     "Back in the command prompt, the same server command must refuse, saying the file carries no access list at all, so every account is allowed; `icacls \"%key%\" /reset` gives the default inherited list, then `",
     protected_list!(),
     "` restores a protected one, and the same server command prints `identity …` again. ",
@@ -435,10 +435,10 @@ const WINDOWS_DACL_HOW: &str = concat!(
     "`icacls \"%key%\" /reset` gives the default inherited list and `",
     protected_list!(),
     "` restores a protected list, after which the same command prints `identity …` again. ",
-    "(8) With the key from (3), a foreign owner: start an elevated prompt of the same account — not another administrator's, whose `%TEMP%` and `%USERNAME%` would name a different directory and a different account — and in it define the same two paths again, `set root=%TEMP%\\peers-scratch` and `set key=%root%\\identity.key`, then run `icacls \"%key%\" /setowner *S-1-5-32-544`, which gives the file to Administrators. ",
+    "(8) With the key from (3), a foreign owner: start an elevated prompt of the same account — not another administrator's, whose `%TEMP%` and `%USERNAME%` would name a different directory and a different account — and in it define the same two paths again, `set root=%TEMP%\\peers-scratch` and `set key=%root%\\identity.key`, then run `icacls \"%key%\" /setowner \"*S-1-5-32-544\"`, which gives the file to Administrators. ",
     "Back in the original command prompt, where `%key%` is still defined, the same server command must refuse, naming `Administrators`, saying it may rewrite the list, and appending `icacls` with this file's path and `/setowner \"%USERNAME%\"`; ",
     "return to the elevated prompt and run `icacls \"%key%\" /setowner \"%USERNAME%\"`, after which the server command in the original prompt prints the same `identity …` line again, because ownership is a fact of its own, read apart from the list. ",
-    "Two shapes have no command here: a file with no owner at all, and an access entry this reader cannot attribute — no `icacls` flag produces either — are refused as `Unowned` and as an unattributable entry by the rule that step (4) runs against those shapes as data. ",
+    "Two shapes no step here produces: a file with no owner at all, and an access entry this reader cannot attribute to an account. The rule refuses them as `Unowned` and as an unattributable entry in the case that step (4) runs against both as data. The message for the unowned file appends `icacls` with this file's path and `/setowner \"%USERNAME%\"`; the one for the unattributable entry appends nothing, and the two calls that repair it are the `/reset` and the protected list of steps (6) and (7). ",
     "(9) `rmdir /s /q \"%root%\"`.",
 );
 
@@ -696,15 +696,15 @@ const CAPABILITIES: &[Capability] = &[
         "harness.link.oversized_datagram_dropped",
         "a datagram larger than the receiver's buffer is dropped rather than delivered truncated",
     ),
-    // The key file: one identity per root, created once, readable by its owner
-    // alone, and never replaced.
+    // The key file: one identity per root, created once, readable only by the
+    // accounts the rule allows, and never replaced.
     Capability::witnessed(
         "library.identity.key_file.one_identity_per_root",
         "one root is one identity: two loads agree, a copy of the root gives the same identity back, and deleting the key file is the only way to become a new machine",
     ),
     Capability::witnessed(
         "library.identity.key_file.created_once",
-        "two creators racing on one root end with one identity, the key is published atomically so no reader ever observes a partial file, and the root is left holding nothing but the key — a crash between writing and publishing can leave only a `.identity.key.*` temporary, owner-only like the key file it was about to become, holding the same private half",
+        "two creators racing on one root end with one identity, the key is published atomically so no reader ever observes a partial file, and the root is left holding nothing but the key — a crash between writing and publishing can leave only a `.identity.key.*` temporary, holding the same private half under the access the key file was about to be given",
     ),
     Capability::witnessed(
         "library.identity.key_file.malformed",
@@ -720,7 +720,7 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.identity.access.dacl_rule",
-        "the Windows rule accepts a protected list whose entries name the owner and at most SYSTEM and Administrators, refuses an inherited list, an absent one, an allowed fourth account and an entry it cannot attribute to an account as access-list problems, refuses as a foreign owner — naming the account — any file whose owner is not the account the product runs as, and refuses a file with no owner at all without inventing one; a storage root's clauses for the account a new file belongs to and for a new file with no owner print the documented wording with no command appended",
+        "the Windows rule accepts a protected list whose entries name at most the owner, SYSTEM and Administrators, refuses an inherited list, an absent one, an allowed fourth account and an entry it cannot attribute to an account as access-list problems, refuses as a foreign owner — naming the account — any file whose owner is not the account the product runs as, and refuses a file with no owner at all without inventing one; a storage root's clauses for the account a new file belongs to and for a new file with no owner print the documented wording with no command appended",
     ),
     Capability::witnessed(
         "library.identity.one_rendering",
@@ -735,7 +735,7 @@ const CAPABILITIES: &[Capability] = &[
     Capability::unproducible(
         "library.identity.key_file.windows_dacl",
         "on Windows a key file whose DACL is inherited, absent, names an account outside the owner, SYSTEM and Administrators, or carries an entry this reader cannot attribute to an account — or whose owner is not the account the product runs as, or is absent — is refused, and a new key file is written with a protected DACL and this process's account as owner",
-        "no case produces a refusing access-list state: an inherited list, an absent list and an allowed fourth account each needs an access-list edit, a foreign owner needs another account or a privileged write, and this suite spawns no process and holds one account. Two shapes have no producing command at all — a file with no owner and an entry this reader cannot attribute — and the procedure says so beside the rule that decides them as data. The rule those states feed is witnessed on every host as data (`library.identity.access.dacl_rule`), and the writer and reader are exercised by the all-host key-file cases wherever the harness runs: `load_or_create` writes the protected list, sets the owner and reads both back before a key byte is written. The Windows reader and writer are type-checked for both Windows targets by `windows-check`, which any host builds; the first run of this harness on Windows is the operator's, and its output is not recorded here",
+        "no case produces a refusing access-list state: an inherited list, an absent list and an allowed fourth account each needs an access-list edit, a foreign owner needs another account or a privileged write, and this suite spawns no process and holds one account. Two shapes the procedure cannot show being produced — a file with no owner and an entry this reader cannot attribute — are named as unproducible beside the rule that decides them. The rule those states feed is witnessed on every host as data (`library.identity.access.dacl_rule`), and the writer and reader are exercised by the all-host key-file cases wherever the harness runs: `load_or_create` writes the protected list, sets the owner and reads both back before a key byte is written. The Windows reader and writer are type-checked for both Windows targets by `windows-check`, which any host builds; the first run of this harness on Windows is the operator's, and its output is not recorded here",
         WINDOWS_DACL_HOW,
     ),
     Capability::witnessed(

@@ -109,7 +109,8 @@ pub(super) fn account_name(uid: u32) -> Option<String> {
 fn extended_entries(file: &File, me: u32) -> io::Result<Option<Insecurity>> {
     use std::os::fd::AsRawFd;
 
-    // `sys/acl.h`: an extended ACL holds at most 169 entries, and an entry that
+    // `sys/acl.h` defines `ACL_MAX_ENTRIES` as 128; this ceiling sits above it, so a
+    // list longer than the platform allows still cannot spin the loop. An entry that
     // allows is tagged `ACL_EXTENDED_ALLOW` (a deny is `ACL_EXTENDED_DENY`).
     const MAX_ENTRIES: usize = 169;
     const EXTENDED_ALLOW: u32 = 1;
@@ -120,7 +121,7 @@ fn extended_entries(file: &File, me: u32) -> io::Result<Option<Insecurity>> {
         // Two answers mean "nothing is granted beyond the mode", and refusing on
         // either would refuse every key written on this platform: Darwin reports a
         // file with no extended entries as `ENOENT` rather than as an empty list,
-        // and a volume without ACL support reports `ENOTSUP`.
+        // and a volume without ACL support reports `ENOTSUP` or `EOPNOTSUPP`.
         return match error.raw_os_error() {
             Some(libc::ENOENT | libc::ENOTSUP | libc::EOPNOTSUPP) => Ok(None),
             _ => Err(error),
@@ -152,9 +153,10 @@ fn extended_entries(file: &File, me: u32) -> io::Result<Option<Insecurity>> {
     Ok(super::acl_refusal(&entries))
 }
 
-/// The six `sys/acl.h` calls the reader needs. The crate takes no dependency on
-/// a binding for them: `libc` does not declare the Darwin ACL functions, and a
-/// handful of declarations are smaller than a crate that wraps them.
+/// The six Darwin declarations the reader needs and `libc` does not provide: the five
+/// `sys/acl.h` calls, and `mbr_uuid_to_id` from `<membership.h>`, which turns an
+/// entry's UUID into a directory account. The crate takes no dependency on a binding
+/// for them: a handful of declarations are smaller than a crate that wraps them.
 #[cfg(target_os = "macos")]
 mod ffi {
     use std::ffi::{c_int, c_void};
@@ -190,10 +192,11 @@ mod ffi {
     /// The entry the cursor is on, as `(tag, names the owner)`, or nothing at the
     /// end of the list.
     ///
-    /// Darwin's `acl_get_entry` answers 0 for an entry it found and -1 at the end,
-    /// not the 1/0 POSIX.1e describes, so the entry pointer decides. An entry that
-    /// is there but cannot be read is an error: the caller must not carry on with a
-    /// shorter list than the file's.
+    /// Darwin's `acl_get_entry` answers 0 for an entry it found and -1 otherwise,
+    /// not the 1/0 POSIX.1e describes, so the return value is what ends the loop; the
+    /// pointer is checked too, because an answer of 0 must come with an entry. An entry
+    /// that is there but cannot be read is an error: the caller must not carry on with
+    /// a shorter list than the file's.
     pub(super) fn entry(
         acl: *mut Acl,
         first: bool,
@@ -220,8 +223,9 @@ mod ffi {
     /// Whether the entry names the account this process runs as.
     ///
     /// The qualifier is a UUID, and `mbr_uuid_to_id` turns it into a directory
-    /// account. An entry without a qualifier names everyone, and anything the
-    /// mapping cannot resolve is not attributable to the owner either.
+    /// account. An entry this cannot resolve — no qualifier, or a UUID the mapping does
+    /// not know — is not attributable to the owner either, and refusing it costs one
+    /// `chmod -N`.
     fn names_owner(entry: *mut AclEntry, me: u32) -> bool {
         /// `ID_TYPE_UID` from `membership.h`.
         const ID_TYPE_UID: c_int = 0;

@@ -20,8 +20,11 @@ usage: mahbot-beacon-server --listen ADDRESS --root DIR
 
   --listen ADDRESS   the UDP address to bind, e.g. 0.0.0.0:4433
   --root DIR         the directory holding the beacon's key: `identity.key`,
-                     created owner-only if absent (mode 0600 on unix, a
-                     protected access list on Windows). It must already exist
+                     created if absent, private by the rule a machine's key
+                     file follows: mode 0600 on unix; on Windows a protected
+                     access list naming the account the process runs as,
+                     SYSTEM and Administrators, with that account as the
+                     file's owner. The directory must already exist
 
 The key is the beacon's identity, not its state: clients pin it, so it must
 survive a restart. Registrations do not — they live in memory and nowhere else.

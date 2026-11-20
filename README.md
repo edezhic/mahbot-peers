@@ -18,7 +18,7 @@ The library (`src/`) holds:
 | `identity` | one ed25519 identity per storage root, in a key file the caller's root holds; the fingerprint is the 44-byte RFC 8410 SubjectPublicKeyInfo and the peer id is the key inside it. `identity::access` is who may reach that file, `identity::keyfile` is its name, its format and its one create |
 | `tls` | TLS 1.3 with raw public keys (RFC 7250), pinned to the peer's fingerprint instead of a certificate chain, with a per-service ALPN |
 | `net` | endpoint construction over an injected datagram socket and an injected clock — no default for either |
-| `beacon` | the beacon: the closed message set (`wire`), the client half (`Beacon`, `Session`) — register, look an id up, learn the address observed on this path, hand a signed introduction over, take the ones pushed to a live session — and the one deadline combinator the client and the server share (`timeout`) |
+| `beacon` | the beacon: the closed message set (`wire`), the client half (`Beacon`, `Session`) — register, look an id up, learn the address observed on this path, hand a signed introduction over, take the ones pushed to a live session — and the one deadline combinator the client and the server share (`timeout`, whose documentation says why there is one copy and not two) |
 
 ## The identity
 
@@ -31,8 +31,9 @@ create and the one rendering are a permanent compatibility contract, because a k
 is never rotated and there is no migration. They are stated once, where they are
 enforced: `identity::keyfile` for the file, `identity` for the pinned bytes and
 their rendering. What a reader of this crate needs here is the shape: one identity
-per root; a copy of a root is the same machine, and is refused as a clone with an
-answer distinct from an untrusted peer's. What losing the key means, and why
+per root; a copy of a root is the same machine, so a peer that presents this machine's
+own key is refused as a clone, with an answer distinct from an untrusted peer's. What
+losing the key means, and why
 deleting it is the only deliberate way to become a new machine, are in
 `identity::keyfile`; three source-scan invariants keep a replacement from happening
 by accident.
@@ -41,27 +42,35 @@ Windows is the platform this repository has no host for: the rule is witnessed
 everywhere as a decision, the reader and the writer type-check for both Windows
 targets through `windows-check` (a crate that compiles just those sources and
 nothing else), and the inventory entry `library.identity.key_file.windows_dacl`
-carries the manual procedure, first creation included. That procedure names its
-accounts by SID, so it runs on an installation whose display language is not
-English.
+carries the manual procedure, first creation included. The accounts that procedure
+grants, removes or sets as owner, other than the one the product runs as, are written
+by SID in the quoted `"*S-1-…"` form `identity::access` documents, so it runs on an
+installation whose display language is not English; that account is `%USERNAME%`.
 
 A refusal is a typed error, never a log line a caller can continue past, and its
-message is the same text on every run: it names the path, the fact, and — where the
-platform has one command that repairs it — that command with the same path, quoted for
-that platform's own tool, so it can be run as printed. The repairs are attributed per
-platform in `identity::access`'s documentation, which quotes what each message says:
-`chmod` for a unix mode, `chmod -N` for a macOS extended entry, `icacls` for a Windows
-list or owner, and no command for ownership on unix, where the file has to be handed
-back to the account the product runs as. A file state this suite cannot produce is
-recorded in the capability inventory (`harness/src/inventory.rs`) as unproducible, with
-what does produce it: a manual procedure for the foreign owner (a second account on
-unix; an elevated prompt of the same account on Windows), for the Windows access-list
-states, and — off macOS — for the extended access list; and for the two Windows shapes
-no command can produce, the record says so and the case that decides them as data is
-the evidence. Every procedure that changes the key file names a scratch root of its
-own before it changes anything — the account-name procedure changes no file and names
-none — and each states what it needs and checks that the key still loads after every
-change.
+message is the same text on every run: it names the path, the fact, and, where the
+rule appends one, a command with the same path, quoted for that platform's own tool,
+so it can be run as printed. A key file's refusal appends a command for a unix mode
+(`chmod`), a Windows owner that is not this account or a file with none
+(`icacls /setowner`), a macOS extended entry (`chmod -N`) and an inherited Windows
+list (the protected list). A storage root's refusal appends one for two of them — the
+macOS entry and the inherited Windows list — and names what has to change for the rest.
+For the key file's message, every other cause has a repair that exists and is not
+appended, and `identity::access`'s documentation is the authority that says what each
+message prints, which causes append nothing and what each of those repairs depends on:
+the unix hand-back, a missing or unattributable list, a fourth account, and a replaced
+link or non-regular file. This paragraph is the summary; the table there is the exact
+text. A file state this suite cannot produce is recorded in the capability inventory
+(`harness/src/inventory.rs`) as unproducible, with what does produce it: a manual
+procedure for the foreign owner (a second account on unix; an elevated prompt of the
+same account on Windows), for the Windows access-list states, and — off macOS — for
+the extended access list; and for the two Windows shapes the record cannot show being
+produced — a file with no owner and an entry this reader cannot attribute — the record
+says so, and the case that decides them as data is the evidence. Every procedure that
+changes the key file names a scratch root of its own before it changes anything — the
+account-name procedure changes no file and names none — and each states what it needs
+and checks the result of every change: the refusal it must raise, or the same identity
+once the state is repaired.
 
 The beacon is introduction and address service and nothing else. It remembers
 where an id currently is, in memory and for a short lifetime; it relays an
@@ -255,12 +264,18 @@ depends on `tokio` itself for its synchronization primitives; what is absent is
 the runtime around it.)
 
 Three dependencies are the key file's. `tempfile` writes the key beside itself and
-publishes it by an operation that fails if the name exists (`renameat2` with
-`RENAME_NOREPLACE` where the kernel has it, `MoveFileEx` without replace on
-Windows), which is the half-written-key hazard removed rather than handled. `libc`
-is the effective account on unix, which decides whether the owner is us; the six
-Darwin ACL calls `libc` does not declare are declared in
-`src/identity/access/unix.rs`. `windows-sys` is the DACL on Windows, read and
-written. The Windows code is compiled by every Windows build and by nobody on a
-host that is not Windows; `windows-check` type-checks it for both Windows targets
-here, and the manual procedure for exercising it is in the inventory.
+publishes it by an operation that fails if the name exists (`renameatx_np` with
+`RENAME_EXCL` on macOS, `renameat2` with `RENAME_NOREPLACE` on Linux where the kernel
+has it, `MoveFileEx` without replace on Windows, or a hard link when the platform call
+is not usable), which is the half-written-key hazard removed rather than handled.
+`libc` is unix's: the effective account (`geteuid`), the login name for a uid
+(`getpwuid_r`/`passwd`), the open flags that make a link or a FIFO a refusal rather
+than a wait (`O_NOFOLLOW`, `O_NONBLOCK`), and the error codes those checks answer with
+(`ELOOP` for a link; `ENOENT`, `ENOTSUP` and `EOPNOTSUPP` when a macOS file has no
+extended list or its volume has no ACLs). It declares none of the six Darwin
+declarations the macOS reader needs — the five `sys/acl.h` calls and `mbr_uuid_to_id`
+from `<membership.h>` — and `src/identity/access/unix.rs` declares them itself.
+`windows-sys` is the DACL on Windows, read and written. The Windows code
+is compiled by every Windows build and by nobody on a host that is not Windows;
+`windows-check` type-checks it for both Windows targets here, and the manual procedure
+for exercising it is in the inventory.

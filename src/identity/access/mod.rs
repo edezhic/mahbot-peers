@@ -9,89 +9,117 @@
 //!
 //! # What a refusal says
 //!
-//! A refusal is a [`KeyFileError`](crate::identity::keyfile::KeyFileError). It prints
-//! the path, then `is not private:`, then the fact, then — where its platform has
-//! one command that repairs that fact — that command, with the same path, quoted for
-//! the shell that platform's tool takes. The command is therefore runnable as
-//! printed, and names the object the message is about. The repair is never presented
-//! as a general rule: `chmod` repairs a unix mode, `chmod -N` a macOS entry, `icacls`
-//! a Windows list, and each is quoted for its own tool rather than for the host that
-//! happens to print the message. A unix ownership refusal has no command of its own:
-//! the rule accepts one owner, the account the process runs as, so handing the file
-//! back is a command run as that account — not as this process, if the operator started
-//! it as root. On Windows the owner is a name, so `icacls /setowner` is the command.
+//! A refusal is a [`KeyFileError`](crate::identity::keyfile::KeyFileError). An insecure
+//! file's message prints the path, then `is not private:`, then the fact, then, where
+//! the rule appends one, a command with the same path, quoted for the shell that
+//! platform's tool takes. The command is therefore runnable as printed, and names the
+//! object the message is about.
 //!
-//! The fact is [`Insecurity`](crate::identity::access::Insecurity)'s `Display` and the
-//! command is built from the same path, so this table is the exact text and not a
-//! paraphrase. `'<path>'` is a POSIX-quoted path and `"<path>"` a `cmd.exe` one; an
-//! account is a login name and number on unix, and on Windows the name the platform
-//! gives it — or, when it has none, the platform's own SDDL spelling of the SID
-//! (`S-1-…`, which `icacls` takes with a leading `*`). Account names and SID spellings
-//! come from `LookupAccountSidW` and `ConvertSidToStringSidW`, so they are the
-//! platform's text, and this table quotes the fact around them rather than them.
+//! The rule appends a command only where one command, built from the path — and, on
+//! Windows, `%USERNAME%` — restores exactly the state the rule requires of the fact
+//! the message names: a unix mode, a Windows ownership fact — an owner that is not
+//! this process's account, or no owner at all — the macOS extended entry and the
+//! inherited Windows list. Every other cause has a repair that exists and is not
+//! appended; the bullets below give one per cause — the link and the non-regular file
+//! share one, because the repair is the same — and each says what its repair depends
+//! on and why the rule does not append it. A bullet may still spell the repair out as a
+//! command: it is not one the rule can build from the path and, on Windows, `%USERNAME%`
+//! — it needs an argument the fact does not carry, such as the `*` form of the account a
+//! Windows message names, or the account the product is meant to run as, which is the
+//! operator's choice rather than this process's; or the repair is two calls where one
+//! would not restore the state.
+//!
+//! The fact is what [`Insecurity`](crate::identity::access::Insecurity)'s `Display`
+//! prints, and the command is built from the same path, so this table is the exact
+//! text and not a paraphrase. `'<path>'` is a POSIX-quoted path and `"<path>"` a
+//! `cmd.exe` one.
+//!
+//! An account is written as one token in every operator command. On Windows that
+//! token is quoted, because `icacls` takes the account as one argument and a name may
+//! hold a space, and every account but the one the product runs as is written by its
+//! SID, in the platform's own SDDL spelling as `"*S-1-…"` — the `*` first inside the
+//! quotes, which is how `icacls` takes a SID — so the token reads the same whatever the
+//! display language; the account the product runs as is `%USERNAME%`, a cmd.exe
+//! expansion of it, so the Windows commands are run in a command prompt of that
+//! account. Where a command carries a permission suffix, it follows the account
+//! outside the quotes, as `"*S-1-5-18":F` does. A SID comes from
+//! `ConvertSidToStringSidW`, and the two built-in accounts are always `S-1-5-18` and
+//! `S-1-5-32-544`; the message names those two `SYSTEM` and `Administrators`, and any
+//! other account as the platform names it, or by its bare SID when the platform has no
+//! name for it. On unix the token is a login name, which the message also gives with
+//! the number the platform assigns it.
+//!
 //! `0644`, `nobody`, the account the product runs as and `Everyone` stand for the mode,
-//! the accounts and the entry a message finds. Each name and number in a message is the
-//! platform's own — `nobody` is 4294967294 on macOS and 65534 on Linux, a login's number
-//! is whatever that machine gave it — so the table prints the shape and the platform
-//! fills it in.
+//! the accounts and the entry a message finds. Each of those is the platform's own —
+//! `nobody` is 4294967294 on macOS and 65534 on Linux, a login's number is whatever that
+//! machine gave it — so the table prints the shape and the platform fills it in.
 //!
 //! | Refusal | Platform | What it says | What it appends |
 //! | --- | --- | --- | --- |
 //! | `Mode` | unix | group or other permission bits are set (mode 0644) | `chmod 600 '<path>'` |
-//! | `Owner` | unix | it belongs to account `<owner>`, not to account `<me>`, each with the login name and number the platform reports | nothing |
+//! | `Owner` | unix | it belongs to account `<owner>`, not to account `<me>`, each with the login name and number the platform reports | nothing; the hand-back is in the bullets below |
 //! | `ForeignOwner` | Windows | it belongs to `Administrators`, which may rewrite the list | `icacls "<path>" /setowner "%USERNAME%"` |
 //! | `Unowned` | Windows | it has no owner at all, so no account can be named as owning it | `icacls "<path>" /setowner "%USERNAME%"` |
-//! | `Symlink` | unix, Windows | it is a symbolic link, which is never followed | nothing |
-//! | `NotRegular` | unix, Windows | it is not a regular file | nothing |
+//! | `Symlink` | unix, Windows | it is a symbolic link, which is never followed | nothing; the object is replaced, as the bullets below say |
+//! | `NotRegular` | unix, Windows | it is not a regular file | nothing; the object is replaced, as the bullets below say |
 //! | `AccessList`, macOS entry | macOS | extended access entries allow an account other than the owner | `chmod -N '<path>'` |
 //! | `AccessList`, inherited | Windows | its access list is inherited from the directory | `icacls "<path>" /inheritance:r /grant:r "%USERNAME%":F` |
-//! | `AccessList`, no list | Windows | it carries no access list at all, so every account is allowed | nothing |
-//! | `AccessList`, fourth account | Windows | it allows `Everyone`, which is not the owner, SYSTEM or Administrators | nothing |
-//! | `AccessList`, unattributable entry | Windows | it has an access entry this reader cannot attribute to an account, which may allow an account that is not the owner, SYSTEM or Administrators | nothing |
+//! | `AccessList`, no list | Windows | it carries no access list at all, so every account is allowed | nothing; the bullets below give the two calls |
+//! | `AccessList`, fourth account | Windows | it allows `Everyone`, which is not the owner, SYSTEM or Administrators | nothing; the bullets below give the call |
+//! | `AccessList`, unattributable entry | Windows | it has an access entry this reader cannot attribute to an account, which may allow an account that is not the owner, SYSTEM or Administrators | nothing; the bullets below give the two calls |
 //!
-//! The four Windows access-list shapes and the macOS one each have their own fact. The
-//! rule appends a command only when the path and this process's own account are all it
-//! takes: `chmod -N` for the macOS entry, and the protected list for the inherited one,
-//! which grants the file back to `%USERNAME%`. The repairs it cannot emit are given once
-//! below, one bullet per cause — the owner's, the two calls for a missing or
-//! unattributable list, the one call that removes a fourth account, which must name the
-//! account the message reports, and the object replaced for a link or a non-regular
-//! file.
+//! The four Windows access-list shapes and the macOS one each have their own fact.
+//! The repairs the rule does not append are given once below, each with what it
+//! depends on:
 //!
 //! - `Owner`: `chown <account> '<path>'`, run by root, with the account the product
 //!   runs as in place of `<account>`; `sudo chown "$(id -un)" '<path>'` does it when
-//!   you are already that account and are not root.
+//!   you are already that account and are not root. It is not appended because the
+//!   fact names the account this process runs as, which may be root, and the account
+//!   the product is meant to run as is the operator's choice.
 //! - no list: `icacls "<path>" /reset`, then the protected list of the inherited row.
-//! - fourth account: `icacls "<path>" /remove:g "<account>"`, with the account the
-//!   message names in place of `<account>` — preceded by `*` inside the quotes when the
-//!   message gave a `S-1-…` SID instead of a name, because `icacls` requires it before
-//!   a SID.
+//!   Two calls, not one: `/reset` alone leaves the list inherited from the directory,
+//!   which is refused as it stands.
+//! - fourth account: `icacls "<path>" /remove:g "<account>"`, with that account's SID
+//!   in place of `<account>`, written `"*S-1-…"` as above — `"*S-1-1-0"` for
+//!   `Everyone`, the account the fact names. It is not appended because the message
+//!   names one stranger and one `/remove:g` need not restore the state when the list
+//!   names another, and because the token that reads the same in every display language
+//!   is the SID, which the fact carries only when the platform has no name for it.
 //! - unattributable entry: `icacls "<path>" /reset`, then the protected list of the
-//!   inherited row; no `icacls` flag writes an access entry of a type this reader does
-//!   not parse, and a SID the platform can neither name nor spell has no command of its
-//!   own either.
+//!   inherited row. Two calls, because the entry names no account this reader can
+//!   resolve — its type is one this reader does not parse, or its SID can be neither
+//!   named nor spelled — so no command built from the path can take it away, and
+//!   `/reset` alone leaves the inherited list, which is refused as it stands.
 //! - link or non-regular file: the object at the path is removed, so the next create
-//!   mints a key file where a regular file belongs.
+//!   mints a key file where a regular file belongs. It is not appended because what is
+//!   there is not the key, and deleting it is the operator's decision.
 //!
 //! A storage root is refused with its own message rather than the file's:
 //! `the storage root <root> gives a new key file an access that is not private: `, then
-//! the same fact, then `; no key was written, and the directory is what has to change`
-//! (or `and the account the new file belongs to`, when the ownership is the cause, or
-//! `and the ownership of the new file`, when there is no owner), then the command for
-//! the root only when one repairs the directory in place: a macOS entry and an
-//! inherited Windows list do, every other cause does not.
+//! the same fact, then `; no key was written, and ` and one of three tails: `the
+//! directory is what has to change`, `the account the new file belongs to is what has
+//! to change` when the ownership is the cause, or `the ownership of the new file is
+//! what has to change` when there is no owner. Only two causes have a command the
+//! message appends: a macOS entry and an inherited Windows list, each with the same
+//! call the file's message carries. The other causes name what has to change
+//! instead, because no single command built from the root restores the state
+//! the rule requires of the fact: a mode is repaired by `chmod 600`, which on a
+//! directory would strip the traverse bit — and the new key file's own mode is pinned
+//! before it is read back, so a mode that reached past the owner came from the
+//! filesystem under it, and what has to change is that. An owner is a fact about the
+//! account a new file belongs to rather than about the directory's list, so no command
+//! on the root changes it: what has to change is the account the product runs as, or the
+//! filesystem that assigns the owner. An absent or unattributable list is repaired by
+//! the two calls in the bullets above.
 //!
-//! Two accounts are named where the refused file belongs to another: on unix by login
-//! name and number (the number alone when it cannot be resolved); on Windows by the
-//! owning account's name, except the two built-in accounts, which are always spelled
-//! `SYSTEM` and `Administrators` — the names the rule itself uses — with `%USERNAME%`
-//! in the command for the account that runs the product. `%USERNAME%` is a cmd.exe
-//! expansion, so the Windows commands are run in a command prompt of that account. A
-//! message about a storage root rather than a file names the root and appends the
-//! repair for the root, which exists, when the cause has one.
+//! A unix refusal about another account names two: the owner and the one the process
+//! runs as, each as the platform spells it, and by number alone where it has no name
+//! for that number. The Windows fact names the owning account alone, and the command
+//! carries `%USERNAME%` for the account that runs the product.
 //!
 //! Refusing too much is the safe direction — a key file that only its owner can read
-//! is accepted even when it is stricter still.
+//! is accepted, and so is one that is stricter still.
 //!
 //! The rules — [`unix_refusal`](crate::identity::access::unix_refusal),
 //! [`acl_refusal`](crate::identity::access::acl_refusal),
@@ -109,7 +137,7 @@ mod unix;
 #[cfg(windows)]
 mod windows;
 
-/// Why the key file is reachable by someone other than its owner.
+/// Why the key file is reachable by an account the rule does not allow.
 ///
 /// The variants are per platform because the facts are: mode bits exist on unix,
 /// access lists on macOS and Windows. A variant that only one reader can produce says
@@ -203,12 +231,13 @@ pub enum Insecurity {
 /// reads names this file in the position its own tool requires.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Remedy {
-    /// `chmod -N <path>`: removes every extended access entry from a macOS file, the
+    /// `chmod -N '<path>'`: removes every extended access entry from a macOS file, the
     /// entries that reach past its owner included.
     ClearExtendedEntries,
-    /// `icacls <path> /inheritance:r /grant:r "%USERNAME%":F`: replaces a Windows
+    /// `icacls "<path>" /inheritance:r /grant:r "%USERNAME%":F`: replaces a Windows
     /// list with a protected one granting the process's account full control, because
-    /// removing inheritance alone would leave a list that denies that account too.
+    /// removing inheritance alone can leave a list that grants that account nothing —
+    /// empty, when every entry was inherited.
     ProtectWindowsList,
 }
 
@@ -264,9 +293,9 @@ impl Insecurity {
     ///
     /// A refusal about a storage root uses this: the object that has to change is the
     /// root rather than the key file, and the root is named in front of it. The root's
-    /// own message prints the command from [`Self::remedy`] after it when the cause has
-    /// one — about the root, which exists — so an access entry an inheriting root hands
-    /// to a new key file still says `chmod -N`.
+    /// own message appends the command from [`Self::remedy`] only for an access-list
+    /// cause — about the root, which exists — so a root whose inherited entry reaches
+    /// a new key file still gets `chmod -N`.
     pub(crate) fn write_fact(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Mode { mode } => {
@@ -300,9 +329,9 @@ impl Insecurity {
     ///
     /// The quoting is the shell of the platform that produced the refusal, decided by
     /// the cause rather than by the host: `chmod` takes a POSIX argument and `icacls`
-    /// a `cmd.exe` one on every host. The unix ownership cause has no command — the
-    /// module documentation gives the form for the account the product runs as; on
-    /// Windows the owner is a name, so `icacls /setowner` repairs it.
+    /// a `cmd.exe` one on every host. The unix ownership cause has no command
+    /// appended — the module documentation gives the form for the account the product
+    /// runs as; on Windows the owner is a name, so `icacls /setowner` is the command.
     pub(crate) fn remedy(&self, path: &Path) -> Option<String> {
         match self {
             Self::Mode { .. } => Some(format!("chmod 600 {}", Shell::Posix.quote(path))),
@@ -368,7 +397,7 @@ pub(crate) fn open(path: &Path) -> std::io::Result<Opening> {
 }
 
 /// Check the open key file, and answer with the reason it is reachable by
-/// somebody other than its owner.
+/// an account the rule does not allow.
 ///
 /// The facts are read from the descriptor, not from the path: what is checked and
 /// what is read are then the same file, whatever a link or a rename did in
@@ -439,7 +468,8 @@ pub struct Entry {
 /// other allow entry is refused: the reader maps an entry's UUID to a directory
 /// account and compares it with the effective account, so an entry naming a
 /// different account counts, and so does one it cannot attribute — an entry with no
-/// qualifier names everyone — since a refusal here costs an operator one `chmod -N`.
+/// qualifier, or one whose UUID the mapping does not know — since a refusal here costs
+/// an operator one `chmod -N`.
 ///
 /// The remedy it reports is macOS's, and this rule is decided on every host as
 /// data; only the macOS reader feeds it in production, so no other host's message
@@ -497,7 +527,7 @@ pub struct Dacl {
     pub entries: Vec<DaclEntry>,
 }
 
-/// Whether a DACL keeps the file to its owner.
+/// Whether a DACL keeps the file to the owner and the two accounts a backup needs.
 ///
 /// The allowed *entries* are the owner, `SYSTEM` and `Administrators`: enforcing
 /// that a real installation lists literally one entry would break the key file the
@@ -516,9 +546,10 @@ pub struct Dacl {
 /// [`Insecurity::Unowned`], rather than accepted as a file another account may open.
 ///
 /// A refusal carries the command the rule emits for it, and only an inherited list has
-/// one: `icacls <path> /inheritance:r /grant:r "%USERNAME%":F` protects the file and
+/// one: `icacls "<path>" /inheritance:r /grant:r "%USERNAME%":F` protects the file and
 /// grants it back to the account running the product in one call — removing inheritance
-/// alone would leave a list that denies that account too. The absent list, a fourth
+/// alone can leave a list that grants that account nothing, empty when every entry was
+/// inherited. The absent list, a fourth
 /// account and an unattributable entry carry none; the module documentation gives the
 /// repair of each, and none of them is a command the path and this process's account
 /// are enough to build.
@@ -545,8 +576,9 @@ pub fn dacl_refusal(dacl: &Dacl) -> Option<Insecurity> {
         ));
     }
     if !dacl.protected {
-        // Removing inheritance alone leaves an empty list, which denies the owner
-        // too, so the repair writes the protected list in the same call.
+        // Removing inheritance alone can leave an empty list: the rule accepts it, but
+        // it grants the owner nothing, so the repair writes the owner's entry in the
+        // same call.
         return Some(list(
             "its access list is inherited from the directory",
             Some(Remedy::ProtectWindowsList),

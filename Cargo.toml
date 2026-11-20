@@ -62,15 +62,21 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring", "s
 ring = "0.17.14"
 # Creating the key file: a temporary file beside it, flushed, published by an
 # operation that fails when the name exists. `tempfile` is the crate that does
-# that portably — `renameat2(RENAME_NOREPLACE)` where the kernel has it,
-# `MoveFileEx` without replace on Windows — and it creates the file with mode 0600
-# on unix. Writing it by hand is where the half-written key would come from.
+# that portably — `renameatx_np` with `RENAME_EXCL` on macOS, `renameat2` with
+# `RENAME_NOREPLACE` on Linux where the kernel has it, `MoveFileEx` without replace
+# on Windows, or a hard link when the platform call is not usable — and it creates the
+# file with mode 0600 on unix. Writing it by hand is where the half-written key
+# would come from.
 tempfile = "3"
 
 # The account that decides who besides the owner may read the key file —
 # `geteuid`, and `getpwuid_r`/`passwd` to name a uid — plus the open flags that
-# refuse a link (`O_NOFOLLOW`, `O_NONBLOCK`, `ELOOP`). `libc` declares no Darwin
-# ACL function, so the six are declared in `src/identity/access/unix.rs` instead.
+# make a link or a FIFO a refusal rather than a wait (`O_NOFOLLOW`, `O_NONBLOCK`)
+# and the error codes those checks answer with (`ELOOP` for a link; `ENOENT`,
+# `ENOTSUP` and `EOPNOTSUPP` when a macOS file has no extended list or its volume
+# has no ACLs). It declares none of the six Darwin declarations the macOS reader
+# needs — the five `sys/acl.h` calls and `mbr_uuid_to_id` from `<membership.h>` —
+# which `src/identity/access/unix.rs` declares itself.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

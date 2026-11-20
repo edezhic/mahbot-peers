@@ -1,5 +1,6 @@
 //! Identity cases: the fingerprint is the SPKI, two roots are two identities, the
-//! key file is created once and never replaced, and only its owner can read it.
+//! key file is created once and never replaced, and only the accounts the rule
+//! allows can read it.
 
 use std::fs;
 use std::io;
@@ -26,9 +27,11 @@ fn refusal(reason: Insecurity) -> String {
 }
 
 /// A refusal about a storage root rather than the key file: the prefix, the clause
-/// saying which fact has to change, and no command — a directory's mode is not
-/// `chmod 600`'s business, and handing an owner back is a command for the account the
-/// product runs as rather than for the process that found the root.
+/// saying which fact has to change, and no command for the causes these cases use — a
+/// directory's mode is not `chmod 600`'s business, and handing an owner back is a
+/// command for the account the product runs as rather than for the process that found
+/// the root. The macOS entry that does append one, where this host can produce it, is
+/// pinned by `key_file_refuses_a_sharing_root`.
 fn root_clause(reason: Insecurity, clause: &str) -> Result<(), String> {
     let root = KeyFileError::RootNotPrivate {
         root: Path::new("/root").to_owned(),
@@ -974,18 +977,19 @@ fn symlink(target: &Path, link: &Path) -> Result<(), String> {
 /// these cases are about. It is the one place the harness writes one: `set_mode` and
 /// `symlink` above set a mode and a link, which no list can express.
 ///
-/// The declarations mirror `src/identity/access/unix.rs`, which reads an extended
-/// list through the same three calls: they cannot be shared, because the library
-/// exports no Darwin FFI — a differing constant shows up here as the case failing
-/// to produce the state it is about, not as a silent pass.
+/// The declarations are the harness's own: it writes a list through Darwin's ACL
+/// writer API, and `src/identity/access/unix.rs` declares the reader API instead.
+/// They cannot be shared, because the library exports no Darwin FFI — a differing
+/// constant shows up here as the case failing to produce the state it is about, not
+/// as a silent pass.
 #[cfg(target_os = "macos")]
 mod acl {
     use std::ffi::{CString, c_char, c_int, c_void};
     use std::path::Path;
 
     /// `ACL_TYPE_EXTENDED`, `ACL_EXTENDED_ALLOW`, `ACL_EXTENDED_DENY`,
-    /// `ACL_READ_DATA`, `ACL_ENTRY_FILE_INHERIT` and `ACL_ENTRY_DIRECTORY_INHERIT`
-    /// from `sys/acl.h`.
+    /// `ACL_READ_DATA`, `ACL_WRITE_DATA`, `ACL_ENTRY_FILE_INHERIT` and
+    /// `ACL_ENTRY_DIRECTORY_INHERIT` from `sys/acl.h`.
     const ACL_TYPE_EXTENDED: u32 = 0x100;
     const ACL_EXTENDED_ALLOW: u32 = 1;
     const ACL_EXTENDED_DENY: u32 = 2;

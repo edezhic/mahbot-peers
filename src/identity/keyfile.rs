@@ -37,14 +37,17 @@
 //!   [`KeyFileError::Insecure`](crate::identity::keyfile::KeyFileError::Insecure),
 //!   which is distinct from "missing" and from "not a key", so a caller cannot
 //!   confuse it with either and cannot continue silently. Its message names the
-//!   accounts involved — or says that no account can be named — and, where the
-//!   platform has one, the command that repairs the file; `identity::access` lists
-//!   every refusal with its platform and its words.
+//!   accounts involved — or says that no account can be named — and, where one
+//!   command built from the path (and, on Windows, `%USERNAME%`) restores exactly the
+//!   state the rule requires, that command; `identity::access` lists every refusal with
+//!   its platform and its words, and gives the dependency of each repair it does not
+//!   append.
 //!   When the storage root itself hands a new file an access its mode cannot
 //!   override, the refusal is
 //!   [`KeyFileError::RootNotPrivate`](crate::identity::keyfile::KeyFileError::RootNotPrivate):
-//!   it happens before a key is minted, names the root, and says what about the root
-//!   has to change.
+//!   it happens before a key is minted, names the root and what has to change, and
+//!   appends a command only for two access-list causes — a macOS entry or an inherited
+//!   Windows list.
 //! - A copy of a storage root is the same identity. That is how a restored backup
 //!   keeps its machine, and it is also a clone: the transport refuses a peer that
 //!   presents this machine's own key ([`crate::tls::Refusal::OwnIdentity`]).
@@ -101,16 +104,17 @@ pub fn load_or_create(root: &Path) -> Result<Identity, KeyFileError> {
 /// Why the identity under a storage root could not be loaded or created.
 #[derive(Debug)]
 pub enum KeyFileError {
-    /// An existing key file is reachable by somebody other than its owner. Distinct
+    /// An existing key file is reachable by an account the rule does not allow. Distinct
     /// from a missing file and from a malformed one: this is a refusal, not an
     /// absence.
     Insecure { path: PathBuf, reason: Insecurity },
     /// A new key file could not be made private inside the storage root, so no key
     /// was minted and nothing was written. The file does not exist: what has to change
     /// is the root — the access it gives the files created under it, or the account a
-    /// new file ends up belonging to. The message names the root and, when one command
-    /// repairs the directory in place, that command: a macOS entry and an inherited
-    /// Windows list do, every other cause does not.
+    /// new file ends up belonging to. The message names the root and what has to
+    /// change, and appends a command only for two access-list causes — a macOS entry
+    /// or an inherited Windows list. `crate::identity::access`'s documentation states
+    /// the rule that decides which causes get one and gives the repairs for the rest.
     RootNotPrivate { root: PathBuf, reason: Insecurity },
     /// The file exists and holds something that is not a key this crate can read.
     /// Nothing was written in its place.
@@ -170,10 +174,10 @@ impl fmt::Display for KeyFileError {
                     }
                     _ => "; no key was written, and the directory is what has to change",
                 })?;
-                // The root exists, unlike the key file a `RootNotPrivate` is about, so
-                // the cause's repair is worth printing when it is about the directory:
-                // an access list is repaired in place, while a mode on a directory is
-                // not `chmod 600`'s business and would strip its traverse bit.
+                // Only an access-list cause carries a remedy built from the root: a
+                // mode on a directory is not `chmod 600`'s business (it would strip
+                // the traverse bit), and an owner is stated by the clause above. The
+                // other access-list shapes carry no remedy, so `remedy` is `None`.
                 match reason {
                     Insecurity::AccessList { .. } => match reason.remedy(root) {
                         Some(command) => write!(f, "; {command}"),
@@ -299,7 +303,7 @@ fn create(root: &Path) -> Result<Identity, KeyFileError> {
     }
     // Minted last, so a refused root never has a key generated for it: nothing
     // private exists, even in memory, until the file it would live in is known to
-    // be one only its owner can read.
+    // be one only the accounts the rule allows can read.
     let identity = mint(&path)?;
     temp.write_all(identity.pkcs8()).map_err(io_error)?;
     temp.as_file().sync_all().map_err(io_error)?;

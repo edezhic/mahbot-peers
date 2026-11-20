@@ -1,10 +1,10 @@
 //! The Windows reader: the file's DACL, and the explicit one a new key is given.
 //!
 //! A mode is not a Windows idea. Who may open a file is decided by an access list,
-//! so keeping the key to its owner means reading the file's DACL — from the open
-//! descriptor, so the list that let the open succeed is the list that is checked.
-//! Giving a new key its list is the other half, and that is done by path: the
-//! handle `tempfile` creates is opened for reading and writing only, and
+//! so keeping the key to the accounts the rule allows means reading the file's DACL
+//! — from the open descriptor, so the list that let the open succeed is the list
+//! that is checked. Giving a new key its list is the other half, and that is done by
+//! path: the handle `tempfile` creates is opened for reading and writing only, and
 //! `WRITE_DAC` is granted only when it is asked for, so a list written through
 //! that handle would be refused. The file is still empty at that point, so no key
 //! byte is ever behind a list this module did not write.
@@ -19,8 +19,8 @@
 //! hazard the unix rule answers by checking ownership. A file with no owner at all is
 //! reported as owning nothing rather than attributed to an invented account, because
 //! no account could be named for the repair. A new key file is given this process's
-//! account as owner for the same reason, after the list: a token does not choose the
-//! owner of the file it creates.
+//! account as owner, after the list, because a token does not always choose itself as
+//! the owner of the file it creates.
 //!
 //! The rule itself is not here. [`super::dacl_refusal`] decides; this module only
 //! turns SIDs into accounts.
@@ -127,9 +127,8 @@ pub(super) fn check(file: &File) -> io::Result<Option<Insecurity>> {
 ///
 /// The owner matters as much as the list: a token does not always choose the owner
 /// of the file it creates — an elevated administrator's token defaults its new
-/// objects to `Administrators`, and a service token to its own account — so this
-/// sets the owner back to the account the process runs as, the only ownership
-/// [`super::dacl_refusal`] accepts.
+/// objects to `Administrators` — so this sets the owner back to the account the
+/// process runs as, the only ownership [`super::dacl_refusal`] accepts.
 ///
 /// Both are applied by path, while the file is still empty, and the caller reads
 /// them back through the handle before writing a key byte: the handle the file was
@@ -483,12 +482,12 @@ fn name(sid: PSID) -> Option<String> {
 /// A SID the platform has no name for, in the SDDL form (`S-1-5-21-…`).
 ///
 /// The conversion is the platform's own, not a copy of the format kept here, so the
-/// spelling is the one the system tools print. `icacls` takes it in `/remove:g` and
-/// `/setowner` with a leading `*`, which is what keeps the message a command an
-/// operator can run when the account it names cannot be resolved — a service account
-/// on a domain controller this machine cannot reach is the case that gets here. `None`
-/// when the platform cannot spell the SID either, which leaves the entry unattributable
-/// rather than named by a guess.
+/// spelling is the one the system tools print. `icacls` takes it in `/grant`,
+/// `/remove:g` and `/setowner` with a leading `*`, so an operator can act on an account
+/// the message names by its SID even when the platform cannot name it — a service
+/// account on a domain controller this machine cannot reach is the case that gets here.
+/// `None` when the platform cannot spell the SID either, which leaves the entry
+/// unattributable rather than named by a guess.
 fn sddl(sid: PSID) -> Option<String> {
     let mut text: PWSTR = null_mut();
     // SAFETY: `sid` points at a whole SID, and `text` receives the one allocation this
