@@ -16,10 +16,36 @@ use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{AsyncUdpSocket, Endpoint, EndpointConfig, IdleTimeout, Runtime};
 
 use crate::identity::Identity;
-use crate::tls::{self, PeerPolicy};
+use crate::tls::{self, PeerPolicy, Refusal};
 
 /// How long a connection may sit idle before QUIC gives up on it.
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The refusal a failed connection reports, when it was refused for the key it
+/// presented rather than for anything else.
+///
+/// The handshake can only answer with text, so this is where that text is turned
+/// back into a reason: [`Refusal::OwnIdentity`] for a peer that presented this
+/// machine's own key — a copy of the storage root — and [`Refusal::Untrusted`] for
+/// a key this machine does not remember. `None` is a failure that is about
+/// something else entirely: a timeout, a version mismatch, a closed endpoint.
+///
+/// It is diagnostic, in both directions. The decision was the verifier's and
+/// cannot be revisited here; and the text may have been written by the far side —
+/// a peer can close a connection with a reason that repeats one of our phrases.
+/// So `OwnIdentity` read from a connection this machine did not itself refuse may
+/// be another machine's claim: the value belongs in a log, and nothing
+/// outward-facing (rights, trust, retries) may be decided on it.
+#[must_use]
+pub fn refusal(error: &quinn::ConnectionError) -> Option<Refusal> {
+    let reason = match error {
+        quinn::ConnectionError::TransportError(error) => Some(error.reason.as_str()),
+        quinn::ConnectionError::ConnectionClosed(close) => std::str::from_utf8(&close.reason).ok(),
+        quinn::ConnectionError::ApplicationClosed(close) => std::str::from_utf8(&close.reason).ok(),
+        _ => None,
+    };
+    reason.and_then(Refusal::of)
+}
 
 /// Everything about an endpoint that is not a seam: today, the idle timeout.
 #[derive(Clone, Debug)]

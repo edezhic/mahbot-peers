@@ -1,0 +1,21 @@
+[package]
+name = "mahbot-peers-windows-check"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/edezhic/mahbot-peers"
+description = "Type-check of the Windows key-file reader and writer, for both Windows targets, on a host that is not Windows."
+
+# Nothing from the library: `ring` compiles C for its target, so a check of the
+# library for a Windows target stops in a C compiler this host does not have. This
+# crate compiles the same access-list sources with only the platform dependencies
+# they use — `windows-sys` on Windows, `libc` on unix — and nothing else.
+[dependencies]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

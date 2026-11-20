@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use mahbot_beacon::config::{Config, Invocation, mode_is_private};
+use mahbot_beacon::config::{Config, Invocation};
 use mahbot_beacon::server::EXCHANGE_TIMEOUT;
 use mahbot_peers::beacon::{Request, Response};
 
@@ -21,16 +21,19 @@ use super::support::{BUDGET, io_error, within};
 
 pub(crate) fn config_parse() -> Result<(), String> {
     let invocation = Invocation::parse(
-        ["--listen", "0.0.0.0:4433", "--key", "/var/lib/beacon/key"].map(str::to_owned),
+        ["--listen", "0.0.0.0:4433", "--root", "/var/lib/beacon"].map(str::to_owned),
     )
     .map_err(|error| error.to_string())?;
     match invocation {
-        Invocation::Serve(Config { listen, key }) => {
+        Invocation::Serve(Config { listen, root }) => {
             if listen != "0.0.0.0:4433".parse().expect("a literal address") {
                 return Err(format!("the listening address was read as {listen}"));
             }
-            if key != Path::new("/var/lib/beacon/key") {
-                return Err(format!("the key path was read as {}", key.display()));
+            if root != Path::new("/var/lib/beacon") {
+                return Err(format!(
+                    "the key's directory was read as {}",
+                    root.display()
+                ));
             }
         }
         Invocation::Help => return Err("a full command line was read as --help".to_owned()),
@@ -44,7 +47,7 @@ pub(crate) fn config_parse() -> Result<(), String> {
 
     for bad in [
         vec!["--listen".to_owned()],
-        vec!["--key".to_owned()],
+        vec!["--root".to_owned()],
         vec!["--listen".to_owned(), "not-an-address".to_owned()],
         vec!["--unknown".to_owned()],
     ] {
@@ -55,21 +58,7 @@ pub(crate) fn config_parse() -> Result<(), String> {
     // A missing required argument reports the usage, not a half configuration.
     match Invocation::parse(["--listen".to_owned(), "0.0.0.0:1".to_owned()]) {
         Err(message) if message.contains("usage:") => {}
-        other => return Err(format!("a missing --key was answered {other:?}")),
-    }
-
-    // The key is private when neither group nor other may touch it.
-    for (mode, private) in [
-        (0o600, true),
-        (0o400, true),
-        (0o640, false),
-        (0o604, false),
-        (0o660, false),
-        (0o777, false),
-    ] {
-        if mode_is_private(mode) != private {
-            return Err(format!("mode {mode:o} was read as private={}", !private));
-        }
+        other => return Err(format!("a missing --root was answered {other:?}")),
     }
     Ok(())
 }

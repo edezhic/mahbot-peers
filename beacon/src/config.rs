@@ -1,10 +1,10 @@
 //! The beacon's configuration and its server-side TLS.
 //!
-//! Parsing the command line and deciding whether a key file is private are pure
-//! functions: the process entry point reads the arguments and the file mode, and
-//! hands both here. That keeps the excluded surface — the part that really touches
-//! the environment — down to the calls themselves, while every decision it makes
-//! is compiled and witnessed in a default build.
+//! Parsing the command line is a pure function: the process entry point reads the
+//! arguments and hands them here, which keeps the exempted surface — the part that
+//! really touches the environment — down to the calls themselves. The key file is
+//! not here at all: its format, its one create and its privacy rule are the
+//! library's, the same ones a machine's identity uses.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -16,10 +16,12 @@ use mahbot_peers::tls::{self, PeerPolicy};
 
 /// What the binary tells its operator, verbatim.
 pub const USAGE: &str = "\
-usage: mahbot-beacon-server --listen ADDRESS --key PATH
+usage: mahbot-beacon-server --listen ADDRESS --root DIR
 
   --listen ADDRESS   the UDP address to bind, e.g. 0.0.0.0:4433
-  --key PATH         the beacon's ed25519 key; created with mode 0600 if absent
+  --root DIR         the directory holding the beacon's key: `identity.key`,
+                     created owner-only if absent (mode 0600 on unix, a
+                     protected access list on Windows). It must already exist
 
 The key is the beacon's identity, not its state: clients pin it, so it must
 survive a restart. Registrations do not — they live in memory and nowhere else.
@@ -29,7 +31,7 @@ survive a restart. Registrations do not — they live in memory and nowhere else
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
     pub listen: SocketAddr,
-    pub key: PathBuf,
+    pub root: PathBuf,
 }
 
 /// What one command line asked for.
@@ -47,7 +49,7 @@ impl Invocation {
     /// A message naming the offending argument, ending with [`USAGE`].
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
         let mut listen = None;
-        let mut key = None;
+        let mut root = None;
         let mut args = args.into_iter();
         while let Some(argument) = args.next() {
             match argument.as_str() {
@@ -59,30 +61,19 @@ impl Invocation {
                             .map_err(|_| format!("`{value}` is not a socket address"))?,
                     );
                 }
-                "--key" => {
-                    let value = args.next().ok_or("--key needs a path")?;
-                    key = Some(PathBuf::from(value));
+                "--root" => {
+                    let value = args.next().ok_or("--root needs a directory")?;
+                    root = Some(PathBuf::from(value));
                 }
                 "--help" | "-h" => return Ok(Self::Help),
                 other => return Err(format!("unknown argument `{other}`\n\n{USAGE}")),
             }
         }
-        match (listen, key) {
-            (Some(listen), Some(key)) => Ok(Self::Serve(Config { listen, key })),
+        match (listen, root) {
+            (Some(listen), Some(root)) => Ok(Self::Serve(Config { listen, root })),
             _ => Err(USAGE.to_owned()),
         }
     }
-}
-
-/// Whether a key file's mode keeps it private: no permission for group or other.
-///
-/// Modes are a unix notion, so the predicate is only asked there; it is a pure
-/// function of the number so the rule is witnessed everywhere.
-#[must_use]
-// The mask is the rule: group and other permissions, and nothing else.
-#[allow(clippy::verbose_bit_mask)]
-pub const fn mode_is_private(mode: u32) -> bool {
-    mode & 0o077 == 0
 }
 
 /// A server configuration for the beacon: it presents its own key, accepts any

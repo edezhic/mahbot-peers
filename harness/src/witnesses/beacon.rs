@@ -17,7 +17,7 @@ use mahbot_peers::beacon::{
     Introduction, MAX_CONCURRENT_STREAMS, MAX_FRAME_BYTES, MAX_PAYLOAD_BYTES, PROTOCOL_VERSION,
     Push, Refusal, Request, Response, Session,
 };
-use mahbot_peers::identity::{Identity, PeerId};
+use mahbot_peers::identity::PeerId;
 use mahbot_peers::net::Transport;
 use quinn::AsyncUdpSocket;
 use rustls::SignatureScheme;
@@ -340,7 +340,7 @@ pub(crate) fn introduction_is_signed_by_its_sender() -> Result<(), String> {
 
         // A compromised beacon holds the beacon's key, so it passes the pin, and
         // still cannot speak for a machine: the recipient checks the signature.
-        let impostor = Identity::generate();
+        let impostor = crate::root::detached_identity().map_err(io_error)?;
         let signed = Introduction::signed(&impostor, recipient.peer_id(), payload.clone())
             .map_err(|error| error.to_string())?;
         let forged = Push::Introduction {
@@ -719,6 +719,7 @@ pub(crate) fn unauthenticated_caller_gets_nothing() -> Result<(), String> {
         let trust = TrustSet::default();
         trust.insert(beacon.key());
         let tls = mahbot_peers::tls::client_config_with_resolver(
+            &machine.identity,
             Arc::new(NoCertificate),
             Arc::new(trust),
             mahbot_peers::beacon::ALPN,

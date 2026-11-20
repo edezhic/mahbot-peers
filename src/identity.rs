@@ -1,15 +1,24 @@
 //! The instance identity: one ed25519 key per storage root.
 //!
 //! The fingerprint is the 44-byte RFC 8410 SubjectPublicKeyInfo of the key, and
-//! the peer id is the 32-byte public key inside it. Nothing here touches a file
-//! — how the key is stored and which permissions it carries is not part of this
-//! crate — and the private half stays in this value: it has no textual form and
-//! never reaches `Debug`. Only the public half crosses a boundary, because that
-//! is what peers exchange, and only a signature over a transcript the caller
-//! names crosses it besides.
+//! the peer id is the 32-byte public key inside it. Both are pinned byte for byte:
+//! a peer that presents a key which merely verifies, or a key of the right shape
+//! with one byte changed, is not the peer this machine remembers.
 //!
-//! The key's PKCS#8 bytes are exposed so a caller can persist them itself; the
-//! crate does not know where, or with which permissions.
+//! There is exactly one human rendering of an identity — the 88 lowercase hex
+//! characters of those 44 bytes, [`Fingerprint`]'s `Display`. There is no second,
+//! hashed or shortened spelling: a hash of a fingerprint identifies nothing, and a
+//! shortened one identifies less. A peer id has no rendering of its own, because
+//! it is the same key: [`PeerId`]'s `Debug` prints the fingerprint's bytes too.
+//!
+//! The private half stays in [`Identity`]: it has no textual form and never
+//! reaches `Debug`. Only the public half crosses a boundary, because that is what
+//! peers exchange, and only a signature over a transcript the caller names crosses
+//! it besides.
+//!
+//! The key is minted in exactly one place and only when there is no key file yet:
+//! [`keyfile::load_or_create`]. The crate has no generator on its surface, so no
+//! caller can mint a fresh identity on every start by accident.
 
 use std::fmt;
 use std::sync::Arc;
@@ -17,6 +26,11 @@ use std::sync::Arc;
 use ring::signature::{self, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
+
+/// Who may reach the key file, and the rules that decide it.
+pub mod access;
+/// The key file under a storage root: its name, its format, and its one create.
+pub mod keyfile;
 
 /// RFC 8410 §4: `SEQUENCE { AlgorithmIdentifier id-Ed25519, BIT STRING key }`.
 const ED25519_SPKI_PREFIX: [u8; 12] = [
@@ -31,6 +45,16 @@ pub const PEER_ID_LEN: usize = 32;
 
 /// Length of an ed25519 signature.
 pub const SIGNATURE_LEN: usize = 64;
+
+/// The pinned 44 bytes: the fixed header and the public key. The one place the
+/// fingerprint of a key is assembled, so "the peer id is the key inside it" cannot
+/// drift between a freshly parsed key and one read back from a peer id.
+fn key_spki(key: &[u8; PEER_ID_LEN]) -> Fingerprint {
+    let mut spki = [0u8; FINGERPRINT_LEN];
+    spki[..ED25519_SPKI_PREFIX.len()].copy_from_slice(&ED25519_SPKI_PREFIX);
+    spki[ED25519_SPKI_PREFIX.len()..].copy_from_slice(key);
+    Fingerprint(spki)
+}
 
 /// The public half of an instance identity: what a peer remembers and pins.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -53,6 +77,14 @@ impl PeerId {
         Self(bytes)
     }
 
+    /// The fingerprint this id is the key inside: the one rendering of the
+    /// machine, recoverable from the 32 bytes because an ed25519 SPKI is a fixed
+    /// header followed by exactly this key.
+    #[must_use]
+    pub fn fingerprint(&self) -> Fingerprint {
+        key_spki(&self.0)
+    }
+
     /// Whether `signature` is `message` signed by this id's key.
     ///
     /// Ed25519 only: the key's bytes are the whole public key, and a signature
@@ -66,14 +98,9 @@ impl PeerId {
 }
 
 impl fmt::Debug for PeerId {
+    /// The fingerprint's rendering, not a second one: a machine has one spelling.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_hex(f, &self.0)
-    }
-}
-
-impl fmt::Display for PeerId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_hex(f, &self.0)
+        fmt::Display::fmt(&self.fingerprint(), f)
     }
 }
 
@@ -98,6 +125,25 @@ impl Fingerprint {
         Some(Self(spki))
     }
 
+    /// Read back what [`Fingerprint`]'s `Display` wrote: 88 lowercase hex
+    /// characters, and nothing else.
+    ///
+    /// This is the inverse of the one rendering, which is what makes it a
+    /// rendering of the identity rather than a label for it: a human carrying a
+    /// fingerprint from one machine to another carries these bytes.
+    #[must_use]
+    pub fn from_hex(text: &str) -> Option<Self> {
+        if text.len() != FINGERPRINT_LEN * 2 {
+            return None;
+        }
+        let digits = text.as_bytes();
+        let mut spki = [0u8; FINGERPRINT_LEN];
+        for (index, byte) in spki.iter_mut().enumerate() {
+            *byte = (hex_digit(digits[index * 2])? << 4) | hex_digit(digits[index * 2 + 1])?;
+        }
+        Self::from_spki(&spki)
+    }
+
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; FINGERPRINT_LEN] {
         &self.0
@@ -114,10 +160,12 @@ impl Fingerprint {
 
 impl fmt::Debug for Fingerprint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_hex(f, &self.0)
+        fmt::Display::fmt(self, f)
     }
 }
 
+/// The one rendering of an identity: the 44 pinned bytes as 88 lowercase hex
+/// characters. Lossless — [`Fingerprint::from_hex`] gives the same bytes back.
 impl fmt::Display for Fingerprint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write_hex(f, &self.0)
@@ -136,47 +184,49 @@ pub struct Identity {
 }
 
 impl Identity {
-    /// Generate a fresh identity from the system's randomness.
-    #[must_use]
-    pub fn generate() -> Self {
-        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
-            .expect("system randomness is available");
-        Self::from_der(pkcs8.as_ref()).expect("a generated key parses")
-    }
-
-    /// Rebuild an identity from the PKCS#8 bytes [`Identity::pkcs8`] produced.
+    /// Rebuild an identity from the PKCS#8 bytes a key file holds.
     ///
-    /// `None` for anything that is not a PKCS#8 ed25519 key: a corrupt or
-    /// truncated key file must fail loudly rather than start a second identity.
+    /// `None` for anything that is not the v2 PKCS#8 form of an ed25519 key — the
+    /// one the key file holds, with its public key checked against the seed. A
+    /// corrupt or truncated key file must fail loudly rather than start a second
+    /// identity.
+    ///
+    /// Minting a key is not this function's business — see
+    /// [`keyfile::load_or_create`], which mints only when there is no key file.
     #[must_use]
     pub fn from_pkcs8(pkcs8: &[u8]) -> Option<Self> {
-        Self::from_der(pkcs8)
-    }
-
-    fn from_der(pkcs8: &[u8]) -> Option<Self> {
         let pair = Ed25519KeyPair::from_pkcs8(pkcs8).ok()?;
-        let mut spki = [0u8; FINGERPRINT_LEN];
-        spki[..ED25519_SPKI_PREFIX.len()].copy_from_slice(&ED25519_SPKI_PREFIX);
-        spki[ED25519_SPKI_PREFIX.len()..].copy_from_slice(pair.public_key().as_ref());
+        // `from_pkcs8` checks the public key the structure carries against the
+        // seed, so this is the key the private half belongs to.
+        let key: [u8; PEER_ID_LEN] = pair
+            .public_key()
+            .as_ref()
+            .try_into()
+            .expect("an ed25519 public key is 32 bytes");
+        let fingerprint = key_spki(&key);
         let signer = rustls::crypto::ring::sign::any_supported_type(&PrivateKeyDer::Pkcs8(
             PrivatePkcs8KeyDer::from(pkcs8.to_vec()),
         ))
         .ok()?;
-        let certified = CertifiedKey::new(vec![CertificateDer::from(spki.to_vec())], signer);
+        let certified = CertifiedKey::new(
+            vec![CertificateDer::from(fingerprint.as_bytes().to_vec())],
+            signer,
+        );
         Some(Self {
-            fingerprint: Fingerprint(spki),
+            fingerprint,
             pair: Arc::new(pair),
             pkcs8: Arc::from(pkcs8),
             certified: Arc::new(certified),
         })
     }
 
-    /// The private key as PKCS#8 bytes, for a caller that persists it.
+    /// The private key as PKCS#8 bytes: what the key file holds, byte for byte.
     ///
-    /// The crate has no opinion on where those bytes go or which permissions the
-    /// file carries; that is the caller's storage rule, not the identity's.
+    /// Crate-internal: a key is persisted by [`keyfile::load_or_create`], which
+    /// owns the name, the format and the permissions, so there is no second way to
+    /// store one and no reason to hand the private half out.
     #[must_use]
-    pub fn pkcs8(&self) -> &[u8] {
+    pub(crate) fn pkcs8(&self) -> &[u8] {
         &self.pkcs8
     }
 
@@ -211,6 +261,16 @@ impl Identity {
 impl fmt::Debug for Identity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Identity").field(&self.fingerprint).finish()
+    }
+}
+
+/// One lowercase hex digit, and nothing else: an identity has one spelling, so the
+/// uppercase form of the same bytes is not it.
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
     }
 }
 

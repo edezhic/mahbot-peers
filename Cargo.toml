@@ -12,9 +12,9 @@ keywords = ["p2p", "quic", "agent"]
 categories = ["network-programming"]
 rust-version = "1.96"
 # Not part of the package the registry builds: the test harness, the beacon
-# library and its server, this checkout's toolchain file, its ignore list and the
-# plan kept beside it. The member paths are anchored: an unanchored `beacon`
-# would also match the library's own `src/beacon/`.
+# library and its server, the Windows type-check crate, this checkout's toolchain
+# file, its ignore list and the plan kept beside it. The member paths are anchored:
+# an unanchored `beacon` would also match the library's own `src/beacon/`.
 exclude = [
     ".DS_Store",
     ".gitignore",
@@ -22,17 +22,31 @@ exclude = [
     "/beacon",
     "/beacon-server",
     "/harness",
+    "/windows-check",
     "rust-toolchain.toml",
 ]
 
 [workspace]
-members = ["harness", "beacon", "beacon-server"]
+members = ["harness", "beacon", "beacon-server", "windows-check"]
 # A workspace root that is also a package defaults to itself alone, which would
 # leave `cargo test` at the root running the library and skipping the harness.
 # The beacon server's binary is left out on purpose: it is the one package that
 # enables quinn's tokio runtime, and building it in the same invocation would
 # give the harness's tokio a `time` feature it deliberately does without.
 default-members = [".", "harness", "beacon"]
+
+# The Windows access list is read and written by the key-file reader, and by the
+# `windows-check` crate that compiles that reader for both Windows targets here; one
+# declaration keeps the two from asking for different features.
+[workspace.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
 
 [dependencies]
 # QUIC over rustls with raw public keys (RFC 7250). No runtime feature: the
@@ -46,3 +60,21 @@ quinn = { version = "0.11.12", default-features = false, features = ["rustls-rin
 quinn-proto = { version = "0.11.19", default-features = false }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 ring = "0.17.14"
+# Creating the key file: a temporary file beside it, flushed, published by an
+# operation that fails when the name exists. `tempfile` is the crate that does
+# that portably — `renameat2(RENAME_NOREPLACE)` where the kernel has it,
+# `MoveFileEx` without replace on Windows — and it creates the file with mode 0600
+# on unix. Writing it by hand is where the half-written key would come from.
+tempfile = "3"
+
+# The account that decides who besides the owner may read the key file —
+# `geteuid`, and `getpwuid_r`/`passwd` to name a uid — plus the open flags that
+# refuse a link (`O_NOFOLLOW`, `O_NONBLOCK`, `ELOOP`). `libc` declares no Darwin
+# ACL function, so the six are declared in `src/identity/access/unix.rs` instead.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# The DACL of the key file: which accounts may read it is a Windows access list,
+# not a mode, so keeping the file private means writing and reading one.
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

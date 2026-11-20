@@ -51,6 +51,44 @@ where
     }
 }
 
+/// The procedure rules, run over every recorded procedure whatever this host can
+/// produce: a capability that carries one on this host is judged even when this host
+/// witnesses the state it describes, so a stale procedure cannot hide behind a passing
+/// case. Each entry carries its own text, so there is no id to type twice.
+pub(crate) fn procedures_are_runnable() -> Result<(), String> {
+    let recorded: Vec<(&'static str, &'static str)> = crate::inventory::capabilities()
+        .into_iter()
+        .filter_map(|entry| entry.procedure.map(|how| (entry.id, how)))
+        .collect();
+    // A record nobody can read is as bad as none: the floor keeps a shrinking identity
+    // set from looking like a pass. The two procedures outside that module are judged
+    // too but do not count towards the six.
+    let identity = recorded
+        .iter()
+        .filter(|(id, _)| id.starts_with("library.identity."))
+        .count();
+    if identity < 6 {
+        return Err(format!(
+            "{identity} identity procedures are recorded, not the six the module has"
+        ));
+    }
+    for (id, how) in &recorded {
+        let violations = crate::inventory::procedure_violations(id, how);
+        if !violations.is_empty() {
+            return Err(format!(
+                "the procedure for {id} breaks {} rule(s): {}",
+                violations.len(),
+                violations
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn inventory_check_is_two_way() -> Result<(), String> {
     let claim = Capability::witnessed("test.claim", "a claim");
     let case = |case: fn() -> Result<(), String>| Witness {
@@ -72,7 +110,8 @@ pub(crate) fn inventory_check_is_two_way() -> Result<(), String> {
         &[Capability::unproducible(
             "test.impossible",
             "a claim",
-            "no case can exist",
+            "no case can exist here",
+            "a host that can runs the procedure",
         )],
         &[Witness {
             id: "test.case",
@@ -114,11 +153,76 @@ pub(crate) fn inventory_check_is_two_way() -> Result<(), String> {
     )?;
     must_report_where(
         &check_inventory(
-            &[Capability::unproducible("test.blank", "a claim", "   ")],
+            &[Capability::unproducible(
+                "test.blank",
+                "a claim",
+                "   ",
+                "a procedure",
+            )],
             &[],
         ),
         "an unproducible entry with no reason",
-        |violation| matches!(violation, InventoryViolation::EmptyReason { .. }),
+        |violation| matches!(violation, InventoryViolation::NoReason { .. }),
+    )?;
+    must_report_where(
+        &check_inventory(
+            &[Capability::unproducible(
+                "test.blank",
+                "a claim",
+                "a reason",
+                "   ",
+            )],
+            &[],
+        ),
+        "an unproducible entry with no procedure",
+        |violation| matches!(violation, InventoryViolation::NoProcedure { .. }),
+    )?;
+    must_report_where(
+        &check_inventory(
+            &[Capability::unproducible(
+                "test.placeholder",
+                "a claim",
+                "a reason",
+                "run `chmod 644 <root>/identity.key`",
+            )],
+            &[],
+        ),
+        "an unproducible entry with a placeholder",
+        |violation| {
+            matches!(
+                violation,
+                InventoryViolation::Placeholder {
+                    placeholder: "<root>",
+                    ..
+                }
+            )
+        },
+    )?;
+    must_report_where(
+        &check_inventory(
+            &[Capability::unproducible(
+                "test.live",
+                "a claim",
+                "a reason",
+                "run `chmod 644 identity.key` in the product's own root",
+            )],
+            &[],
+        ),
+        "an unproducible entry that changes a live key file",
+        |violation| matches!(violation, InventoryViolation::NotOnScratchRoot { .. }),
+    )?;
+    must_report_where(
+        &check_inventory(
+            &[Capability::unproducible(
+                "test.stale",
+                "a claim",
+                "a reason",
+                "it offers the repair `chmod 600 it`",
+            )],
+            &[],
+        ),
+        "an unproducible entry quoting a pathless repair",
+        |violation| matches!(violation, InventoryViolation::PathlessCommand { .. }),
     )?;
     must_report_where(
         &check_inventory(&[claim], &[case(panicking_case)]),

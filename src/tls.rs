@@ -20,6 +20,62 @@ use crate::identity::{Fingerprint, Identity};
 /// handshake instead of reaching application code. The beacon has its own.
 pub const ALPN: &[u8] = b"mahbot-peers/1";
 
+/// Why a handshake refused the key a peer presented.
+///
+/// The two are told apart because they mean different things and lead to
+/// different actions: an untrusted peer is a stranger or a revoked machine, while
+/// our own identity arriving from the network is a copy of this machine's storage
+/// root, which no amount of pairing can make into a second machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// The peer presented this machine's own key: a copy of the storage root, not
+    /// another machine. Two peers with one identity are one machine, so the
+    /// connection is refused instead of talking to ourselves.
+    OwnIdentity,
+    /// The peer presented a key this machine does not remember.
+    Untrusted,
+}
+
+impl Refusal {
+    /// The words the refusal carries into the local handshake error.
+    pub(crate) const fn phrase(self) -> &'static str {
+        match self {
+            Self::OwnIdentity => "is this machine's own identity",
+            Self::Untrusted => "is not a trusted peer",
+        }
+    }
+
+    /// The reason a refusal left behind, when the text is one of ours.
+    ///
+    /// rustls hands a refused key back as an opaque error, and quinn carries the
+    /// text of whichever side ended the connection — so the value is a reading of
+    /// text, not a decision. [`crate::net::refusal`] is the way in for a failed
+    /// connection.
+    pub(crate) fn of(reason: &str) -> Option<Self> {
+        [Self::OwnIdentity, Self::Untrusted]
+            .into_iter()
+            .find(|refusal| reason.contains(refusal.phrase()))
+    }
+}
+
+/// Whether a presented key is refused, and why.
+///
+/// The machine's own key is decided first: a restored backup is a copy of a
+/// machine that is still running, and no policy entry can make it a peer.
+pub(crate) fn refusal(
+    me: &Fingerprint,
+    presented: &Fingerprint,
+    policy: &dyn PeerPolicy,
+) -> Option<Refusal> {
+    if presented == me {
+        Some(Refusal::OwnIdentity)
+    } else if policy.trusts(presented) {
+        None
+    } else {
+        Some(Refusal::Untrusted)
+    }
+}
+
 /// Who a connection may talk to. A machine's peer store implements this; the
 /// test harness backs it with an in-memory set of fingerprints.
 pub trait PeerPolicy: fmt::Debug + Send + Sync {
@@ -37,6 +93,7 @@ pub fn client_config(
     alpn: &[u8],
 ) -> Result<rustls::ClientConfig, rustls::Error> {
     client_config_with_resolver(
+        me,
         Arc::new(rustls::client::AlwaysResolvesClientRawPublicKeys::new(
             me.certified_key(),
         )),
@@ -48,8 +105,11 @@ pub fn client_config(
 /// A client configuration with a caller-supplied certificate resolver.
 ///
 /// The resolver is where the client's identity comes from, so a caller can
-/// present a key it holds elsewhere — or, in a test, present none at all.
+/// present a key it holds elsewhere — or, in a test, present none at all. `me` is
+/// still needed: it names the machine whose own key must never be accepted back
+/// from the network.
 pub fn client_config_with_resolver(
+    me: &Identity,
     resolver: Arc<dyn rustls::client::ResolvesClientCert>,
     policy: Arc<dyn PeerPolicy>,
     alpn: &[u8],
@@ -58,13 +118,17 @@ pub fn client_config_with_resolver(
     let mut config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinnedServer { policy, provider }))
+        .with_custom_certificate_verifier(Arc::new(PinnedServer {
+            me: me.fingerprint(),
+            policy,
+            provider,
+        }))
         .with_client_cert_resolver(resolver);
     config.alpn_protocols = vec![alpn.to_vec()];
     Ok(config)
 }
 
-/// A server configuration that pins the client's fingerprint.
+/// A server configuration that pins the client's fingerprint and refuses our own.
 pub fn server_config(
     me: &Identity,
     policy: Arc<dyn PeerPolicy>,
@@ -73,7 +137,11 @@ pub fn server_config(
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut config = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
         .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_client_cert_verifier(Arc::new(PinnedClient { policy, provider }))
+        .with_client_cert_verifier(Arc::new(PinnedClient {
+            me: me.fingerprint(),
+            policy,
+            provider,
+        }))
         .with_cert_resolver(Arc::new(
             rustls::server::AlwaysResolvesServerRawPublicKeys::new(me.certified_key()),
         ));
@@ -83,6 +151,7 @@ pub fn server_config(
 
 #[derive(Debug)]
 struct PinnedServer {
+    me: Fingerprint,
     policy: Arc<dyn PeerPolicy>,
     provider: Arc<CryptoProvider>,
 }
@@ -96,7 +165,7 @@ impl ServerCertVerifier for PinnedServer {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        pin(&self.policy, end_entity)?;
+        pin(self.me, &self.policy, end_entity)?;
         Ok(ServerCertVerified::assertion())
     }
 
@@ -136,6 +205,7 @@ impl ServerCertVerifier for PinnedServer {
 
 #[derive(Debug)]
 struct PinnedClient {
+    me: Fingerprint,
     policy: Arc<dyn PeerPolicy>,
     provider: Arc<CryptoProvider>,
 }
@@ -151,7 +221,7 @@ impl ClientCertVerifier for PinnedClient {
         _intermediates: &[CertificateDer<'_>],
         _now: UnixTime,
     ) -> Result<ClientCertVerified, rustls::Error> {
-        pin(&self.policy, end_entity)?;
+        pin(self.me, &self.policy, end_entity)?;
         Ok(ClientCertVerified::assertion())
     }
 
@@ -190,16 +260,21 @@ impl ClientCertVerifier for PinnedClient {
 }
 
 /// The pin itself: exactly 44 bytes of Ed25519 SubjectPublicKeyInfo, trusted by
-/// policy. Anything else is refused before its signature is even looked at.
-fn pin(policy: &Arc<dyn PeerPolicy>, presented: &CertificateDer<'_>) -> Result<(), rustls::Error> {
+/// policy and never this machine's own key. Anything else is refused before its
+/// signature is even looked at.
+fn pin(
+    me: Fingerprint,
+    policy: &Arc<dyn PeerPolicy>,
+    presented: &CertificateDer<'_>,
+) -> Result<(), rustls::Error> {
     let fingerprint = Fingerprint::from_spki(presented.as_ref()).ok_or_else(|| {
         rustls::Error::General("peer presented a key that is not an ed25519 SPKI".into())
     })?;
-    if policy.trusts(&fingerprint) {
-        Ok(())
-    } else {
-        Err(rustls::Error::General(format!(
-            "peer {fingerprint} is not trusted"
-        )))
+    match refusal(&me, &fingerprint, policy.as_ref()) {
+        None => Ok(()),
+        Some(refusal) => Err(rustls::Error::General(format!(
+            "peer {fingerprint} {}",
+            refusal.phrase()
+        ))),
     }
 }

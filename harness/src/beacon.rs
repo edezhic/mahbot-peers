@@ -62,7 +62,7 @@ impl TestBeacon {
     /// Start a beacon that serves at most `max` connections at once.
     pub fn start_with_limit(sim: &Sim, max: usize) -> io::Result<Self> {
         let beacon = Self {
-            identity: Identity::generate(),
+            identity: crate::root::detached_identity()?,
             socket: sim.link().attach_next(),
             link: sim.link().clone(),
             clock: sim.clock().clone(),

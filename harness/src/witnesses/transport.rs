@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use mahbot_peers::identity::Identity;
+use mahbot_peers::identity::Fingerprint;
 use mahbot_peers::net::{DEFAULT_IDLE_TIMEOUT, Transport, TransportError};
 use mahbot_peers::tls::{ALPN, PeerPolicy};
 use quinn::AsyncUdpSocket;
@@ -28,7 +28,7 @@ pub(crate) fn endpoint_from_injected_seams() -> Result<(), String> {
             .endpoint(
                 Arc::clone(&socket) as Arc<dyn AsyncUdpSocket>,
                 sim.clock().runtime(),
-                &Identity::generate(),
+                &crate::root::detached_identity().map_err(io_error)?,
                 Arc::new(TrustSet::default()),
             )
             .map_err(|error| error.to_string())?;
@@ -55,7 +55,7 @@ pub(crate) fn idle_timeout_bounds() -> Result<(), String> {
         match transport.endpoint(
             Arc::clone(&socket) as Arc<dyn AsyncUdpSocket>,
             sim.clock().runtime(),
-            &Identity::generate(),
+            &crate::root::detached_identity().map_err(io_error)?,
             Arc::new(TrustSet::default()),
         ) {
             Err(TransportError::IdleTimeout) => {}
@@ -433,6 +433,120 @@ pub(crate) fn closed_custom_endpoint_is_reported() -> Result<(), String> {
                 "a closed endpoint was not reported as closed: {other:?}"
             )),
         }
+    })
+}
+
+/// A peer that presents this machine's own key is refused for being a copy, and
+/// the reason is not the one an untrusted stranger gets.
+pub(crate) fn own_identity_is_refused() -> Result<(), String> {
+    use mahbot_peers::net::refusal;
+    use mahbot_peers::tls::Refusal;
+
+    block_on(async {
+        let sim = Sim::new().map_err(io_error)?;
+        let original = sim.machine().map_err(io_error)?;
+        let clone = sim.clone_of(&original).map_err(io_error)?;
+        if clone.fingerprint() != original.fingerprint() {
+            return Err("a copy of a root did not carry its identity".to_owned());
+        }
+        if clone.root_id() == original.root_id() {
+            return Err("a clone shares the root it was copied from".to_owned());
+        }
+        // A clone would have been paired with itself: its peer list holds the very
+        // key it presents, so the refusal cannot be the policy's.
+        original.trust(&clone);
+        clone.trust(&original);
+        for (dialer, listener) in [(&original, &clone), (&clone, &original)] {
+            let refused = match connect(dialer, listener).await {
+                Ok(_) => {
+                    return Err("a peer presenting this machine's own key was accepted".to_owned());
+                }
+                Err(ConnectError::Connection(error)) => refusal(&error),
+                Err(other) => {
+                    return Err(format!("the refusal came from the wrong layer: {other}"));
+                }
+            };
+            if refused != Some(Refusal::OwnIdentity) {
+                return Err(format!(
+                    "a clone was refused as {refused:?}, not as this machine's own identity"
+                ));
+            }
+        }
+
+        // The same failure with a different cause reads differently: a peer whose
+        // key this machine does not remember is untrusted, not a copy.
+        let sim = Sim::new().map_err(io_error)?;
+        let dialer = sim.machine().map_err(io_error)?;
+        let stranger = sim.machine().map_err(io_error)?;
+        stranger.trust(&dialer);
+        match connect(&dialer, &stranger).await {
+            Err(ConnectError::Connection(error)) => {
+                if refusal(&error) != Some(Refusal::Untrusted) {
+                    return Err(format!(
+                        "an unpinned peer was refused as {:?}, not as untrusted",
+                        refusal(&error)
+                    ));
+                }
+            }
+            other => return Err(format!("an unpinned peer was not refused: {other:?}")),
+        }
+        // Text that is not one of our refusals reads back as no refusal at all. The
+        // reader cannot tell who wrote the text, which is why what it answers is a
+        // log line and not evidence.
+        let foreign = quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+            error_code: quinn::VarInt::from_u32(0),
+            reason: b"the peer went away".to_vec().into(),
+        });
+        if refusal(&foreign).is_some() {
+            return Err("an unrelated close reason was read as a refusal".to_owned());
+        }
+        Ok(())
+    })
+}
+
+/// The 44 bytes the handshake pins, the 88 characters a human reads and the bytes
+/// the other machine computes are one value.
+pub(crate) fn handshake_value_is_the_pinned_bytes() -> Result<(), String> {
+    block_on(async {
+        let sim = Sim::new().map_err(io_error)?;
+        let (client, server) = sim.trusting_pair().map_err(io_error)?;
+        let pair = connect(&client, &server).await.map_err(|e| e.to_string())?;
+        for (side, connection, expected) in [
+            ("server", &pair.server, client.fingerprint()),
+            ("client", &pair.client, server.fingerprint()),
+        ] {
+            let identity = connection
+                .peer_identity()
+                .ok_or_else(|| format!("the {side} recorded no peer identity"))?;
+            let presented = identity
+                .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+                .map_err(|_| format!("the {side} recorded an identity of another type"))?;
+            if presented.len() != 1 {
+                return Err(format!(
+                    "the {side} received {} keys, not the one a raw public key sends",
+                    presented.len()
+                ));
+            }
+            let pinned = Fingerprint::from_spki(presented[0].as_ref())
+                .ok_or_else(|| format!("what the {side} received is not an ed25519 SPKI"))?;
+            if pinned != expected {
+                return Err(format!(
+                    "the {side} pinned {pinned}, but the peer calls itself {expected}"
+                ));
+            }
+            if Fingerprint::from_hex(&pinned.to_string()) != Some(pinned) {
+                return Err(format!(
+                    "the {side}'s 44 bytes do not read back from the 88 characters shown"
+                ));
+            }
+        }
+        // And the pin is what the trusting side's policy was asked about.
+        if !server.trust.contains(&client.fingerprint())
+            || !client.trust.contains(&server.fingerprint())
+        {
+            return Err("a completed handshake left the peer out of the trust set".to_owned());
+        }
+        Ok(())
     })
 }
 

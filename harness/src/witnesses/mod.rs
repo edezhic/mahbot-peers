@@ -1,7 +1,7 @@
 //! The recorded cases.
 //!
-//! Each case is a plain function returning `Result<(), String>`, and the table
-//! below is the one place a case is listed. The summary check in
+//! Each case is a plain function returning `Result<(), String>`, and the tables
+//! below are the one place a case is listed. The summary check in
 //! `tests/summary.rs` runs the whole table through the inventory check, so a
 //! failure names the case that failed; there are no per-case `#[test]` wrappers
 //! to keep in step with it.
@@ -11,8 +11,14 @@
 //! timer sleep does not compile and a wall-clock wait cannot pass quietly.
 //!
 //! The cases are grouped by the seam they exercise. Each is `pub(crate)` and
-//! reached only through the table below, so a case that is not in the table is
+//! reached only through the tables below, so a case that is not in one of them is
 //! an unused function and fails the lint gate.
+//!
+//! Some cases are per platform: a case about unix mode bits or a macOS extended
+//! access entry cannot run on a host that has neither, and the inventory then
+//! records the capability as unproducible with the procedure that produces it. The
+//! tables are composed for the host rather than silently shortened, so what this
+//! host cannot produce is named as unreachable, with what to do about it.
 
 use crate::inventory::Witness;
 
@@ -26,8 +32,57 @@ mod server;
 mod support;
 mod transport;
 
-/// Every recorded case, and the capability it speaks for.
-pub const WITNESSES: &[Witness] = &[
+/// Every recorded case this host can run, and the capability it speaks for.
+#[must_use]
+pub fn witnesses() -> Vec<Witness> {
+    let mut all = WITNESSES.to_vec();
+    all.extend_from_slice(UNIX_WITNESSES);
+    all.extend_from_slice(MACOS_WITNESSES);
+    all
+}
+
+/// The cases that need unix modes, links and ownership.
+#[cfg(unix)]
+pub const UNIX_WITNESSES: &[Witness] = &[
+    Witness {
+        id: "key_file_refuses_other_readers",
+        capability: "library.identity.key_file.insecure_file",
+        case: identity::key_file_refuses_other_readers,
+    },
+    Witness {
+        id: "unix_account_names_are_exact",
+        capability: "library.identity.access.unix_account_names",
+        case: identity::unix_account_names_are_exact,
+    },
+];
+
+/// Nothing on a host without unix modes; `platform_capabilities` records the case
+/// as unproducible here, with the procedure that produces the file states.
+#[cfg(not(unix))]
+pub const UNIX_WITNESSES: &[Witness] = &[];
+
+/// The cases that need an extended access list.
+#[cfg(target_os = "macos")]
+pub const MACOS_WITNESSES: &[Witness] = &[
+    Witness {
+        id: "key_file_refuses_an_extended_entry",
+        capability: "library.identity.key_file.extended_acl",
+        case: identity::key_file_refuses_an_extended_entry,
+    },
+    Witness {
+        id: "key_file_refuses_a_sharing_root",
+        capability: "library.identity.key_file.root_access_list",
+        case: identity::key_file_refuses_a_sharing_root,
+    },
+];
+
+/// Nothing on a host without extended access lists; `platform_capabilities` records
+/// the case as unproducible here, with the procedure that produces the file state.
+#[cfg(not(target_os = "macos"))]
+pub const MACOS_WITNESSES: &[Witness] = &[];
+
+/// Every recorded case every host runs, and the capability it speaks for.
+const WITNESSES: &[Witness] = &[
     Witness {
         id: "identity_fingerprint_is_spki",
         capability: "library.identity.spki_fingerprint",
@@ -189,6 +244,11 @@ pub const WITNESSES: &[Witness] = &[
         case: checks::inventory_check_is_two_way,
     },
     Witness {
+        id: "procedures_are_runnable",
+        capability: "harness.inventory.procedures_are_runnable",
+        case: checks::procedures_are_runnable,
+    },
+    Witness {
         id: "invariant_check_is_two_way",
         capability: "harness.check.invariant_two_way",
         case: checks::invariant_check_is_two_way,
@@ -313,4 +373,58 @@ pub const WITNESSES: &[Witness] = &[
         capability: "harness.sim.no_shared_state",
         case: machines::simulations_share_no_state,
     },
+    Witness {
+        id: "key_file_is_one_identity_per_root",
+        capability: "library.identity.key_file.one_identity_per_root",
+        case: identity::key_file_is_one_identity_per_root,
+    },
+    Witness {
+        id: "key_file_is_created_once_under_race",
+        capability: "library.identity.key_file.created_once",
+        case: identity::key_file_is_created_once_under_race,
+    },
+    Witness {
+        id: "key_file_refuses_a_broken_key",
+        capability: "library.identity.key_file.malformed",
+        case: identity::key_file_refuses_a_broken_key,
+    },
+    Witness {
+        id: "unix_rule_is_exact",
+        capability: "library.identity.access.unix_rule",
+        case: identity::unix_rule_is_exact,
+    },
+    Witness {
+        id: "extended_access_rule_is_exact",
+        capability: "library.identity.access.extended_rule",
+        case: identity::extended_access_rule_is_exact,
+    },
+    Witness {
+        id: "windows_dacl_rule_is_exact",
+        capability: "library.identity.access.dacl_rule",
+        case: identity::windows_dacl_rule_is_exact,
+    },
+    Witness {
+        id: "one_rendering_round_trips",
+        capability: "library.identity.one_rendering",
+        case: identity::one_rendering_round_trips,
+    },
+    Witness {
+        id: "no_key_rotation_is_proven",
+        capability: "harness.invariant.no_key_rotation",
+        case: identity::no_key_rotation_is_proven,
+    },
+    Witness {
+        id: "own_identity_is_refused",
+        capability: "library.tls.own_identity_refused",
+        case: transport::own_identity_is_refused,
+    },
+    Witness {
+        id: "handshake_value_is_the_pinned_bytes",
+        capability: "library.tls.pinned_value",
+        case: transport::handshake_value_is_the_pinned_bytes,
+    },
 ];
+
+// The host-independent part of the table, which the platform tables add to. This is
+// the floor that keeps a shrinking table from looking like a pass.
+const _: () = assert!(WITNESSES.len() >= 68, "the shared witness table shrank");

@@ -49,6 +49,12 @@ pub(crate) async fn within<F: Future>(
         .ok_or_else(|| format!("no answer within {budget:?} of virtual time"))
 }
 
+/// A private temporary directory for a case that needs a storage root of its own
+/// without a simulated world around it: the key-file cases.
+pub(crate) fn temp_root() -> Result<tempfile::TempDir, String> {
+    crate::root::identity_dir().map_err(io_error)
+}
+
 /// A machine's server-side TLS configuration, pinning the peers it trusts.
 pub(crate) fn server_tls(machine: &Machine) -> Result<rustls::ServerConfig, String> {
     let policy: Arc<dyn PeerPolicy> = Arc::clone(&machine.trust) as Arc<dyn PeerPolicy>;

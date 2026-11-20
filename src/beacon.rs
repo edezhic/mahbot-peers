@@ -112,7 +112,7 @@ impl fmt::Display for BeaconError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unavailable => f.write_str("the beacon is unavailable"),
-            Self::UnknownPeer(id) => write!(f, "peer {id} is not reachable"),
+            Self::UnknownPeer(id) => write!(f, "peer {} is not reachable", id.fingerprint()),
             Self::PayloadTooLarge(len) => write!(
                 f,
                 "an introduction of {len} bytes exceeds {MAX_PAYLOAD_BYTES}"
@@ -127,7 +127,8 @@ impl fmt::Display for BeaconError {
             Self::UnauthenticatedIntroduction { from } => {
                 write!(
                     f,
-                    "an introduction claiming to be from {from} is not signed by it"
+                    "an introduction claiming to be from {} is not signed by it",
+                    from.fingerprint()
                 )
             }
             Self::Unexpected(answer) => {
@@ -277,6 +278,7 @@ pub fn client_config(
     beacon: Fingerprint,
 ) -> Result<quinn::ClientConfig, BeaconError> {
     let tls = tls::client_config_with_resolver(
+        me,
         Arc::new(rustls::client::AlwaysResolvesClientRawPublicKeys::new(
             me.certified_key(),
         )),

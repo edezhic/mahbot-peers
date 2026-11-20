@@ -187,10 +187,13 @@ dependencies = [
 name = "mahbot-peers"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "quinn",
  "quinn-proto",
  "ring",
  "rustls",
+ "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -204,6 +207,14 @@ dependencies = [
  "rustls",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "mahbot-peers-windows-check"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -12,7 +12,6 @@
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use mahbot_peers::identity::Identity;
 use ring::rand::SecureRandom;
 use tempfile::TempDir;
 
@@ -61,15 +60,33 @@ impl Sim {
         &self.link
     }
 
-    /// Create a machine with a fresh identity, its own root and its own address.
+    /// Create a machine: its own root with a key file in it, and its own address.
     pub fn machine(&self) -> io::Result<Machine> {
+        self.machine_on(self.root()?)
+    }
+
+    /// Create a machine whose key is a copy of `original`'s, as restoring a backup
+    /// of one machine onto another gives: the same identity, a second machine.
+    ///
+    /// Two roots are two peers, and this is the one way they can share a key. The
+    /// transport refuses a peer that presents this machine's own key, so such a
+    /// pair never connects; that refusal is a case of its own.
+    pub fn clone_of(&self, original: &Machine) -> io::Result<Machine> {
+        let root = self.root()?;
+        original.root.copy_key_into(&root)?;
+        self.machine_on(root)
+    }
+
+    fn root(&self) -> io::Result<Root> {
         let index = self.next.fetch_add(1, Ordering::Relaxed);
-        let root = Root::create(RootId::new(self.nonce, index), self.dir.path())?;
-        let socket = self.link.attach_next();
+        Root::create(RootId::new(self.nonce, index), self.dir.path())
+    }
+
+    fn machine_on(&self, root: Root) -> io::Result<Machine> {
         Ok(Machine::new(
-            Identity::generate(),
+            root.load_identity()?,
             root,
-            socket,
+            self.link.attach_next(),
             self.link.clone(),
             self.clock.clone(),
         ))

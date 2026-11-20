@@ -12,12 +12,14 @@
 //! what it is: it contains the forbidden constructs as data, and a checker's own
 //! pattern list is not evidence.
 //!
-//! One source file beyond this one is excluded, and the exclusion is data too: the
-//! beacon server's process entry point binds a real socket, reads the
-//! environment and reads the wall clock, because that is what a process entry
-//! point is for. [`EXCLUDED`] names it and says why, the summary check proves the
-//! list is exactly that one file, and the same check proves the file still needs
-//! its exclusion — so the exception cannot quietly grow or go stale.
+//! One source file beyond this one is exempt from some invariants, and the
+//! exemption is data too: the beacon server's process entry point binds a real
+//! socket, reads the environment and reads the wall clock, because that is what a
+//! process entry point is for. [`EXEMPT`] names it, the invariants it does not
+//! answer to, and why; every other invariant judges it like any other source, so
+//! its key handling is scanned. The summary check proves the list is exactly that
+//! one file, that each exemption is needed, and that nothing else about the file
+//! is excused.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -48,9 +50,11 @@ impl fmt::Display for Finding {
 pub struct Invariant {
     pub id: &'static str,
     pub claim: &'static str,
-    /// The files this invariant covers, by display path. Empty means every
-    /// source, which is the usual case; a claim about one file names it here
-    /// rather than hiding a path comparison inside its check.
+    /// The files this invariant covers, by display path; an entry ending in `/`
+    /// covers everything under that directory. Empty means every source, which is
+    /// the usual case; a claim about one module names it here rather than hiding a
+    /// path comparison inside its check. A file that does not answer to this
+    /// invariant at all says so in [`EXEMPT`].
     pub scope: &'static [&'static str],
     /// A snippet this invariant's check must flag. It is scanned in-process, so
     /// the proof that the check is awake costs no subprocess and no fixture.
@@ -61,8 +65,17 @@ pub struct Invariant {
 impl Invariant {
     #[must_use]
     pub fn covers(&self, path: &str) -> bool {
-        self.scope.is_empty() || self.scope.contains(&path)
+        self.scope.is_empty() || in_scope(self.scope, path)
     }
+}
+
+/// Whether `path` is one of `scopes`: a file named outright, or anything under an
+/// entry that ends in `/`.
+fn in_scope(scopes: &[&str], path: &str) -> bool {
+    scopes.iter().any(|entry| match entry.strip_suffix('/') {
+        Some(_) => path.starts_with(entry),
+        None => *entry == path,
+    })
 }
 
 impl fmt::Debug for Invariant {
@@ -146,14 +159,18 @@ pub fn check(invariants: &[Invariant], sources: &[Source]) -> Report {
                 invariant: invariant.id,
             });
         }
-        if !sources.is_empty() && !sources.iter().any(|source| invariant.covers(&source.path)) {
+        if !sources.is_empty()
+            && !sources
+                .iter()
+                .any(|source| invariant.covers(&source.path) && !exempt(invariant.id, &source.path))
+        {
             report.violations.push(Violation::ScopeNotFound {
                 invariant: invariant.id,
             });
         }
         for source in sources
             .iter()
-            .filter(|source| invariant.covers(&source.path))
+            .filter(|source| invariant.covers(&source.path) && !exempt(invariant.id, &source.path))
         {
             for finding in (invariant.check)(source) {
                 report.violations.push(Violation::Found {
@@ -203,24 +220,86 @@ pub const CLOCK_FILE: &str = "harness/src/clock.rs";
 /// not evidence.
 pub const TABLE_FILE: &str = "harness/src/invariants.rs";
 
-/// The beacon server's process entry point: the one file the scan excludes.
+/// The beacon server's process entry point: the one file with an exemption.
 pub const ENTRY_FILE: &str = "beacon-server/src/main.rs";
 
-/// A source file the scan skips, and the reason it must.
+/// A source file that some invariants do not cover, and why.
+///
+/// The exemption is per invariant, not per file: a file listed here is scanned
+/// like any other by every invariant not named in [`Exemption::exempt_from`], so an
+/// exemption cannot hide a claim the file is still supposed to answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Exclusion {
+pub struct Exemption {
     pub path: &'static str,
+    /// The invariants this file does not answer to, by id.
+    pub exempt_from: &'static [&'static str],
     pub reason: &'static str,
 }
 
-/// The documented exclusions: exactly one, and the summary check proves it.
-pub const EXCLUDED: &[Exclusion] = &[Exclusion {
+/// The documented exemptions: exactly one file, and the summary check proves both
+/// that each listed invariant is still tripped by the file and that no other one
+/// is.
+pub const EXEMPT: &[Exemption] = &[Exemption {
     path: ENTRY_FILE,
-    reason: "the process entry point: it binds the UDP socket, reads the listening address and key path from the command line, owns the executor and the wall clock, and owns the key file — the exclusive create with mode 0600 on unix, the retry when a racing process wins the create or is caught mid-write, and the refusal of a file other users can read. What the command line means, whether a mode is private and how the server is configured are pure functions in the `mahbot-beacon` library, which the scan covers.",
+    exempt_from: &[
+        "workspace.no_ambient_configuration",
+        "workspace.no_real_sockets",
+        "workspace.single_source_of_time",
+    ],
+    reason: "the process entry point: it binds the UDP socket, reads the listening address and the directory holding its key from the command line, owns the executor and the wall clock. Everything else is scanned here like anywhere: how the command line is read, what it means and how the server is configured are pure functions in `mahbot-beacon`, and the key file is the peer library's `identity.key`, reached only through `keyfile::load_or_create` — so it stays under `identity.key_is_never_replaced`, `identity.key_file_name_is_one_place` and `identity.key_is_minted_in_one_place`, as a machine's identity is.",
 }];
+
+/// Whether `path` does not answer to the invariant `id`: only a documented
+/// exemption excuses a file, and only from the invariants it names.
+#[must_use]
+pub fn exempt(id: &str, path: &str) -> bool {
+    EXEMPT
+        .iter()
+        .any(|exemption| exemption.path == path && exemption.exempt_from.contains(&id))
+}
 
 /// The handle that must not name a path.
 pub const MACHINE_FILE: &str = "harness/src/machine.rs";
+
+/// The only source that may name or write the key file, and the only one that may
+/// mint a key.
+pub const KEY_FILE_SOURCE: &str = "src/identity/keyfile.rs";
+
+/// The module that owns the key file, as a directory scope: the invariant that no
+/// source replaces it covers these files, and reaching the key from anywhere else
+/// would take its name, which `identity.key_file_name_is_one_place` forbids.
+pub const IDENTITY_SCOPE: &[&str] = &["src/identity.rs", "src/identity/"];
+
+/// The crates the scan covers, as directory scopes: a claim about what this
+/// workspace ships leaves the test rig out, since the rig produces the very file
+/// states the key invariants forbid.
+///
+/// A summary check asserts that every scanned source is inside this list or inside
+/// [`UNSHIPPED_SCOPE`], so a crate added beside these cannot stay outside the
+/// key-name invariant by being forgotten here.
+pub const SHIPPED_SCOPE: &[&str] = &["src/", "beacon/", "beacon-server/"];
+
+/// The scanned trees that are not shipped library code: the test rig, the Windows
+/// type-check crate, and the root package's dev targets and build script.
+pub const UNSHIPPED_SCOPE: &[&str] = &[
+    "harness/",
+    "windows-check/",
+    "tests/",
+    "benches/",
+    "examples/",
+    "build.rs",
+];
+
+/// The literal name of the key file, as a code path that means to reach it has to
+/// spell it, for the invariant that only one file does.
+pub const KEY_FILE_NAME: &str = r#""identity.key""#;
+
+/// The call that mints a key, for the invariant that only one place does.
+pub const KEY_MINT: &str = "generate_pkcs8";
+
+/// Every other way to build a key pair, so a second minting path cannot be added
+/// under a different name.
+pub const MINT_FORMS: &[&str] = &[KEY_MINT, "from_seed", "maybe_unchecked"];
 
 /// Every form of ambient read the configuration scanner must catch, and the
 /// look-alikes it must leave alone. They live in this file because it is the one
@@ -313,8 +392,29 @@ pub const INVARIANTS: &[Invariant] = &[
         check: handle_names_no_path,
     },
     Invariant {
+        id: "identity.key_is_never_replaced",
+        claim: "no shipped source removes a directory, renames or copies a path — any of those can take the key with the path it lives in — and no source of the identity module truncates, renames onto, deletes, copies onto or overwrites the key file: the one write path publishes a new file beside it, and a publish that would clobber an existing key is not on this list",
+        scope: SHIPPED_SCOPE,
+        control: "std::fs::remove_dir_all(&root)?;",
+        check: no_key_replacement,
+    },
+    Invariant {
+        id: "identity.key_file_name_is_one_place",
+        claim: "the quoted literal `\"identity.key\"` and the bare name `file_in` — the function that builds the key's path — appear in one source file the crates ship, the key file's own module. Prose that mentions the name reaches no file, and `file_in` is matched at identifier boundaries, so a longer name that ends in it does not count",
+        scope: SHIPPED_SCOPE,
+        control: r#"let key = root.join("identity.key");"#,
+        check: key_file_name_is_one_place,
+    },
+    Invariant {
+        id: "identity.key_is_minted_in_one_place",
+        claim: "a key is minted in exactly one place — the create path of the key file's module — and no other source, the test rig included, can generate an identity at all",
+        scope: &[],
+        control: "let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng)?;",
+        check: key_is_minted_in_one_place,
+    },
+    Invariant {
         id: "beacon.no_persistent_state",
-        claim: "the beacon keeps no state on disk: neither its protocol and client nor its server library touches a file, so a restart loses every registration by construction, and only the process entry point may touch one, for its own key",
+        claim: "the beacon keeps no state on disk: neither its protocol and client nor its server library touches a file, so a restart loses every registration by construction",
         scope: &[
             "src/beacon.rs",
             "src/beacon/client.rs",
@@ -337,48 +437,38 @@ pub fn find(id: &str) -> Option<&'static Invariant> {
     INVARIANTS.iter().find(|invariant| invariant.id == id)
 }
 
-/// Every source file the invariants cover: the library, the beacon crates, the
-/// harness and its tests, because a wall-clock sleep or an environment lookup in
-/// a test breaks the same promises as one in the code under test. The table and
-/// the documented exclusions are skipped; nothing else is.
+/// Every source file the invariants cover: the whole workspace, because a
+/// wall-clock sleep or an environment lookup in a test breaks the same promises as
+/// one in the code under test, and a `build.rs`, `benches/` or `examples/` added to
+/// a crate is scanned without this function changing. Two kinds of directory are
+/// passed over: `target/`, which holds the dependencies' sources, and dotted
+/// directories, which hold tool state. The table is skipped too, and a file's
+/// [`EXEMPT`] entry only takes it out of the invariants it names.
 ///
 /// Paths are relative to the workspace root and always use `/`, so a finding
 /// reads the same on every host.
 #[must_use]
 pub fn workspace_sources() -> Vec<Source> {
-    let harness_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workspace_dir = harness_dir
+    let workspace_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("the harness sits in the workspace");
     let mut sources = Vec::new();
-    for root in [
-        workspace_dir.join("src"),
-        workspace_dir.join("tests"),
-        workspace_dir.join("beacon/src"),
-        workspace_dir.join("beacon-server/src"),
-        harness_dir.join("src"),
-        harness_dir.join("tests"),
-    ] {
-        if !root.is_dir() {
+    for file in rs_files_under(workspace_dir) {
+        let relative = file
+            .strip_prefix(workspace_dir)
+            .expect("sources live under the workspace")
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        if relative == TABLE_FILE {
             continue;
         }
-        for file in rs_files_under(&root) {
-            let relative = file
-                .strip_prefix(workspace_dir)
-                .expect("sources live under the workspace")
-                .components()
-                .map(|component| component.as_os_str().to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join("/");
-            if relative == TABLE_FILE || EXCLUDED.iter().any(|skip| skip.path == relative) {
-                continue;
-            }
-            let text = std::fs::read_to_string(&file).expect("a source file reads as utf-8");
-            sources.push(Source {
-                path: relative,
-                text,
-            });
-        }
+        let text = std::fs::read_to_string(&file).expect("a source file reads as utf-8");
+        sources.push(Source {
+            path: relative,
+            text,
+        });
     }
     sources.sort_by(|left, right| left.path.cmp(&right.path));
     sources
@@ -389,7 +479,13 @@ fn rs_files_under(dir: &Path) -> Vec<PathBuf> {
         for entry in std::fs::read_dir(dir).expect("a source directory reads") {
             let path = entry.expect("a directory entry reads").path();
             if path.is_dir() {
-                walk(&path, out);
+                // `target/` holds the dependencies' sources and a dotted directory
+                // holds tool state: neither is this workspace's code, so both are
+                // passed over. A vendored dependency would need its own rule.
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                if name != "target" && !name.starts_with('.') {
+                    walk(&path, out);
+                }
             } else if path.extension().is_some_and(|extension| extension == "rs") {
                 out.push(path);
             }
@@ -503,6 +599,103 @@ fn no_external_processes(source: &Source) -> Vec<Finding> {
 
 fn handle_names_no_path(source: &Source) -> Vec<Finding> {
     forbidden(source, &["Path"])
+}
+
+/// The ways the key can be replaced, or taken away with the path that holds it.
+///
+/// Removing a directory, renaming or copying a path judges every shipped source: any
+/// of those can take the key with the directory it lives in. The forms that write one
+/// file judge the module that owns the key, because writing a file anywhere else is
+/// ordinary work that does not reach this one.
+fn no_key_replacement(source: &Source) -> Vec<Finding> {
+    let mut needles = vec!["remove_dir", "fs::rename", "fs::copy"];
+    if !in_scope(IDENTITY_SCOPE, &source.path) {
+        return forbidden(source, &needles);
+    }
+    // Everything that could replace an existing key, or open it for writing:
+    // `create_new` is the one write the key file's module performs, and it lives in
+    // `tempfile`, which is not on this list because its temporary file is not the
+    // key. `persist(` is the overwriting publish beside the one this crate uses;
+    // `persist_noclobber(` does not contain it, so the safe call stays legal while
+    // the one that clobbers a racing creator's key does not.
+    needles.extend([
+        "remove_file",
+        "fs::write",
+        "File::create",
+        "persist(",
+        "truncate",
+        "set_len",
+        ".append(",
+        "create(true)",
+        ".write(true)",
+    ]);
+    forbidden(source, &needles)
+}
+
+fn key_file_name_is_one_place(source: &Source) -> Vec<Finding> {
+    if source.path == KEY_FILE_SOURCE {
+        return Vec::new();
+    }
+    // The literal a new code path would write, and the function it would use to
+    // build the key's path: either is a second way to the key, which is what this
+    // claim forbids. The function is matched by its bare name, so
+    // `keyfile::file_in(..)`, a brace import and an alias all count; a longer name
+    // that merely ends in it (`tempfile_in`) does not.
+    let mut findings = forbidden(source, &[KEY_FILE_NAME]);
+    for (line, text) in code_lines(&source.text) {
+        if names_file_in(text) {
+            findings.push(Finding {
+                path: source.path.clone(),
+                line,
+                detail: format!("uses `file_in`: {}", text.trim()),
+            });
+        }
+    }
+    findings
+}
+
+/// Whether a line names the function `file_in`, not a longer identifier it ends.
+fn names_file_in(text: &str) -> bool {
+    let ident = |character: char| character.is_alphanumeric() || character == '_';
+    text.match_indices("file_in").any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + "file_in".len()..].chars().next();
+        !before.is_some_and(ident) && !after.is_some_and(ident)
+    })
+}
+
+fn key_is_minted_in_one_place(source: &Source) -> Vec<Finding> {
+    if source.path != KEY_FILE_SOURCE {
+        return forbidden(source, MINT_FORMS);
+    }
+    // The key file's own module must mint, and mint once: a second call would be a
+    // second way to become a new machine. Occurrences are counted, not lines, so two
+    // mints written on one line are two.
+    let mints: Vec<usize> = code_lines(&source.text)
+        .flat_map(|(line, text)| {
+            let count: usize = MINT_FORMS
+                .iter()
+                .map(|form| text.match_indices(form).count())
+                .sum();
+            std::iter::repeat_n(line, count)
+        })
+        .collect();
+    match mints.as_slice() {
+        [_] => Vec::new(),
+        [] => vec![Finding {
+            path: KEY_FILE_SOURCE.to_owned(),
+            line: 1,
+            detail: "the key file's module mints no key at all".to_owned(),
+        }],
+        [_, second, ..] => vec![Finding {
+            path: KEY_FILE_SOURCE.to_owned(),
+            line: *second,
+            detail: format!(
+                "the key file's module mints a key {} times; there must be one",
+                mints.len()
+            ),
+        }],
+    }
 }
 
 fn no_persistent_state(source: &Source) -> Vec<Finding> {

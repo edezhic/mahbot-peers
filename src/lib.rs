@@ -1,13 +1,15 @@
 //! Peer layer between mahbot instances.
 //!
-//! The seams the rest of the layer is built on — identity, the QUIC transport
-//! over raw public keys, the beacon as its protocol and client. Pairing,
-//! delivery and rights are not here yet.
+//! The seams the rest of the layer is built on — identity and its key file, the
+//! QUIC transport over raw public keys, the beacon as its protocol and client.
+//! Pairing, delivery and rights are not here yet.
 //!
-//! The library holds no filesystem access and reads no ambient state: a caller
-//! hands it an identity, a socket and a clock, and it uses nothing else. That is
-//! what lets the test harness run the real transport over an in-memory link and
-//! an injected clock.
+//! The library reads no ambient state: a caller hands it a storage root, a socket,
+//! an identity and a clock, and it uses nothing else. The key file is the one place
+//! the crate touches a filesystem, and the root it lives under arrives from outside;
+//! its name and format are permanent (`identity::keyfile`). That is what lets the
+//! test harness run the real transport over an in-memory link and an injected
+//! clock.
 #![warn(clippy::pedantic)]
 #![allow(
     clippy::missing_errors_doc,
@@ -18,7 +20,7 @@
 
 // The beacon: its closed message set and the client half the product speaks.
 pub mod beacon;
-// The per-instance ed25519 identity and its byte-exact fingerprint.
+// The per-instance ed25519 identity, its byte-exact fingerprint and its key file.
 pub mod identity;
 // Endpoint construction over a datagram socket and a clock, both injected.
 pub mod net;

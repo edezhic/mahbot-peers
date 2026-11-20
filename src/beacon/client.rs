@@ -272,7 +272,7 @@ impl Session {
 impl fmt::Debug for Session {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Session")
-            .field("peer", &self.me.peer_id())
+            .field("me", &self.me.fingerprint())
             .field("close_reason", &self.connection.close_reason())
             .finish_non_exhaustive()
     }

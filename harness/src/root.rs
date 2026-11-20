@@ -8,6 +8,8 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
+use mahbot_peers::identity::Identity;
+use mahbot_peers::identity::keyfile;
 use tempfile::TempDir;
 
 use crate::machine::RootId;
@@ -28,6 +30,19 @@ impl Root {
 
     pub(crate) fn id(&self) -> RootId {
         self.id
+    }
+
+    /// The machine's identity: the key file under this root, created if this is
+    /// the first start. Machines get their identity the way an installation does,
+    /// so no case runs on a key that could not exist here.
+    pub(crate) fn load_identity(&self) -> io::Result<Identity> {
+        keyfile::load_or_create(self.dir.path()).map_err(io::Error::other)
+    }
+
+    /// Copy this root's key into another root, as restoring a backup onto a second
+    /// machine does. The copy is the same identity: that is what a clone is.
+    pub(crate) fn copy_key_into(&self, target: &Self) -> io::Result<()> {
+        copy_key(self.dir.path(), target.dir.path())
     }
 
     pub(crate) fn write(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
@@ -85,4 +100,34 @@ impl Root {
 
 fn invalid(detail: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, detail.to_owned())
+}
+
+/// A throwaway storage root: the directory a case that needs an identity and no
+/// machine behind it creates one in.
+pub(crate) fn identity_dir() -> io::Result<tempfile::TempDir> {
+    tempfile::Builder::new().prefix("identity-").tempdir()
+}
+
+/// An identity with no machine behind it, for a case that needs a key and not a
+/// machine: a beacon's own identity, an impostor's, an endpoint built over a raw
+/// socket.
+///
+/// It is created through the real key-file path in a root this helper throws away,
+/// so the harness never mints a key in any way an installation cannot.
+pub(crate) fn detached_identity() -> io::Result<Identity> {
+    let dir = identity_dir()?;
+    keyfile::load_or_create(dir.path()).map_err(io::Error::other)
+}
+
+/// Put `from`'s key into the root at `to`: what restoring a backup onto a second
+/// machine leaves behind.
+///
+/// The key is written through the crate's own create and then given `from`'s bytes,
+/// not copied with `fs::copy`: what a restored backup restores is the file *and its
+/// access*, and whether a copy API carries a Windows DACL is not something this rig
+/// should be betting a suite on. The destination is private before the bytes land.
+pub(crate) fn copy_key(from: &Path, to: &Path) -> io::Result<()> {
+    let key = fs::read(keyfile::file_in(from))?;
+    keyfile::load_or_create(to).map_err(io::Error::other)?;
+    fs::write(keyfile::file_in(to), key)
 }
