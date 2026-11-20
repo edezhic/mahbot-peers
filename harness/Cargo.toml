@@ -6,19 +6,20 @@ rust-version = "1.96"
 publish = false
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/edezhic/mahbot-peers"
-description = "Test harness for mahbot-peers: machines, a scripted link, an injected clock, a stand-in rendezvous service and the witness checks."
+description = "Test harness for mahbot-peers: machines, a scripted link, an injected clock, the beacon over a simulated link, and the witness checks."
 
 [dependencies]
+mahbot-beacon = { path = "../beacon" }
 mahbot-peers = { path = "..", version = "0.1.0" }
-async-trait = "0.1"
 quinn = { version = "0.11.12", default-features = false, features = ["rustls-ring"] }
 # The cases build the server's TLS configuration themselves when they have to
 # change something about it, so the type is named here too.
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 # No `time` here, and no runtime feature on quinn: both crates are handed a
 # `quinn::Runtime` by their caller, and the runtime the harness builds has no
-# timer driver, so a timer sleep does not compile and a thread sleep is forbidden
-# by the single-source-of-time invariant.
+# timer driver. The beacon server's binary enables quinn's tokio runtime, which
+# is why it is not a default member: building it in the same invocation would
+# give this tokio a `time` feature, and a timer sleep would compile here.
 tokio = { version = "1.54", default-features = false, features = ["rt", "macros"] }
 ring = "0.17.14"
 tempfile = "3"

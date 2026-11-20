@@ -394,10 +394,11 @@ pub(crate) fn alpn_mismatch_is_refused() -> Result<(), String> {
         // Both of the library's configurations offer the crate's protocol and
         // nothing else.
         let policy: Arc<dyn PeerPolicy> = Arc::new(TrustSet::default());
-        let client_alpn = mahbot_peers::tls::client_config(&client.identity, Arc::clone(&policy))
-            .map_err(|error| error.to_string())?
-            .alpn_protocols;
-        let server_alpn = mahbot_peers::tls::server_config(&server.identity, policy)
+        let client_alpn =
+            mahbot_peers::tls::client_config(&client.identity, Arc::clone(&policy), ALPN)
+                .map_err(|error| error.to_string())?
+                .alpn_protocols;
+        let server_alpn = mahbot_peers::tls::server_config(&server.identity, policy, ALPN)
             .map_err(|error| error.to_string())?
             .alpn_protocols;
         for (side, alpn) in [("client", client_alpn), ("server", server_alpn)] {

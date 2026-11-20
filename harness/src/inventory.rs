@@ -158,11 +158,11 @@ pub type Report = crate::report::Report<Violation>;
 /// The claims this workspace makes: the library's and the harness's together.
 ///
 /// An entry is a behaviour a caller may rely on. The harness is a deliverable in
-/// its own right, so its machines, link, clock, beacon stand-in and checks are
+/// its own right, so its machines, link, clock, beacon rig and checks are
 /// claimed here exactly like the library's seams.
 pub const CAPABILITIES: &[Capability] = &[
     // The library: identity, the pinned handshake, the transport seam, the
-    // rendezvous seam.
+    // beacon.
     Capability::witnessed(
         "library.identity.spki_fingerprint",
         "a generated identity is a 44-byte Ed25519 SubjectPublicKeyInfo, its peer id is the key inside it, and the parser accepts exactly that shape",
@@ -180,8 +180,80 @@ pub const CAPABILITIES: &[Capability] = &[
         "a peer whose fingerprint is not pinned is refused at the handshake",
     ),
     Capability::witnessed(
-        "library.beacon.seam",
-        "the rendezvous seam registers an id at an address, looks it up, and carries an opaque payload between two ids without reading it",
+        "library.beacon.alpn",
+        "the beacon speaks its own ALPN: a client that pins the beacon's key but offers the peer layer's protocol gets no answer",
+    ),
+    Capability::witnessed(
+        "library.beacon.lookup",
+        "two clients registered on a fresh beacon find each other by id, each at the address the beacon observes on its path",
+    ),
+    Capability::witnessed(
+        "library.beacon.address",
+        "a client learns its own address as observed on the path it uses for peers, a peer reaches it there, and a session on another socket reports that socket instead",
+    ),
+    Capability::witnessed(
+        "library.beacon.state_volatile",
+        "a restarted beacon remembers nothing, its old sessions answer nothing, and both clients recover on their next need by registering again",
+    ),
+    Capability::witnessed(
+        "library.beacon.register_identity",
+        "a registration is bound to the key the handshake proved: a third party registers only itself, and a frame that asserts an address is refused and changes nothing",
+    ),
+    Capability::witnessed(
+        "library.beacon.register_ttl",
+        "a registration is answered for its documented lifetime, forgotten after it, and live again after a refresh",
+    ),
+    Capability::witnessed(
+        "library.beacon.introduction_authenticated",
+        "an introduction is signed by its sender over both ids and the payload; a beacon holding the pinned key cannot pass one off under a false sender id or with an altered payload",
+    ),
+    Capability::witnessed(
+        "library.beacon.introduction_live_only",
+        "an introduction is delivered only while the addressee is registered: a closed or expired registration collects nothing, and nothing is stored for a later registration to collect",
+    ),
+    Capability::witnessed(
+        "library.beacon.introduction_opaque",
+        "the beacon relays an introduction payload byte for byte and remembers none of it: its whole memory is the registrations",
+    ),
+    Capability::witnessed(
+        "library.beacon.wire_closed",
+        "the message set is closed: an unknown kind, an answer or a push sent as a request, a wrong body length, a trailing frame and an oversized frame are all refused",
+    ),
+    Capability::witnessed(
+        "library.beacon.wire_version",
+        "every frame carries the version: a request under another version is refused with the version named, and a client reading another version reports a mismatch instead of misreading the body",
+    ),
+    Capability::witnessed(
+        "library.beacon.pin",
+        "a client pointed at an impostor that does not hold the beacon's pinned key gets no usable answer",
+    ),
+    Capability::witnessed(
+        "library.beacon.auth",
+        "an unauthenticated caller gets nothing: a client that presents no key is refused and nothing is registered",
+    ),
+    Capability::witnessed(
+        "library.beacon.address_codec",
+        "an observed address round-trips through the wire exactly as it was given, including an IPv6 scope id",
+    ),
+    Capability::witnessed(
+        "library.beacon.session_liveness",
+        "a session whose beacon was killed reports the loss within the request bound instead of waiting on a session that looks open, and the next need recovers by connecting and registering again",
+    ),
+    Capability::witnessed(
+        "library.beacon.relay_bounded",
+        "a recipient that never reads its pushes cannot stall the sender: the push gives up within the server's bound, the sender's own registration stays served, and the recipient stays registered — a third party cannot use a failed push to evict it",
+    ),
+    Capability::witnessed(
+        "library.beacon.exchange_bounded",
+        "a peer that opens a stream and does not finish its frame is answered `Slow` within the server's bound, and the same connection keeps serving complete requests",
+    ),
+    Capability::witnessed(
+        "library.beacon.handshake_bounded",
+        "a half-open handshake gives its connection slot back within the server's bound instead of holding it until the idle timeout, so a stalled dialer cannot occupy the cap",
+    ),
+    Capability::witnessed(
+        "server.transport_advertisement",
+        "the beacon advertises only what it serves: no unidirectional stream and no QUIC datagram, so a peer cannot pin receive window on a channel the server would never drain, and the connection still answers requests",
     ),
     Capability::witnessed(
         "library.net.injected_seams",
@@ -201,10 +273,15 @@ pub const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.beacon.payload_limit",
-        "an introduction is built only through a checked constructor: exactly the documented size is accepted and one byte more is refused as `PayloadTooLarge`",
+        "an introduction is built only through a checked constructor: exactly the documented size is accepted and one byte more is refused as `PayloadTooLarge`, by the client before it sends and by the server if it arrives anyway",
     ),
-    // The harness: machines, the link, the clock, the beacon stand-in, the
-    // connect helper and the checks themselves.
+    Capability::unproducible(
+        "library.beacon.check_code",
+        "the short check code never passes through the beacon, and the beacon cannot force two machines to compare the same code",
+        "the code is derived by the pairing ceremony, which this workspace does not implement: nothing here produces a code, so no case can compare one. What is provable here is witnessed instead — the payload is relayed opaquely (`library.beacon.introduction_opaque`), an alteration is refused (`library.beacon.introduction_authenticated`), and the message set has no field for a code (`library.beacon.wire_closed`).",
+    ),
+    // The harness: machines, the link, the clock, the beacon rig, the raw
+    // client, the connect helper and the checks themselves.
     Capability::witnessed(
         "harness.check.inventory_two_way",
         "the inventory check reports an empty inventory, a duplicate entry or case, an entry with no witness, a witness with no entry, a failing case, a panicking case, an empty reason and a case for an unproducible entry",
@@ -264,11 +341,19 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability::unproducible(
         "harness.clock.no_wall_clock_wait",
         "no case in the suite waits on wall time",
-        "no single case can prove an absence across the suite; it is enforced structurally instead — the harness's tokio has no `time` feature, so a timer sleep does not compile, the runtime it builds has no timer driver, and the single-source-of-time invariant forbids a thread sleep. Measuring elapsed wall time inside a case would itself need the clock this harness forbids, and would be flaky besides.",
+        "no single case can prove an absence across the suite; it is enforced structurally instead — in a default build the harness's tokio has no `time` feature, so a timer sleep does not compile, the runtime it builds has no timer driver, so a sleep that did compile would panic, and the single-source-of-time invariant forbids a thread sleep. Measuring elapsed wall time inside a case would itself need the clock this harness forbids, and would be flaky besides.",
     ),
     Capability::witnessed(
-        "harness.beacon.start_stop_wipe",
-        "the stand-in service can be started, stopped and wiped, refuses everything while stopped, and is reached only through the seam",
+        "harness.beacon.in_process_server",
+        "the real server runs in-process over the simulated link: it answers while running and answers nothing once stopped",
+    ),
+    Capability::witnessed(
+        "server.config",
+        "the command line is read into a listening address and a key path, `--help` is its own outcome, an unknown or incomplete argument is refused with the usage, and a key file's mode is read as private only when neither group nor other may touch it",
+    ),
+    Capability::witnessed(
+        "server.connection_cap",
+        "a server at its connection limit refuses a further connection instead of accepting it",
     ),
     Capability::witnessed(
         "harness.sim.no_shared_state",

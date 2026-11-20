@@ -16,8 +16,8 @@ use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 
 use crate::identity::{Fingerprint, Identity};
 
-/// The one protocol this crate speaks. Fixed here so a mismatch fails the
-/// handshake instead of reaching application code.
+/// The protocol the peer layer speaks. Fixed here so a mismatch fails the
+/// handshake instead of reaching application code. The beacon has its own.
 pub const ALPN: &[u8] = b"mahbot-peers/1";
 
 /// Who a connection may talk to. A machine's peer store implements this; the
@@ -26,20 +26,41 @@ pub trait PeerPolicy: fmt::Debug + Send + Sync {
     fn trusts(&self, peer: &Fingerprint) -> bool;
 }
 
-/// A client configuration that pins the server's fingerprint.
+/// A client configuration that pins the server's fingerprint and presents the
+/// identity's raw public key.
+///
+/// `alpn` is the service's own name: the peer layer and the beacon are two
+/// protocols, and a connection offered to one must not complete on the other.
 pub fn client_config(
     me: &Identity,
     policy: Arc<dyn PeerPolicy>,
+    alpn: &[u8],
+) -> Result<rustls::ClientConfig, rustls::Error> {
+    client_config_with_resolver(
+        Arc::new(rustls::client::AlwaysResolvesClientRawPublicKeys::new(
+            me.certified_key(),
+        )),
+        policy,
+        alpn,
+    )
+}
+
+/// A client configuration with a caller-supplied certificate resolver.
+///
+/// The resolver is where the client's identity comes from, so a caller can
+/// present a key it holds elsewhere — or, in a test, present none at all.
+pub fn client_config_with_resolver(
+    resolver: Arc<dyn rustls::client::ResolvesClientCert>,
+    policy: Arc<dyn PeerPolicy>,
+    alpn: &[u8],
 ) -> Result<rustls::ClientConfig, rustls::Error> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(PinnedServer { policy, provider }))
-        .with_client_cert_resolver(Arc::new(
-            rustls::client::AlwaysResolvesClientRawPublicKeys::new(me.certified_key()),
-        ));
-    config.alpn_protocols = vec![ALPN.to_vec()];
+        .with_client_cert_resolver(resolver);
+    config.alpn_protocols = vec![alpn.to_vec()];
     Ok(config)
 }
 
@@ -47,6 +68,7 @@ pub fn client_config(
 pub fn server_config(
     me: &Identity,
     policy: Arc<dyn PeerPolicy>,
+    alpn: &[u8],
 ) -> Result<rustls::ServerConfig, rustls::Error> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut config = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
@@ -55,7 +77,7 @@ pub fn server_config(
         .with_cert_resolver(Arc::new(
             rustls::server::AlwaysResolvesServerRawPublicKeys::new(me.certified_key()),
         ));
-    config.alpn_protocols = vec![ALPN.to_vec()];
+    config.alpn_protocols = vec![alpn.to_vec()];
     Ok(config)
 }
 

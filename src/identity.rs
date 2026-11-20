@@ -5,12 +5,16 @@
 //! — how the key is stored and which permissions it carries is not part of this
 //! crate — and the private half stays in this value: it has no textual form and
 //! never reaches `Debug`. Only the public half crosses a boundary, because that
-//! is what peers exchange.
+//! is what peers exchange, and only a signature over a transcript the caller
+//! names crosses it besides.
+//!
+//! The key's PKCS#8 bytes are exposed so a caller can persist them itself; the
+//! crate does not know where, or with which permissions.
 
 use std::fmt;
 use std::sync::Arc;
 
-use ring::signature::{Ed25519KeyPair, KeyPair};
+use ring::signature::{self, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
 
@@ -25,9 +29,41 @@ pub const FINGERPRINT_LEN: usize = 44;
 /// Length of an Ed25519 public key, which is also the peer id.
 pub const PEER_ID_LEN: usize = 32;
 
+/// Length of an ed25519 signature.
+pub const SIGNATURE_LEN: usize = 64;
+
 /// The public half of an instance identity: what a peer remembers and pins.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PeerId([u8; PEER_ID_LEN]);
+
+impl PeerId {
+    /// The key's bytes. The peer id is public, and every transcript a caller
+    /// signs or verifies starts from it.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; PEER_ID_LEN] {
+        &self.0
+    }
+
+    /// Read a peer id from the key's bytes.
+    ///
+    /// Nothing is checked: a peer id is an ed25519 public key, and a key that
+    /// does not verify is refused when a signature is checked, not here.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; PEER_ID_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    /// Whether `signature` is `message` signed by this id's key.
+    ///
+    /// Ed25519 only: the key's bytes are the whole public key, and a signature
+    /// that does not verify is a lie about who sent the message.
+    #[must_use]
+    pub fn verify(&self, message: &[u8], signature: &[u8]) -> bool {
+        UnparsedPublicKey::new(&signature::ED25519, self.0)
+            .verify(message, signature)
+            .is_ok()
+    }
+}
 
 impl fmt::Debug for PeerId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -94,6 +130,8 @@ impl fmt::Display for Fingerprint {
 #[derive(Clone)]
 pub struct Identity {
     fingerprint: Fingerprint,
+    pair: Arc<Ed25519KeyPair>,
+    pkcs8: Arc<[u8]>,
     certified: Arc<CertifiedKey>,
 }
 
@@ -103,19 +141,52 @@ impl Identity {
     pub fn generate() -> Self {
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
             .expect("system randomness is available");
-        let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("a generated key parses");
+        Self::from_der(pkcs8.as_ref()).expect("a generated key parses")
+    }
+
+    /// Rebuild an identity from the PKCS#8 bytes [`Identity::pkcs8`] produced.
+    ///
+    /// `None` for anything that is not a PKCS#8 ed25519 key: a corrupt or
+    /// truncated key file must fail loudly rather than start a second identity.
+    #[must_use]
+    pub fn from_pkcs8(pkcs8: &[u8]) -> Option<Self> {
+        Self::from_der(pkcs8)
+    }
+
+    fn from_der(pkcs8: &[u8]) -> Option<Self> {
+        let pair = Ed25519KeyPair::from_pkcs8(pkcs8).ok()?;
         let mut spki = [0u8; FINGERPRINT_LEN];
         spki[..ED25519_SPKI_PREFIX.len()].copy_from_slice(&ED25519_SPKI_PREFIX);
         spki[ED25519_SPKI_PREFIX.len()..].copy_from_slice(pair.public_key().as_ref());
         let signer = rustls::crypto::ring::sign::any_supported_type(&PrivateKeyDer::Pkcs8(
-            PrivatePkcs8KeyDer::from(pkcs8.as_ref().to_vec()),
+            PrivatePkcs8KeyDer::from(pkcs8.to_vec()),
         ))
-        .expect("the ring provider signs ed25519");
+        .ok()?;
         let certified = CertifiedKey::new(vec![CertificateDer::from(spki.to_vec())], signer);
-        Self {
+        Some(Self {
             fingerprint: Fingerprint(spki),
+            pair: Arc::new(pair),
+            pkcs8: Arc::from(pkcs8),
             certified: Arc::new(certified),
-        }
+        })
+    }
+
+    /// The private key as PKCS#8 bytes, for a caller that persists it.
+    ///
+    /// The crate has no opinion on where those bytes go or which permissions the
+    /// file carries; that is the caller's storage rule, not the identity's.
+    #[must_use]
+    pub fn pkcs8(&self) -> &[u8] {
+        &self.pkcs8
+    }
+
+    /// Sign `message` with this identity's key.
+    #[must_use]
+    pub fn sign(&self, message: &[u8]) -> [u8; SIGNATURE_LEN] {
+        let signature = self.pair.sign(message);
+        let mut bytes = [0u8; SIGNATURE_LEN];
+        bytes.copy_from_slice(signature.as_ref());
+        bytes
     }
 
     #[must_use]

@@ -3,17 +3,6 @@
 version = 4
 
 [[package]]
-name = "async-trait"
-version = "0.1.92"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -176,10 +165,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
+name = "mahbot-beacon"
+version = "0.1.0"
+dependencies = [
+ "mahbot-peers",
+ "quinn",
+ "rustls",
+]
+
+[[package]]
+name = "mahbot-beacon-server"
+version = "0.1.0"
+dependencies = [
+ "mahbot-beacon",
+ "mahbot-peers",
+ "quinn",
+ "tokio",
+]
+
+[[package]]
 name = "mahbot-peers"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "quinn",
  "quinn-proto",
  "ring",
@@ -190,13 +197,24 @@ dependencies = [
 name = "mahbot-peers-harness"
 version = "0.1.0"
 dependencies = [
- "async-trait",
+ "mahbot-beacon",
  "mahbot-peers",
  "quinn",
  "ring",
  "rustls",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "mio"
+version = "1.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20521a903f02b0a573cd6840e9d0a5a0cc043d361fe924092cd70f8556cc9c4a"
+dependencies = [
+ "libc",
+ "wasi",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -475,8 +493,12 @@ version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
+ "libc",
+ "mio",
  "pin-project-lite",
+ "socket2",
  "tokio-macros",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

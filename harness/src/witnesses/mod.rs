@@ -22,6 +22,7 @@ mod clock;
 mod identity;
 mod link;
 mod machines;
+mod server;
 mod support;
 mod transport;
 
@@ -48,14 +49,119 @@ pub const WITNESSES: &[Witness] = &[
         case: transport::untrusted_peer_is_refused,
     },
     Witness {
-        id: "beacon_carries_opaque_payload",
-        capability: "library.beacon.seam",
-        case: beacon::beacon_carries_opaque_payload,
+        id: "beacon_alpn_is_its_own",
+        capability: "library.beacon.alpn",
+        case: beacon::beacon_alpn_is_its_own,
+    },
+    Witness {
+        id: "two_clients_find_each_other",
+        capability: "library.beacon.lookup",
+        case: beacon::two_clients_find_each_other,
+    },
+    Witness {
+        id: "observed_address_is_the_peer_path",
+        capability: "library.beacon.address",
+        case: beacon::observed_address_is_the_peer_path,
+    },
+    Witness {
+        id: "beacon_restart_forgets_and_recovers",
+        capability: "library.beacon.state_volatile",
+        case: beacon::beacon_restart_forgets_and_recovers,
+    },
+    Witness {
+        id: "registration_is_bound_to_the_caller_key",
+        capability: "library.beacon.register_identity",
+        case: beacon::registration_is_bound_to_the_caller_key,
+    },
+    Witness {
+        id: "registration_ttl_is_the_beacons_housekeeping",
+        capability: "library.beacon.register_ttl",
+        case: beacon::registration_ttl_is_the_beacons_housekeeping,
+    },
+    Witness {
+        id: "introduction_is_signed_by_its_sender",
+        capability: "library.beacon.introduction_authenticated",
+        case: beacon::introduction_is_signed_by_its_sender,
+    },
+    Witness {
+        id: "beacon_relays_introductions_live_only",
+        capability: "library.beacon.introduction_live_only",
+        case: beacon::beacon_relays_introductions_live_only,
+    },
+    Witness {
+        id: "introduction_payload_is_opaque_to_the_beacon",
+        capability: "library.beacon.introduction_opaque",
+        case: beacon::introduction_payload_is_opaque_to_the_beacon,
     },
     Witness {
         id: "introduction_size_limit",
         capability: "library.beacon.payload_limit",
         case: beacon::introduction_size_limit,
+    },
+    Witness {
+        id: "closed_message_set_refuses_unknown_kinds",
+        capability: "library.beacon.wire_closed",
+        case: beacon::closed_message_set_refuses_unknown_kinds,
+    },
+    Witness {
+        id: "version_mismatch_is_explicit",
+        capability: "library.beacon.wire_version",
+        case: beacon::version_mismatch_is_explicit,
+    },
+    Witness {
+        id: "impostor_beacon_gives_no_answers",
+        capability: "library.beacon.pin",
+        case: beacon::impostor_beacon_gives_no_answers,
+    },
+    Witness {
+        id: "unauthenticated_caller_gets_nothing",
+        capability: "library.beacon.auth",
+        case: beacon::unauthenticated_caller_gets_nothing,
+    },
+    Witness {
+        id: "beacon_starts_and_stops",
+        capability: "harness.beacon.in_process_server",
+        case: beacon::beacon_starts_and_stops,
+    },
+    Witness {
+        id: "addresses_round_trip",
+        capability: "library.beacon.address_codec",
+        case: beacon::addresses_round_trip,
+    },
+    Witness {
+        id: "a_dead_beacon_is_noticed",
+        capability: "library.beacon.session_liveness",
+        case: beacon::a_dead_beacon_is_noticed,
+    },
+    Witness {
+        id: "a_stalled_stream_is_refused",
+        capability: "library.beacon.exchange_bounded",
+        case: beacon::a_stalled_stream_is_refused,
+    },
+    Witness {
+        id: "a_stalled_handshake_gives_its_place_back",
+        capability: "library.beacon.handshake_bounded",
+        case: beacon::a_stalled_handshake_gives_its_place_back,
+    },
+    Witness {
+        id: "the_beacon_advertises_only_what_it_serves",
+        capability: "server.transport_advertisement",
+        case: server::the_beacon_advertises_only_what_it_serves,
+    },
+    Witness {
+        id: "a_recipient_that_never_reads_does_not_stall_the_sender",
+        capability: "library.beacon.relay_bounded",
+        case: beacon::a_recipient_that_never_reads_does_not_stall_the_sender,
+    },
+    Witness {
+        id: "server_config_parse",
+        capability: "server.config",
+        case: server::config_parse,
+    },
+    Witness {
+        id: "server_connection_cap",
+        capability: "server.connection_cap",
+        case: server::connection_cap,
     },
     Witness {
         id: "endpoint_from_injected_seams",
@@ -201,11 +307,6 @@ pub const WITNESSES: &[Witness] = &[
         id: "transport_timer_follows_clock",
         capability: "harness.clock.drives_transport_timers",
         case: transport::transport_timer_follows_clock,
-    },
-    Witness {
-        id: "beacon_starts_stops_and_wipes",
-        capability: "harness.beacon.start_stop_wipe",
-        case: beacon::beacon_starts_stops_and_wipes,
     },
     Witness {
         id: "simulations_share_no_state",

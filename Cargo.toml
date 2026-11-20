@@ -2,7 +2,7 @@
 name = "mahbot-peers"
 version = "0.1.0"
 authors = ["edezhic <edezhic@gmail.com>"]
-description = "Direct peer layer between mahbot instances: identity, QUIC transport over raw public keys, rendezvous and delivery."
+description = "Direct peer layer between mahbot instances: identity, QUIC transport over raw public keys, the beacon, and delivery."
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/edezhic/mahbot-peers"
@@ -11,21 +11,28 @@ readme = "README.md"
 keywords = ["p2p", "quic", "agent"]
 categories = ["network-programming"]
 rust-version = "1.96"
-# Not part of the package the registry builds: the test harness, this checkout's
-# toolchain file, its ignore list and the plan kept beside it.
+# Not part of the package the registry builds: the test harness, the beacon
+# library and its server, this checkout's toolchain file, its ignore list and the
+# plan kept beside it. The member paths are anchored: an unanchored `beacon`
+# would also match the library's own `src/beacon/`.
 exclude = [
     ".DS_Store",
     ".gitignore",
     "PLAN.md",
-    "harness",
+    "/beacon",
+    "/beacon-server",
+    "/harness",
     "rust-toolchain.toml",
 ]
 
 [workspace]
-members = ["harness"]
+members = ["harness", "beacon", "beacon-server"]
 # A workspace root that is also a package defaults to itself alone, which would
 # leave `cargo test` at the root running the library and skipping the harness.
-default-members = [".", "harness"]
+# The beacon server's binary is left out on purpose: it is the one package that
+# enables quinn's tokio runtime, and building it in the same invocation would
+# give the harness's tokio a `time` feature it deliberately does without.
+default-members = [".", "harness", "beacon"]
 
 [dependencies]
 # QUIC over rustls with raw public keys (RFC 7250). No runtime feature: the
@@ -39,4 +46,3 @@ quinn = { version = "0.11.12", default-features = false, features = ["rustls-rin
 quinn-proto = { version = "0.11.19", default-features = false }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 ring = "0.17.14"
-async-trait = "0.1"

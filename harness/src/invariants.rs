@@ -8,9 +8,16 @@
 //! own check must flag. An invariant that has gone blind fails instead of passing
 //! over nothing.
 //!
-//! This file holds the checkers and the table together, and is the one file the
-//! scan skips: it contains the forbidden constructs as data, and a checker's own
+//! This file holds the checkers and the table together, and the scan skips it for
+//! what it is: it contains the forbidden constructs as data, and a checker's own
 //! pattern list is not evidence.
+//!
+//! One source file beyond this one is excluded, and the exclusion is data too: the
+//! beacon server's process entry point binds a real socket, reads the
+//! environment and reads the wall clock, because that is what a process entry
+//! point is for. [`EXCLUDED`] names it and says why, the summary check proves the
+//! list is exactly that one file, and the same check proves the file still needs
+//! its exclusion — so the exception cannot quietly grow or go stale.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -196,6 +203,22 @@ pub const CLOCK_FILE: &str = "harness/src/clock.rs";
 /// not evidence.
 pub const TABLE_FILE: &str = "harness/src/invariants.rs";
 
+/// The beacon server's process entry point: the one file the scan excludes.
+pub const ENTRY_FILE: &str = "beacon-server/src/main.rs";
+
+/// A source file the scan skips, and the reason it must.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Exclusion {
+    pub path: &'static str,
+    pub reason: &'static str,
+}
+
+/// The documented exclusions: exactly one, and the summary check proves it.
+pub const EXCLUDED: &[Exclusion] = &[Exclusion {
+    path: ENTRY_FILE,
+    reason: "the process entry point: it binds the UDP socket, reads the listening address and key path from the command line, owns the executor and the wall clock, and owns the key file — the exclusive create with mode 0600 on unix, the retry when a racing process wins the create or is caught mid-write, and the refusal of a file other users can read. What the command line means, whether a mode is private and how the server is configured are pure functions in the `mahbot-beacon` library, which the scan covers.",
+}];
+
 /// The handle that must not name a path.
 pub const MACHINE_FILE: &str = "harness/src/machine.rs";
 
@@ -289,6 +312,23 @@ pub const INVARIANTS: &[Invariant] = &[
         control: "pub fn root(&self) -> &Path { &self.root }",
         check: handle_names_no_path,
     },
+    Invariant {
+        id: "beacon.no_persistent_state",
+        claim: "the beacon keeps no state on disk: neither its protocol and client nor its server library touches a file, so a restart loses every registration by construction, and only the process entry point may touch one, for its own key",
+        scope: &[
+            "src/beacon.rs",
+            "src/beacon/client.rs",
+            "src/beacon/time.rs",
+            "src/beacon/wire.rs",
+            "beacon/src/clock.rs",
+            "beacon/src/config.rs",
+            "beacon/src/core.rs",
+            "beacon/src/lib.rs",
+            "beacon/src/server.rs",
+        ],
+        control: "std::fs::write(path, bytes)?;",
+        check: no_persistent_state,
+    },
 ];
 
 /// The invariant with this id, for a case that has to run one directly.
@@ -297,9 +337,10 @@ pub fn find(id: &str) -> Option<&'static Invariant> {
     INVARIANTS.iter().find(|invariant| invariant.id == id)
 }
 
-/// Every source file the invariants cover: the library, the harness and the
-/// harness's tests, because a wall-clock sleep or an environment lookup in a
-/// test breaks the same promises as one in the code under test.
+/// Every source file the invariants cover: the library, the beacon crates, the
+/// harness and its tests, because a wall-clock sleep or an environment lookup in
+/// a test breaks the same promises as one in the code under test. The table and
+/// the documented exclusions are skipped; nothing else is.
 ///
 /// Paths are relative to the workspace root and always use `/`, so a finding
 /// reads the same on every host.
@@ -313,6 +354,8 @@ pub fn workspace_sources() -> Vec<Source> {
     for root in [
         workspace_dir.join("src"),
         workspace_dir.join("tests"),
+        workspace_dir.join("beacon/src"),
+        workspace_dir.join("beacon-server/src"),
         harness_dir.join("src"),
         harness_dir.join("tests"),
     ] {
@@ -327,7 +370,7 @@ pub fn workspace_sources() -> Vec<Source> {
                 .map(|component| component.as_os_str().to_string_lossy().into_owned())
                 .collect::<Vec<_>>()
                 .join("/");
-            if relative == TABLE_FILE {
+            if relative == TABLE_FILE || EXCLUDED.iter().any(|skip| skip.path == relative) {
                 continue;
             }
             let text = std::fs::read_to_string(&file).expect("a source file reads as utf-8");
@@ -460,4 +503,8 @@ fn no_external_processes(source: &Source) -> Vec<Finding> {
 
 fn handle_names_no_path(source: &Source) -> Vec<Finding> {
     forbidden(source, &["Path"])
+}
+
+fn no_persistent_state(source: &Source) -> Vec<Finding> {
+    forbidden(source, &["std::fs", "OpenOptions", "File::"])
 }

@@ -10,7 +10,7 @@
 //! datagram's fate by arithmetic, so the same seed over the same traffic
 //! produces the same trace, and a recorded trace replays to itself.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
@@ -169,6 +169,9 @@ struct LinkState {
     generation: u64,
     seq: u64,
     sockets: BTreeMap<SocketAddr, Weak<LinkedSocket>>,
+    /// Addresses that accept nothing, as a process that is gone does: the socket
+    /// still exists, but no datagram reaches it until the address is resumed.
+    silenced: BTreeSet<SocketAddr>,
     held: Option<Datagram>,
     trace: BTreeMap<u64, TraceEvent>,
 }
@@ -207,6 +210,7 @@ impl Link {
                     generation: 0,
                     seq: 0,
                     sockets: BTreeMap::new(),
+                    silenced: BTreeSet::new(),
                     held: None,
                     trace: BTreeMap::new(),
                 }),
@@ -249,7 +253,9 @@ impl Link {
     /// [`AddressTaken`] when another live socket already holds the address.
     pub fn attach(&self, addr: SocketAddr) -> Result<Arc<LinkedSocket>, AddressTaken> {
         let mut state = self.state();
-        if state.sockets.get(&addr).and_then(Weak::upgrade).is_some() {
+        if state.sockets.get(&addr).and_then(Weak::upgrade).is_some()
+            || state.silenced.contains(&addr)
+        {
             return Err(AddressTaken(addr));
         }
         Ok(self.insert(&mut state, addr))
@@ -274,6 +280,20 @@ impl Link {
         });
         state.sockets.insert(addr, Arc::downgrade(&socket));
         socket
+    }
+
+    /// Stop delivering anything to `addr`, as a process that is gone does.
+    ///
+    /// The socket is not closed and its address stays taken: the sender keeps
+    /// transmitting into nothing, which is exactly what a killed peer looks like
+    /// from the outside. [`Link::resume`] undoes it.
+    pub fn silence(&self, addr: SocketAddr) {
+        self.state().silenced.insert(addr);
+    }
+
+    /// Deliver to `addr` again.
+    pub fn resume(&self, addr: SocketAddr) {
+        self.state().silenced.remove(&addr);
     }
 
     /// Move a socket to a new apparent address, as a path change does.
@@ -422,6 +442,11 @@ impl Link {
         let at = self.inner.clock.elapsed();
         let mut state = self.state();
         if state.generation != datagram.generation {
+            return;
+        }
+        // A silenced address is a peer that is gone: the datagram is sent into
+        // nothing, so the trace records it with no delivery.
+        if state.silenced.contains(&datagram.to) {
             return;
         }
         let target = state.sockets.get(&datagram.to).and_then(Weak::upgrade);
@@ -573,9 +598,9 @@ impl AsyncUdpSocket for LinkedSocket {
 
 /// The lowest address the link hands out that no live socket holds.
 fn free_addr(state: &LinkState) -> Option<SocketAddr> {
-    (0..ADDRESS_SPAN)
-        .map(addr_at)
-        .find(|addr| state.sockets.get(addr).and_then(Weak::upgrade).is_none())
+    (0..ADDRESS_SPAN).map(addr_at).find(|addr| {
+        state.sockets.get(addr).and_then(Weak::upgrade).is_none() && !state.silenced.contains(addr)
+    })
 }
 
 /// Point a socket's registry entry at `addr`.

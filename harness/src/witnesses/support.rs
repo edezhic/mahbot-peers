@@ -20,6 +20,10 @@ pub(crate) fn io_error(error: io::Error) -> String {
     error.to_string()
 }
 
+/// How much virtual time one request may take before a case fails instead of
+/// hanging: every case's budget for an await that may never resolve.
+pub(crate) const BUDGET: Duration = Duration::from_secs(10);
+
 pub(crate) fn socket(port: u16) -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, port))
 }
@@ -48,7 +52,8 @@ pub(crate) async fn within<F: Future>(
 /// A machine's server-side TLS configuration, pinning the peers it trusts.
 pub(crate) fn server_tls(machine: &Machine) -> Result<rustls::ServerConfig, String> {
     let policy: Arc<dyn PeerPolicy> = Arc::clone(&machine.trust) as Arc<dyn PeerPolicy>;
-    mahbot_peers::tls::server_config(&machine.identity, policy).map_err(|error| error.to_string())
+    mahbot_peers::tls::server_config(&machine.identity, policy, mahbot_peers::tls::ALPN)
+        .map_err(|error| error.to_string())
 }
 
 /// An endpoint over a machine's own socket, carrying a TLS configuration the case

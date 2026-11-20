@@ -1,0 +1,19 @@
+[package]
+name = "mahbot-beacon-server"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/edezhic/mahbot-peers"
+description = "The beacon's process entry point: binds a socket, reads its configuration and runs the server. Not published."
+
+[dependencies]
+mahbot-beacon = { path = "../beacon" }
+mahbot-peers = { path = "..", version = "0.1.0" }
+# This is the one package in the workspace that pulls quinn's tokio runtime: the
+# process entry point owns the socket and the executor. The server library and
+# the harness deliberately do not, so the harness's tokio keeps no `time` feature
+# and in a default build a timer sleep still does not compile there.
+quinn = { version = "0.11.12", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
+tokio = { version = "1.54", features = ["rt-multi-thread"] }

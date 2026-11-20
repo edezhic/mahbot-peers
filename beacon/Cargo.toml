@@ -1,0 +1,17 @@
+[package]
+name = "mahbot-beacon"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/edezhic/mahbot-peers"
+description = "The beacon server: introduction and address service for mahbot peers. Not published; the owner runs it."
+
+[dependencies]
+mahbot-peers = { path = "..", version = "0.1.0" }
+# No `runtime-tokio` here: the server is handed an endpoint and a runtime and
+# spawns its tasks on that runtime. Enabling it would also give the harness's
+# tokio a `time` feature, which the harness deliberately does without.
+quinn = { version = "0.11.12", default-features = false, features = ["rustls-ring"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }

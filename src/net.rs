@@ -53,12 +53,14 @@ impl Transport {
         // The crate builds the TLS configuration itself — TLS 1.3 only, with the
         // ring provider — so an initial cipher suite always exists and this
         // conversion cannot fail.
-        let server_tls = QuicServerConfig::try_from(tls::server_config(me, Arc::clone(&policy))?)
-            .expect("the crate's TLS 1.3 configuration has an initial cipher suite");
+        let server_tls =
+            QuicServerConfig::try_from(tls::server_config(me, Arc::clone(&policy), tls::ALPN)?)
+                .expect("the crate's TLS 1.3 configuration has an initial cipher suite");
         let mut server = quinn::ServerConfig::with_crypto(Arc::new(server_tls));
         server.transport_config(Arc::clone(&transport));
-        let client_tls = QuicClientConfig::try_from(Arc::new(tls::client_config(me, policy)?))
-            .expect("the crate's TLS 1.3 configuration has an initial cipher suite");
+        let client_tls =
+            QuicClientConfig::try_from(Arc::new(tls::client_config(me, policy, tls::ALPN)?))
+                .expect("the crate's TLS 1.3 configuration has an initial cipher suite");
         let mut client = quinn::ClientConfig::new(Arc::new(client_tls));
         client.transport_config(transport);
         let mut endpoint = Endpoint::new_with_abstract_socket(

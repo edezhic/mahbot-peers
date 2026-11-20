@@ -274,6 +274,14 @@ impl Default for MockClock {
     }
 }
 
+/// The clock as the beacon server reads it: the same reading, so a registration
+/// expires when the test moves time and never because wall time passed.
+impl mahbot_beacon::clock::Clock for MockClock {
+    fn now(&self) -> Duration {
+        self.elapsed()
+    }
+}
+
 /// Scheduler turns a driven future gets before time is moved: enough for a
 /// handshake on a clean link, so driving it costs no virtual time.
 pub(crate) const DRIVE_YIELDS: usize = 4;

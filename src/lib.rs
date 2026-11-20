@@ -1,8 +1,8 @@
 //! Peer layer between mahbot instances.
 //!
 //! The seams the rest of the layer is built on — identity, the QUIC transport
-//! over raw public keys, the rendezvous service. Pairing, delivery and rights are
-//! not here yet.
+//! over raw public keys, the beacon as its protocol and client. Pairing,
+//! delivery and rights are not here yet.
 //!
 //! The library holds no filesystem access and reads no ambient state: a caller
 //! hands it an identity, a socket and a clock, and it uses nothing else. That is
@@ -16,7 +16,7 @@
     clippy::module_name_repetitions
 )]
 
-// The rendezvous service, as the client sees it.
+// The beacon: its closed message set and the client half the product speaks.
 pub mod beacon;
 // The per-instance ed25519 identity and its byte-exact fingerprint.
 pub mod identity;
