@@ -2,7 +2,10 @@
 //!
 //! The beacon never reads a clock of its own: the timer comes from the
 //! `quinn::Runtime` the endpoint runs on, so a test moves time and a real process
-//! waits on real time without the protocol knowing the difference.
+//! waits on real time without the protocol knowing the difference. The one
+//! combinator is published as `beacon::timeout` because both halves of the beacon
+//! use it — the client in this crate and the server in its own crate — and a
+//! second copy would let their deadline arithmetic drift.
 
 use std::future::Future;
 use std::pin::pin;
@@ -13,6 +16,11 @@ use quinn::Runtime;
 
 /// Run `future`, giving up after `after` of the runtime's time. `None` means the
 /// deadline passed first.
+///
+/// This is the beacon's own bound, not a general-purpose utility: the client's
+/// request bound and the server's exchange bound are both measured with it, and
+/// the ordering that keeps a live but slow beacon from being reported as dead
+/// depends on the one copy.
 pub async fn timeout<F: Future>(
     runtime: &dyn Runtime,
     after: Duration,

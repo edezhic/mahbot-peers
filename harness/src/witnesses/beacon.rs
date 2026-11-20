@@ -24,7 +24,7 @@ use rustls::SignatureScheme;
 use rustls::client::ResolvesClientCert;
 use rustls::sign::CertifiedKey;
 
-use crate::beacon::TestBeacon;
+use crate::beacon::{TestBeacon, client_config};
 use crate::clock::block_on;
 use crate::connect::{TrustSet, connect};
 use crate::machine::Machine;
@@ -503,38 +503,32 @@ pub(crate) fn introduction_payload_is_opaque_to_the_beacon() -> Result<(), Strin
         }
 
         // The beacon's whole memory is the two registrations: no payload, no
-        // queue, nothing about the message it just carried.
-        let snapshot = beacon
+        // queue, nothing about the message it just carried. The rendering names
+        // every field the registry holds, and the renderer's own destructuring
+        // stops compiling if a field is added, so a payload field cannot be added
+        // silently.
+        let mut expected = [
+            format!(
+                "{:?} at {} on ConnectionId(0) live",
+                sender.peer_id(),
+                sender.addr()
+            ),
+            format!(
+                "{:?} at {} on ConnectionId(1) live",
+                recipient.peer_id(),
+                recipient.addr()
+            ),
+        ];
+        expected.sort();
+        let expected = expected.join("\n") + "\n";
+        let remembered = beacon
             .registry()
             .lock()
             .expect("beacon registry is not poisoned")
-            .snapshot();
-        let mut expected = vec![
-            (sender.peer_id(), sender.addr()),
-            (recipient.peer_id(), recipient.addr()),
-        ];
-        expected.sort_by_key(|(id, _)| *id);
-        if snapshot != expected {
+            .render(sim.clock().elapsed());
+        if remembered != expected {
             return Err(format!(
-                "the beacon remembers {snapshot:?}, not just the registrations"
-            ));
-        }
-
-        // The snapshot is a curated view; the registry's own rendering is not. A
-        // field added to hold the payload would print here, so this check fails
-        // when the claim it makes is broken. The payload is the byte run
-        // 254, 255, 0, 1 repeated, which is how a stored copy would read in a
-        // debug rendering.
-        let remembered = format!(
-            "{:?}",
-            beacon
-                .registry()
-                .lock()
-                .expect("beacon registry is not poisoned")
-        );
-        if remembered.contains("254, 255, 0, 1") {
-            return Err(format!(
-                "the beacon's state carries the payload it relayed: {remembered}"
+                "the beacon remembers {remembered:?}, not just the registrations"
             ));
         }
         Ok(())
@@ -716,21 +710,12 @@ pub(crate) fn unauthenticated_caller_gets_nothing() -> Result<(), String> {
         let machine = sim.machine().map_err(io_error)?;
 
         // A client that pins the beacon's key but presents no key of its own.
-        let trust = TrustSet::default();
-        trust.insert(beacon.key());
-        let tls = mahbot_peers::tls::client_config_with_resolver(
-            &machine.identity,
-            Arc::new(NoCertificate),
-            Arc::new(trust),
+        let config = client_config(
+            &machine,
+            beacon.key(),
             mahbot_peers::beacon::ALPN,
-        )
-        .map_err(|error| error.to_string())?;
-        let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls))
-            .map_err(|error| format!("{error:?}"))?;
-        let mut config = quinn::ClientConfig::new(Arc::new(crypto));
-        config.transport_config(Arc::new(
-            mahbot_peers::beacon::transport_config().map_err(|error| error.to_string())?,
-        ));
+            Some(Arc::new(NoCertificate)),
+        )?;
         let answered = match within(
             &sim,
             BUDGET,
@@ -858,6 +843,27 @@ pub(crate) fn a_stalled_stream_is_refused() -> Result<(), String> {
     })
 }
 
+pub(crate) fn deadlines_are_ordered() -> Result<(), String> {
+    // An introduction makes the server apply its exchange bound to three
+    // sequential waits: reading the request, handing the frame to the recipient,
+    // and writing the answer. The client's request bound must outlast all three,
+    // or a live but slow beacon is reported as dead.
+    let introduction = EXCHANGE_TIMEOUT * 3;
+    if introduction >= BEACON_REQUEST_TIMEOUT {
+        return Err(format!(
+            "three server exchanges take {introduction:?}, which is not less than the client's {BEACON_REQUEST_TIMEOUT:?}"
+        ));
+    }
+    // The request bound must also stay below the idle timeout, or the connection
+    // would expire before the request's own bound could name the failure.
+    if BEACON_REQUEST_TIMEOUT >= BEACON_IDLE_TIMEOUT {
+        return Err(format!(
+            "the client's request bound {BEACON_REQUEST_TIMEOUT:?} is not below the idle timeout {BEACON_IDLE_TIMEOUT:?}"
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn a_stalled_handshake_gives_its_place_back() -> Result<(), String> {
     block_on(async {
         let sim = Sim::new().map_err(io_error)?;
@@ -963,15 +969,7 @@ pub(crate) fn beacon_alpn_is_its_own() -> Result<(), String> {
 
         // A client that pins the beacon's key but offers the peer layer's ALPN
         // must not complete: the two services are separate protocols.
-        let trust = TrustSet::default();
-        trust.insert(beacon.key());
-        let policy: Arc<dyn mahbot_peers::tls::PeerPolicy> = Arc::new(trust);
-        let tls =
-            mahbot_peers::tls::client_config(&machine.identity, policy, mahbot_peers::tls::ALPN)
-                .map_err(|error| error.to_string())?;
-        let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls))
-            .map_err(|error| format!("{error:?}"))?;
-        let config = quinn::ClientConfig::new(Arc::new(crypto));
+        let config = client_config(&machine, beacon.key(), mahbot_peers::tls::ALPN, None)?;
         match within(
             &sim,
             BUDGET,

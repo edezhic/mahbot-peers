@@ -20,8 +20,10 @@ use mahbot_beacon::server::{BeaconServer, DEFAULT_MAX_CONNECTIONS};
 use mahbot_peers::beacon::Beacon;
 use mahbot_peers::identity::{Fingerprint, Identity};
 use quinn::{AsyncUdpSocket, Endpoint, EndpointConfig};
+use rustls::client::ResolvesClientCert;
 
 use crate::clock::MockClock;
+use crate::connect::TrustSet;
 use crate::link::{Link, LinkedSocket};
 use crate::machine::Machine;
 use crate::sim::Sim;
@@ -38,6 +40,39 @@ pub(crate) fn endpoint(
         Arc::clone(socket) as Arc<dyn AsyncUdpSocket>,
         runtime,
     )
+}
+
+/// A beacon client's configuration for a case that has to vary the TLS half:
+/// `alpn` is the protocol it offers, and `resolver` is where its identity comes
+/// from — `None` presents the machine's own key, `Some` supplies the case's own
+/// (the unauthenticated case presents none). The pinned key and the transport
+/// settings are the beacon client's own, so no case assembles them by hand.
+pub(crate) fn client_config(
+    machine: &Machine,
+    key: Fingerprint,
+    alpn: &[u8],
+    resolver: Option<Arc<dyn ResolvesClientCert>>,
+) -> Result<quinn::ClientConfig, String> {
+    let trust = TrustSet::default();
+    trust.insert(key);
+    let policy: Arc<dyn mahbot_peers::tls::PeerPolicy> = Arc::new(trust);
+    let tls = match resolver {
+        Some(resolver) => mahbot_peers::tls::client_config_with_resolver(
+            &machine.identity,
+            resolver,
+            policy,
+            alpn,
+        ),
+        None => mahbot_peers::tls::client_config(&machine.identity, policy, alpn),
+    }
+    .map_err(|error| error.to_string())?;
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls))
+        .map_err(|error| format!("{error:?}"))?;
+    let mut config = quinn::ClientConfig::new(Arc::new(crypto));
+    config.transport_config(Arc::new(
+        mahbot_peers::beacon::transport_config().map_err(|error| error.to_string())?,
+    ));
+    Ok(config)
 }
 
 /// A running beacon and everything needed to restart it.

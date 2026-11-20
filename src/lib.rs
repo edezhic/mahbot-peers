@@ -18,7 +18,8 @@
     clippy::module_name_repetitions
 )]
 
-// The beacon: its closed message set and the client half the product speaks.
+// The beacon: its closed message set, the client half the product speaks, and
+// the deadline combinator both halves share.
 pub mod beacon;
 // The per-instance ed25519 identity, its byte-exact fingerprint and its key file.
 pub mod identity;

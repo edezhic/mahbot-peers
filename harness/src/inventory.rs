@@ -531,6 +531,10 @@ const CAPABILITIES: &[Capability] = &[
         "a peer that opens a stream and does not finish its frame is answered `Slow` within the server's bound, and the same connection keeps serving complete requests",
     ),
     Capability::witnessed(
+        "library.beacon.deadline_ordering",
+        "an introduction's three sequential server exchanges fit strictly inside the client's request bound, which fits strictly inside the idle timeout, so a live but slow beacon is not reported as dead",
+    ),
+    Capability::witnessed(
         "library.beacon.handshake_bounded",
         "a half-open handshake gives its connection slot back within the server's bound instead of holding it until the idle timeout, so a stalled dialer cannot occupy the cap",
     ),

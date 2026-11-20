@@ -21,19 +21,22 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use mahbot_peers::beacon::timeout;
 use mahbot_peers::beacon::wire;
 use mahbot_peers::beacon::{BeaconError, Frame, Refusal, Request, Response};
 use mahbot_peers::identity::{Fingerprint, PeerId};
 use quinn::{Connection, Endpoint, RecvStream, Runtime, SendStream};
 use rustls::pki_types::CertificateDer;
 
-use crate::clock::{Clock, timeout};
+use crate::clock::Clock;
 use crate::core::{Action, ConnectionId, Registry};
 
 /// How long one exchange may take: reading a request, writing an answer, or
 /// handing a frame to a recipient. The runtime's timer measures it, so a test
-/// moves it and the server never reads a clock of its own. The client's own bound
-/// is larger, so a live but slow beacon is not reported as a dead one.
+/// moves it and the server never reads a clock of its own. An introduction passes
+/// through all three in sequence, so the client's request bound is more than three
+/// times this one and a live but slow beacon is not reported as dead; the
+/// harness's recorded case `deadlines_are_ordered` pins the ordering.
 pub const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The most connections the beacon serves at once, handshakes in flight included.

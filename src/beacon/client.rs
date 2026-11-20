@@ -162,11 +162,14 @@ impl Session {
     /// constructor the recipient verifies against — and sent as its parts; the
     /// beacon adds the sender's id from the connection, never from the frame.
     ///
-    /// The beacon does not read the payload and does not store it: if `to` is not
-    /// reachable at this moment the call fails with
-    /// [`BeaconError::UnknownPeer`] and nothing is kept for later. `Delivered`
-    /// means the frame reached the addressee's connection, not that it was read.
-    /// The call is bounded by [`BEACON_REQUEST_TIMEOUT`], like every request.
+    /// The beacon does not read the payload and does not store it. If `to` is not
+    /// registered, or its live connection cannot take the frame within the
+    /// server's exchange bound — a recipient that has left
+    /// [`crate::beacon::MAX_CONCURRENT_STREAMS`] introductions unread — the call
+    /// fails with [`BeaconError::UnknownPeer`] and nothing is kept for later.
+    /// `Delivered` means the frame was written to the addressee's connection, not
+    /// that its application read it. The call is bounded by
+    /// [`BEACON_REQUEST_TIMEOUT`], like every request.
     ///
     /// # Errors
     ///

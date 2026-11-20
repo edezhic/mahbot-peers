@@ -194,6 +194,11 @@ const WITNESSES: &[Witness] = &[
         case: beacon::a_stalled_stream_is_refused,
     },
     Witness {
+        id: "deadlines_are_ordered",
+        capability: "library.beacon.deadline_ordering",
+        case: beacon::deadlines_are_ordered,
+    },
+    Witness {
         id: "a_stalled_handshake_gives_its_place_back",
         capability: "library.beacon.handshake_bounded",
         case: beacon::a_stalled_handshake_gives_its_place_back,

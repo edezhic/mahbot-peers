@@ -18,7 +18,7 @@ The library (`src/`) holds:
 | `identity` | one ed25519 identity per storage root, in a key file the caller's root holds; the fingerprint is the 44-byte RFC 8410 SubjectPublicKeyInfo and the peer id is the key inside it. `identity::access` is who may reach that file, `identity::keyfile` is its name, its format and its one create |
 | `tls` | TLS 1.3 with raw public keys (RFC 7250), pinned to the peer's fingerprint instead of a certificate chain, with a per-service ALPN |
 | `net` | endpoint construction over an injected datagram socket and an injected clock — no default for either |
-| `beacon` | the beacon: the closed message set (`wire`) and the client half (`Beacon`, `Session`) — register, look an id up, learn the address observed on this path, hand a signed introduction over, take the ones pushed to a live session |
+| `beacon` | the beacon: the closed message set (`wire`), the client half (`Beacon`, `Session`) — register, look an id up, learn the address observed on this path, hand a signed introduction over, take the ones pushed to a live session — and the one deadline combinator the client and the server share (`timeout`) |
 
 ## The identity
 
@@ -87,9 +87,12 @@ A session is bounded in both directions. It pings every `BEACON_KEEP_ALIVE` so a
 idle session keeps its connection and its NAT binding, and every request — the
 handshake included, and the frame of a pushed introduction — gives up after
 `BEACON_REQUEST_TIMEOUT` of the injected runtime's time: a beacon that is gone is
-a bounded failure, not a session that looks open forever. The server's own bound
-per exchange is smaller, so a live but slow beacon is never reported as dead.
-`next_introduction`'s wait for the beacon to speak first is the caller's.
+a bounded failure, not a session that looks open forever. An introduction makes
+the server apply its own exchange bound three times in sequence, so the client's
+bound is more than three times the server's and a live but slow beacon is never
+reported as dead; the recorded case `deadlines_are_ordered` pins that ordering and
+the idle timeout above it. `next_introduction`'s wait for the beacon to speak
+first is the caller's.
 
 ## The server
 

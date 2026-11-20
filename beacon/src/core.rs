@@ -16,6 +16,7 @@
 //! the beacon has no way to tell a copy from the real machine and is not asked to.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -142,6 +143,33 @@ impl Registry {
             .collect();
         entries.sort_by_key(|(id, _)| *id);
         entries
+    }
+
+    /// A canonical rendering of everything the registry holds, one line per
+    /// registration, for the case that asserts the beacon stores no payload.
+    ///
+    /// Every field of the registry and of a registration is named in the
+    /// destructuring below, so a field added to either stops this from compiling
+    /// until it is named here too; a payload field therefore cannot be added
+    /// silently. Expiry is rendered as whether the registration is still live at
+    /// `now`, because the instant itself is the clock's and not a value a case
+    /// can compare.
+    #[must_use]
+    pub fn render(&self, now: Duration) -> String {
+        let Self { entries } = self;
+        let mut registrations: Vec<(&PeerId, &Entry)> = entries.iter().collect();
+        registrations.sort_by_key(|(id, _)| **id);
+        let mut rendered = String::new();
+        for (id, entry) in registrations {
+            let Entry {
+                address,
+                connection,
+                expires,
+            } = entry;
+            let liveness = if *expires > now { "live" } else { "expired" };
+            let _ = writeln!(rendered, "{id:?} at {address} on {connection:?} {liveness}");
+        }
+        rendered
     }
 
     #[must_use]

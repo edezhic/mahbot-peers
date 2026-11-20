@@ -31,6 +31,7 @@ mod time;
 pub mod wire;
 
 pub use client::{Beacon, Session};
+pub use time::timeout;
 pub use wire::{Frame, MAX_FRAME_BYTES, PROTOCOL_VERSION, Push, Refusal, Request, Response};
 
 /// The beacon's own protocol, distinct from the peer layer's: a connection
@@ -65,15 +66,20 @@ pub const BEACON_KEEP_ALIVE: Duration = Duration::from_secs(10);
 
 /// How long one request may wait for its answer. The transport's idle timeout is
 /// not a substitute: a request already sent to a beacon that is gone would wait
-/// out the whole idle timeout, and the caller needs that failure named sooner. The
-/// server's own bound per exchange is smaller, so a live but slow beacon is never
-/// reported as dead.
+/// out the whole idle timeout, and the caller needs that failure named sooner. An
+/// introduction makes the server apply its own exchange bound three times in
+/// sequence — reading the request, handing the frame to the recipient, writing the
+/// answer — so this bound is more than three times the server's, and a live but
+/// slow beacon is never reported as dead.
 pub const BEACON_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The most streams one side may have open to the other at once. It bounds the
 /// beacon's per-connection state, and it is the number of introductions a
-/// recipient can leave unread before the beacon's next push has to wait for
-/// credit.
+/// recipient can leave unread. A push beyond it waits for credit; a push that
+/// cannot complete within the server's exchange bound is answered
+/// [`BeaconError::UnknownPeer`] — the same answer an unregistered id gets — so a
+/// live recipient that stops reading is reported as unreachable instead of
+/// stalling the sender. Nothing is stored for a later attempt.
 pub const MAX_CONCURRENT_STREAMS: u32 = 16;
 
 /// The domain separator of an introduction's signature.
@@ -84,7 +90,9 @@ const INTRODUCTION_DOMAIN: &[u8] = b"mahbot-peers introduction v1";
 pub enum BeaconError {
     /// The service is not running, or the connection to it is gone.
     Unavailable,
-    /// The addressee is not reachable at this moment, so nothing was stored.
+    /// The addressee is not reachable at this moment — not registered, or its
+    /// live connection could not take the frame within the server's exchange
+    /// bound — so nothing was stored.
     UnknownPeer(PeerId),
     /// The payload is larger than [`MAX_PAYLOAD_BYTES`].
     PayloadTooLarge(usize),
@@ -297,12 +305,14 @@ pub fn client_config(
 /// interval that makes a quiet session survive it, and the per-connection stream
 /// limit that bounds the beacon's state.
 ///
-/// The receive window is one frame per stream and one frame per stream across the
-/// connection, rather than quinn's megabyte: the largest thing the beacon sends is
-/// a frame, and the protocol never uses QUIC datagrams, so nothing advertises or
-/// buffers a channel it would not drain. The server differs in one respect — it
-/// accepts no unidirectional stream — and says so where its own configuration is
-/// built.
+/// The receive window is one frame per stream and that multiplied by the stream
+/// limit across the connection — [`MAX_FRAME_BYTES`] × [`MAX_CONCURRENT_STREAMS`],
+/// 256 KiB — rather than quinn's defaults: the largest thing the beacon sends is a
+/// frame, and the protocol never uses QUIC datagrams, so nothing advertises or
+/// buffers a channel it would not drain. At the server's default cap of 1024
+/// connections, 256 KiB per connection is at most 256 MiB of received stream data
+/// in the beacon's memory. The server differs in one respect — it accepts no
+/// unidirectional stream — and says so where its own configuration is built.
 ///
 /// # Errors
 ///
