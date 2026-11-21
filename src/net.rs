@@ -30,7 +30,7 @@ pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// A pair is mostly silent — the queue lives at the sender and a peer may have
 /// nothing to say for days — so the default keeps the connection: a third of
-/// [`DEFAULT_IDLE_TIMEOUT`], which leaves two lost pings before the timeout would
+/// [`DEFAULT_IDLE_TIMEOUT`], which leaves one lost ping before the timeout would
 /// close it, and a peer that is really gone stops answering and is closed by that
 /// timeout.
 pub const DEFAULT_KEEP_ALIVE: Duration = Duration::from_secs(10);
@@ -67,17 +67,12 @@ pub fn refusal(error: &quinn::ConnectionError) -> Option<Refusal> {
 pub struct Transport {
     /// How long a connection may carry nothing before QUIC gives up on it.
     ///
-    /// The peer layer's connection manager refuses a value too short for the window
-    /// it judges a fresh connection by; see [`crate::peer::Connections::new`].
+    /// The timeout that applies is the smaller of the two machines' values, so the
+    /// shorter one governs both ends.
     pub idle_timeout: Duration,
-    /// How often to ping a quiet connection, or `None` to let silence close it.
+    /// How often this machine pings a quiet connection, or `None` to send none.
     ///
-    /// A pair that is mostly idle — the sender-side queue can hold a message for
-    /// hours — is re-dialled on every idle timeout unless the endpoint pings. A
-    /// keep-alive shorter than [`Self::idle_timeout`] keeps such a pair connected;
-    /// a peer that is really gone stops answering and is closed by the timeout. The
-    /// peer layer's connection manager refuses a keep-alive that is not shorter: it
-    /// could never fire before the timeout closed the connection.
+    /// A value that is not shorter than [`Self::idle_timeout`] would not be effective.
     pub keep_alive: Option<Duration>,
 }
 
@@ -85,9 +80,9 @@ impl Default for Transport {
     fn default() -> Self {
         Self {
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
-            // A quiet pair stays connected: silence is the normal case for this
-            // product, and a connection that dies of it would have to be re-dialled
-            // by a caller. A caller that wants the bare timeout states `None`.
+            // A quiet pair stays connected while either side pings: silence is the
+            // normal case for this product, and a connection that dies of it has to be
+            // re-dialled. A caller that wants the bare timeout states `None`.
             keep_alive: Some(DEFAULT_KEEP_ALIVE),
         }
     }

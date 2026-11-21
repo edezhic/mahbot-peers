@@ -13,13 +13,30 @@
 //!
 //! Recovery is the manager's: [`Connections::keep_connected`] watches the pair's
 //! live connection and dials again when it is gone, so a caller runs one per paired
-//! peer and does not dial itself. A quiet pair stays connected by default —
-//! [`crate::net::Transport`] pings at [`crate::net::DEFAULT_KEEP_ALIVE`] — so silence
-//! is not a lost connection, and [`Connections::new`] refuses a transport that could
-//! not keep one. A connection that carried anything and then died is a link failure
-//! and is re-dialled without a bound; only dials that carried nothing are counted.
-//! When the keeper stops instead of dialling, it says which way it stopped:
-//! [`Keeper`], and what counts is stated on [`Connections::keep_connected`].
+//! peer and does not dial itself. A connection that carried anything and then died
+//! is a link failure and is re-dialled without a bound; only dials that carried
+//! nothing are counted. When the keeper stops instead of dialling, it says which way
+//! it stopped: [`Keeper`], and what counts is stated on
+//! [`Connections::keep_connected`].
+//!
+//! # A quiet pair
+//!
+//! A keep-alive on either machine holds a silent pair: QUIC's idle timeout is the
+//! smaller of the two machines' and a ping resets it on both, so
+//! [`Connections::new`] accepts a transport with no keep-alive at all, and a silent
+//! pair then lives only while the peer keeps pinging. With both sides silent the
+//! connection closes at the idle timeout and [`Connections::keep_connected`] dials it
+//! again — recovery, not a failure of the pair.
+//!
+//! The keeper judges a fresh connection by its own window, [`KEEPER_SETTLE`], not by
+//! the transport's idle timeout. A connection the keeper dialled that ends inside
+//! that window having carried nothing is a strike against the peer, and
+//! [`KEEPER_UNSTABLE_LIMIT`] of those in a row stop the keeper, so a transport whose
+//! idle timeout is not longer than the window would turn each ordinary silent drop
+//! into a strike and a run of them into a stop. That is why [`Connections::new`]
+//! refuses one. The check reads this machine's transport only: over the wire the
+//! effective timeout is the smaller of the two machines', so a peer built with a
+//! shorter one can still close a quiet connection inside this machine's window.
 //!
 //! The manager reads the record store as it is loaded. A process that shares a
 //! storage root with another — the self-update window — calls
@@ -91,14 +108,12 @@ const DEFAULT_CONNECT_BUDGET: Duration = Duration::from_secs(10);
 /// How long a connection must stay up before the keeper counts it as one the peer
 /// keeps.
 ///
-/// A connection that ends inside this window without carrying anything is one the
-/// pair never got to use, and a run of those is bounded. The window must fit inside
-/// the transport's idle timeout — [`Connections::new`] refuses a transport where it
-/// does not — because a healthy quiet connection whose own idle timeout fired inside
-/// the window would be counted as the peer refusing it, and a few of those would
-/// stop the keeper for good. It is not a poll interval — nothing is re-dialled while
-/// a connection is up. [`Connections::keep_connected`] states what the window
-/// decides.
+/// A connection the keeper dialled that ends inside this window without carrying
+/// anything is one the pair never got to use, and a run of those is bounded. The
+/// window is the keeper's own, not the transport's: the module's *A quiet pair* note
+/// says why a transport whose idle timeout is not longer than this window is refused.
+/// It is not a poll interval — nothing is re-dialled while a connection is up.
+/// [`Connections::keep_connected`] states what the window decides.
 pub const KEEPER_SETTLE: Duration = Duration::from_secs(10);
 
 /// How many dials in a row may produce a connection that ends before the pair
@@ -106,8 +121,8 @@ pub const KEEPER_SETTLE: Duration = Duration::from_secs(10);
 ///
 /// One is an ordinary loss; a run of them is a peer that accepts and drops, and
 /// re-dialling at handshake rate is the silent retry loop the design rules out. It
-/// is public because [`Keeper`]'s words carry the number: a caller that reports the
-/// stop says the same.
+/// is public because the test rig drives cases by that number, and because a caller
+/// deciding what to do after a [`Keeper::Unstable`] stop may want it.
 pub const KEEPER_UNSTABLE_LIMIT: u8 = 3;
 
 /// How many accept loops a machine should run at once.
@@ -186,17 +201,18 @@ impl Connections {
     /// [`Self::serve`] over must be built over the same store as its
     /// [`crate::tls::PeerPolicy`] and from this same `transport`: the handshake would
     /// otherwise trust a peer this manager does not, and the keeper would judge
-    /// connections by a window the transport does not honour. quinn exposes no way to
-    /// read an endpoint's transport back, so this is a contract the caller keeps, not
-    /// something the manager can check. The store is read as it is loaded; see the
-    /// module docs on the self-update window.
+    /// connections by a window the endpoint's own transport was never checked
+    /// against. quinn exposes no way to read an endpoint's transport back, so this is
+    /// a contract the caller keeps, not something the manager can check. The store is
+    /// read as it is loaded; see the module docs on the self-update window.
     ///
     /// # Errors
     ///
     /// [`ManagerError::IdleTimeoutTooShort`] when `transport`'s idle timeout is not
-    /// longer than [`KEEPER_SETTLE`], which says why the window must fit inside it;
-    /// [`ManagerError::KeepAliveNotBelowIdle`] when its keep-alive is not shorter
-    /// than its idle timeout, so it could never fire.
+    /// longer than [`KEEPER_SETTLE`] — the module's *A quiet pair* note says why —
+    /// and [`ManagerError::KeepAliveNotBelowIdle`] when its keep-alive is not
+    /// shorter than its idle timeout, so it could never fire. Both read this
+    /// machine's transport only; each variant says what that leaves out.
     pub fn new(
         me: &Identity,
         store: RecordStore,
@@ -785,21 +801,32 @@ pub enum NotTrustedCause {
 /// Why a connection manager could not be built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ManagerError {
-    /// The transport's idle timeout is not longer than [`KEEPER_SETTLE`]; that
-    /// constant says why the window must fit inside it. Raise the timeout above the
-    /// window.
+    /// The transport's idle timeout is not longer than [`KEEPER_SETTLE`]; the
+    /// module's *A quiet pair* note says why that is refused. Raise the timeout above
+    /// the window.
     ///
-    /// The check is this machine's alone: QUIC's effective idle timeout is the
-    /// smaller of the two peers', so a peer built with a shorter one can still close
-    /// a quiet connection inside this machine's window.
+    /// The check reads this machine's transport only: QUIC's effective idle timeout
+    /// is the smaller of the two machines', so a peer built with a shorter one can
+    /// still close a quiet connection inside this machine's window.
     IdleTimeoutTooShort { idle_timeout: Duration },
     /// The transport's keep-alive is not shorter than its idle timeout, so it could
     /// never fire: a quiet connection would time out before a ping kept it alive.
+    ///
+    /// The check reads this machine's transport only: the keep-alive must also be
+    /// shorter than the peer's idle timeout, so one that is short enough here can
+    /// still be too long for the pair.
     KeepAliveNotBelowIdle {
         keep_alive: Duration,
         idle_timeout: Duration,
     },
 }
+
+/// What both refusals say about their reach: they read this machine's transport,
+/// while over the wire the effective timeout is the smaller of the two machines'.
+const LOCAL_TRANSPORT_ONLY: &str = concat!(
+    "; the check reads this machine's transport only, while over the wire the ",
+    "effective timeout is the smaller of the two machines'",
+);
 
 impl fmt::Display for ManagerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -807,7 +834,8 @@ impl fmt::Display for ManagerError {
             Self::IdleTimeoutTooShort { idle_timeout } => write!(
                 f,
                 "the transport's idle timeout {idle_timeout:?} is not longer than the \
-                 {KEEPER_SETTLE:?} window the keeper judges a fresh connection by"
+                 {KEEPER_SETTLE:?} window the keeper judges a fresh connection by\
+                 {LOCAL_TRANSPORT_ONLY}"
             ),
             Self::KeepAliveNotBelowIdle {
                 keep_alive,
@@ -815,7 +843,7 @@ impl fmt::Display for ManagerError {
             } => write!(
                 f,
                 "the transport's keep-alive {keep_alive:?} is not shorter than its idle \
-                 timeout {idle_timeout:?}, so it could never fire"
+                 timeout {idle_timeout:?}, so it could never fire{LOCAL_TRANSPORT_ONLY}"
             ),
         }
     }

@@ -429,9 +429,9 @@ pub(crate) fn four_failures_are_distinct() -> Result<(), String> {
 }
 
 /// A transport the keeper could not watch cannot build a manager: neither a silence
-/// deadline inside the keeper's window nor a keep-alive that cannot fire before the
-/// timeout is accepted, so a caller cannot break the pair by configuring the
-/// transport it hands over.
+/// deadline no longer than the keeper's window nor a keep-alive that cannot fire
+/// before the timeout is accepted, so a caller cannot turn an ordinary silent drop
+/// into a strike by configuring this machine's transport.
 pub(crate) fn manager_refuses_an_unwatchable_transport() -> Result<(), String> {
     block_on(async {
         let sim = Sim::new().map_err(io_error)?;
@@ -1344,17 +1344,13 @@ async fn wait_live(
     .map_err(|_| "no live connection within the budget".to_owned())
 }
 
-/// The default transport holds a quiet pair: silence is not a link failure.
+/// The default transport pings, so a pair with nothing to carry stays connected for
+/// twice the idle timeout.
 pub(crate) fn quiet_pair_stays_connected() -> Result<(), String> {
-    let transport = mahbot_peers::net::Transport::default();
-    let Some(keep_alive) = transport.keep_alive else {
+    // The manager refuses a keep-alive that is not below the timeout; that the
+    // default has one at all is this case's own assertion.
+    if mahbot_peers::net::Transport::default().keep_alive.is_none() {
         return Err("the default transport has no keep-alive".to_owned());
-    };
-    if keep_alive >= transport.idle_timeout {
-        return Err(format!(
-            "the default keep-alive {keep_alive:?} is not below the idle timeout {:?}",
-            transport.idle_timeout
-        ));
     }
     block_on(async {
         let sim = Sim::new().map_err(io_error)?;
@@ -1692,17 +1688,12 @@ pub(crate) fn keeper_survives_a_supersession() -> Result<(), String> {
         }
         // Both machines kept the connection the smaller fingerprint started: the
         // collision was resolved by the rule, not by whichever dial happened to finish.
-        let (small_id, large_id) = if left.peer_id() < right.peer_id() {
-            (left.peer_id(), right.peer_id())
+        let (small, large, small_managed, large_managed) = if left.peer_id() < right.peer_id() {
+            (&left, &right, &managed_left, &managed_right)
         } else {
-            (right.peer_id(), left.peer_id())
+            (&right, &left, &managed_right, &managed_left)
         };
-        let (small_managed, large_managed) = if left.peer_id() < right.peer_id() {
-            (&managed_left, &managed_right)
-        } else {
-            (&managed_right, &managed_left)
-        };
-        match small_managed.connections.started_by(&large_id) {
+        match small_managed.connections.started_by(&large.peer_id()) {
             Some(Started::Here) => {}
             other => {
                 return Err(format!(
@@ -1710,7 +1701,7 @@ pub(crate) fn keeper_survives_a_supersession() -> Result<(), String> {
                 ));
             }
         }
-        match large_managed.connections.started_by(&small_id) {
+        match large_managed.connections.started_by(&small.peer_id()) {
             Some(Started::There) => {}
             other => {
                 return Err(format!(

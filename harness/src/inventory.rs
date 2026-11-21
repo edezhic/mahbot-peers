@@ -672,7 +672,7 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.net.quiet_pair_default",
-        "the default transport carries a keep-alive below its idle timeout, so a quiet pair stays connected past twice the timeout with nothing to carry, and a datagram crosses the connection that survived",
+        "the default transport carries a keep-alive, so a quiet pair with nothing to carry stays connected for twice the idle timeout, and a datagram crosses the connection that survived",
     ),
     Capability::witnessed(
         "library.tls.alpn",
@@ -821,7 +821,7 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.peer.connect.unwatchable_transport",
-        "a transport whose idle timeout is not longer than the keeper's settle window is refused when the manager is built, with a typed error naming the timeout, so a caller cannot turn every ordinary link failure into a strike by configuring the transport it hands over; a keep-alive that is not shorter than its idle timeout — one that could never fire — is refused the same way, naming both; one second above the window with a keep-alive just below the timeout builds a manager",
+        "a transport whose idle timeout is not longer than the keeper's settle window is refused when the manager is built, with a typed error naming the timeout, so a caller cannot turn an ordinary silent drop into a strike by configuring this machine's transport; a keep-alive that is not shorter than its idle timeout — one that could never fire — is refused the same way, naming both; one second above the window with a keep-alive just below the timeout builds a manager",
     ),
     Capability::witnessed(
         "library.peer.connect.one_per_pair",
