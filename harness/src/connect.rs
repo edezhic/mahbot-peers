@@ -24,15 +24,15 @@ use std::time::Duration;
 
 use mahbot_peers::identity::Fingerprint;
 use mahbot_peers::net::TransportError;
+use mahbot_peers::peer::RecordStore;
 use mahbot_peers::tls::PeerPolicy;
 use quinn::{Connection, Endpoint, Incoming};
 
 use crate::machine::Machine;
 
-/// The name rustls is given for a connection. With raw public keys the name is
-/// not what identifies the peer — the pinned fingerprint is — so it only has to
-/// be a valid DNS name.
-pub const SERVER_NAME: &str = "mahbot-peers";
+/// The name rustls is given for a connection, from the library, so the rig and the
+/// crate cannot name the same service differently.
+pub const SERVER_NAME: &str = mahbot_peers::net::SERVER_NAME;
 
 /// The fingerprints one machine trusts.
 #[derive(Debug, Default)]
@@ -57,6 +57,24 @@ impl TrustSet {
 impl PeerPolicy for TrustSet {
     fn trusts(&self, peer: &Fingerprint) -> bool {
         self.contains(peer)
+    }
+}
+
+/// What a machine's endpoint trusts: the in-memory set a case fills with
+/// `Machine::trust`, and the durable records a person wrote.
+///
+/// The peer-layer cases use the record half; the transport cases use the set. One
+/// endpoint serves both, because a machine has one socket and the endpoint built
+/// over it is the one a beacon session and a peer dial share.
+#[derive(Debug)]
+pub struct Policy {
+    pub trust: Arc<TrustSet>,
+    pub records: RecordStore,
+}
+
+impl PeerPolicy for Policy {
+    fn trusts(&self, peer: &Fingerprint) -> bool {
+        self.trust.contains(peer) || self.records.trusts(&peer.peer_id())
     }
 }
 
@@ -106,7 +124,10 @@ impl Machine {
         if let Some(endpoint) = slot.as_ref() {
             return Ok(endpoint.clone());
         }
-        let policy: Arc<dyn PeerPolicy> = Arc::clone(&self.trust) as Arc<dyn PeerPolicy>;
+        let policy: Arc<dyn PeerPolicy> = Arc::new(Policy {
+            trust: Arc::clone(&self.trust),
+            records: self.records.clone(),
+        });
         let endpoint = self.transport.endpoint(
             Arc::clone(&self.socket) as Arc<dyn quinn::AsyncUdpSocket>,
             self.clock.runtime(),

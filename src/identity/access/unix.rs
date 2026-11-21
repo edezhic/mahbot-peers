@@ -10,7 +10,7 @@ use std::io;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
-use super::{Insecurity, Opening, unix_refusal};
+use super::{Insecurity, Object, Opening, unix_refusal};
 
 pub(super) fn open(path: &Path) -> io::Result<Opening> {
     let mut options = OpenOptions::new();
@@ -40,13 +40,29 @@ pub(super) fn make_private(file: &File) -> io::Result<()> {
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
 }
 
+/// Pin the mode of a directory this crate just created to its owner alone.
+///
+/// The same step as the key file's, with the directory's mode: owner read, write and
+/// search, nothing for anyone else. The descriptor is opened the way [`check_dir`]
+/// opens one, so a link is never followed.
+pub(super) fn make_directory_private(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
+    options
+        .open(dir)?
+        .set_permissions(std::fs::Permissions::from_mode(0o700))
+}
+
 pub(super) fn check(file: &File) -> io::Result<Option<Insecurity>> {
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Ok(Some(Insecurity::NotRegular));
     }
     let me = me();
-    if let Some(reason) = unix_refusal(metadata.mode() & 0o777, metadata.uid(), me) {
+    if let Some(reason) = unix_refusal(metadata.mode() & 0o777, metadata.uid(), me, Object::File) {
         return Ok(Some(reason));
     }
     #[cfg(target_os = "macos")]
@@ -55,6 +71,54 @@ pub(super) fn check(file: &File) -> io::Result<Option<Insecurity>> {
         // extended access entry that grants everyone read. The account is read once
         // and decides both facts: whose the file is, and whether an entry names it.
         extended_entries(file, me)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(None)
+    }
+}
+
+/// Check a directory that holds records: the same owner-only rule, without the
+/// regular-file check. A world-writable directory lets another account delete a
+/// record, which is a silent un-pairing.
+///
+/// The directory is opened with `O_NOFOLLOW | O_DIRECTORY`, so a link is refused
+/// outright, as the key file's own rule refuses one, and records cannot be made to
+/// land outside the root through a linked `peers/`.
+pub(super) fn check_dir(dir: &Path) -> io::Result<Option<Insecurity>> {
+    // The descriptor check below refuses a link, but `O_DIRECTORY` changes the
+    // errno a link answers with on macOS, so the link is also refused by its own
+    // metadata first: a `peers/` that is a link must not pass for a directory.
+    if std::fs::symlink_metadata(dir)?.file_type().is_symlink() {
+        return Ok(Some(Insecurity::Symlink));
+    }
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
+    let file = match options.open(dir) {
+        Ok(file) => file,
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return Ok(Some(Insecurity::Symlink));
+        }
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() {
+        return Ok(Some(Insecurity::NotRegular));
+    }
+    let me = me();
+    if let Some(reason) = unix_refusal(
+        metadata.mode() & 0o777,
+        metadata.uid(),
+        me,
+        Object::Directory,
+    ) {
+        return Ok(Some(reason));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        extended_entries(&file, me)
     }
     #[cfg(not(target_os = "macos"))]
     {

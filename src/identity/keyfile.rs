@@ -60,13 +60,14 @@
 //! configuration and no ambient state. The root must exist; it is not created.
 
 use std::fmt;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use ring::rand::SystemRandom;
 
 use super::Identity;
-use super::access::{self, Insecurity};
+use super::access::Insecurity;
+use crate::private;
 
 /// The key file's name inside a storage root. Permanent: see the module docs.
 ///
@@ -94,6 +95,11 @@ pub fn file_in(root: &Path) -> PathBuf {
 /// something that is not a key, or it could not be read or created. A refusal
 /// never writes a key of its own.
 pub fn load_or_create(root: &Path) -> Result<Identity, KeyFileError> {
+    if !root.is_dir() {
+        return Err(KeyFileError::RootMissing {
+            path: root.to_owned(),
+        });
+    }
     let path = file_in(root);
     match read(&path)? {
         Some(identity) => Ok(identity),
@@ -104,6 +110,10 @@ pub fn load_or_create(root: &Path) -> Result<Identity, KeyFileError> {
 /// Why the identity under a storage root could not be loaded or created.
 #[derive(Debug)]
 pub enum KeyFileError {
+    /// The storage root does not exist, or is not a directory. It is never created
+    /// here: a mistyped or deleted root must fail loudly instead of minting a new
+    /// identity under a path that is not this machine's.
+    RootMissing { path: PathBuf },
     /// An existing key file is reachable by an account the rule does not allow. Distinct
     /// from a missing file and from a malformed one: this is a refusal, not an
     /// absence.
@@ -147,6 +157,11 @@ pub enum Malformed {
 impl fmt::Display for KeyFileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::RootMissing { path } => write!(
+                f,
+                "{}: the storage root does not exist or is not a directory; it is never created",
+                path.display()
+            ),
             Self::Insecure { path, reason } => {
                 write!(f, "{} is not private: {reason}", path.display())?;
                 // The message is the one an operator acts on, so the command names
@@ -208,40 +223,34 @@ impl std::error::Error for KeyFileError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
-            Self::Insecure { .. } | Self::RootNotPrivate { .. } | Self::Malformed { .. } => None,
+            Self::RootMissing { .. }
+            | Self::Insecure { .. }
+            | Self::RootNotPrivate { .. }
+            | Self::Malformed { .. } => None,
         }
     }
 }
 
 /// Read the key at `path`, or `None` if nothing is there.
 fn read(path: &Path) -> Result<Option<Identity>, KeyFileError> {
-    let file = match access::open(path).map_err(|source| KeyFileError::Io {
-        path: path.to_owned(),
-        source,
-    })? {
-        access::Opening::File(file) => file,
-        access::Opening::Absent => return Ok(None),
-        access::Opening::Refused(reason) => {
+    let file = match private::open_private(path) {
+        Ok(Some(file)) => file,
+        Ok(None) => return Ok(None),
+        Err(private::PrivateFileError::Insecure(reason)) => {
             return Err(KeyFileError::Insecure {
                 path: path.to_owned(),
                 reason,
             });
         }
+        Err(private::PrivateFileError::Io(source)) => {
+            return Err(KeyFileError::Io {
+                path: path.to_owned(),
+                source,
+            });
+        }
     };
-    if let Some(reason) = access::check(&file).map_err(|source| KeyFileError::Io {
-        path: path.to_owned(),
-        source,
-    })? {
-        return Err(KeyFileError::Insecure {
-            path: path.to_owned(),
-            reason,
-        });
-    }
-    let length = file.metadata().map(|metadata| metadata.len()).ok();
-    let mut bytes = Vec::new();
-    file.take(MAX_BYTES)
-        .read_to_end(&mut bytes)
-        .map_err(|source| KeyFileError::Io {
+    let (bytes, length) =
+        private::read_capped(file, MAX_BYTES).map_err(|source| KeyFileError::Io {
             path: path.to_owned(),
             source,
         })?;
@@ -266,6 +275,8 @@ fn read(path: &Path) -> Result<Option<Identity>, KeyFileError> {
 }
 
 /// Mint a key and publish it under `root` unless another creator already did.
+///
+/// The root is checked by [`load_or_create`], the only caller.
 fn create(root: &Path) -> Result<Identity, KeyFileError> {
     let path = file_in(root);
     let io_error = |source| KeyFileError::Io {
@@ -274,33 +285,13 @@ fn create(root: &Path) -> Result<Identity, KeyFileError> {
     };
     // Beside the destination, so publishing is a rename within one directory: a
     // copy of the key never exists under a name a reader of the key would use.
-    let mut temp = tempfile::Builder::new()
-        .prefix(".identity.key.")
-        .tempfile_in(root)
-        .map_err(|source| match source.kind() {
-            // The root arrives from the caller and is never created here: a missing
-            // one is the caller's bug, and it deserves a message that says so.
-            io::ErrorKind::NotFound => io_error(io::Error::new(
-                io::ErrorKind::NotFound,
-                "the storage root does not exist",
-            )),
-            _ => io_error(source),
-        })?;
-    // The access first: on Windows the temporary file inherits the directory's
-    // list until this replaces it, and the private half must not be written into a
-    // window where that list is still the directory's.
-    access::make_private(temp.as_file(), temp.path()).map_err(io_error)?;
-    // Verified before a key byte exists in the file: on Windows the list and the
-    // owner were applied by path, so a path swapped between the calls leaves the
-    // handle's file with the directory's own list and owner, and this refuses instead
-    // of writing into it. The refusal names the root, because the root is the directory
-    // that handed the temporary file the access and the owner that were found.
-    if let Some(reason) = access::check(temp.as_file()).map_err(io_error)? {
-        return Err(KeyFileError::RootNotPrivate {
+    let mut temp = private::private_temp(&path, ".identity.key.").map_err(|error| match error {
+        private::PrivateFileError::Insecure(reason) => KeyFileError::RootNotPrivate {
             root: root.to_owned(),
             reason,
-        });
-    }
+        },
+        private::PrivateFileError::Io(source) => io_error(source),
+    })?;
     // Minted last, so a refused root never has a key generated for it: nothing
     // private exists, even in memory, until the file it would live in is known to
     // be one only the accounts the rule allows can read.

@@ -18,8 +18,22 @@ use quinn::{AsyncUdpSocket, Endpoint, EndpointConfig, IdleTimeout, Runtime};
 use crate::identity::Identity;
 use crate::tls::{self, PeerPolicy, Refusal};
 
+/// The name rustls is given for a peer connection. With raw public keys the name
+/// is not what identifies the peer — the pinned fingerprint is — so it only has to
+/// be a valid DNS name.
+pub const SERVER_NAME: &str = "mahbot-peers";
+
 /// How long a connection may sit idle before QUIC gives up on it.
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often a quiet connection pings, by default.
+///
+/// A pair is mostly silent — the queue lives at the sender and a peer may have
+/// nothing to say for days — so the default keeps the connection: a third of
+/// [`DEFAULT_IDLE_TIMEOUT`], which leaves two lost pings before the timeout would
+/// close it, and a peer that is really gone stops answering and is closed by that
+/// timeout.
+pub const DEFAULT_KEEP_ALIVE: Duration = Duration::from_secs(10);
 
 /// The refusal a failed connection reports, when it was refused for the key it
 /// presented rather than for anything else.
@@ -47,16 +61,34 @@ pub fn refusal(error: &quinn::ConnectionError) -> Option<Refusal> {
     reason.and_then(Refusal::of)
 }
 
-/// Everything about an endpoint that is not a seam: today, the idle timeout.
+/// Everything about an endpoint that is not a seam: the idle timeout, and how
+/// often a quiet connection pings so it does not reach it.
 #[derive(Clone, Debug)]
 pub struct Transport {
+    /// How long a connection may carry nothing before QUIC gives up on it.
+    ///
+    /// The peer layer's connection manager refuses a value too short for the window
+    /// it judges a fresh connection by; see [`crate::peer::Connections::new`].
     pub idle_timeout: Duration,
+    /// How often to ping a quiet connection, or `None` to let silence close it.
+    ///
+    /// A pair that is mostly idle — the sender-side queue can hold a message for
+    /// hours — is re-dialled on every idle timeout unless the endpoint pings. A
+    /// keep-alive shorter than [`Self::idle_timeout`] keeps such a pair connected;
+    /// a peer that is really gone stops answering and is closed by the timeout. The
+    /// peer layer's connection manager refuses a keep-alive that is not shorter: it
+    /// could never fire before the timeout closed the connection.
+    pub keep_alive: Option<Duration>,
 }
 
 impl Default for Transport {
     fn default() -> Self {
         Self {
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            // A quiet pair stays connected: silence is the normal case for this
+            // product, and a connection that dies of it would have to be re-dialled
+            // by a caller. A caller that wants the bare timeout states `None`.
+            keep_alive: Some(DEFAULT_KEEP_ALIVE),
         }
     }
 }
@@ -75,6 +107,7 @@ impl Transport {
         transport.max_idle_timeout(Some(
             IdleTimeout::try_from(self.idle_timeout).map_err(|_| TransportError::IdleTimeout)?,
         ));
+        transport.keep_alive_interval(self.keep_alive);
         let transport = Arc::new(transport);
         // The crate builds the TLS configuration itself — TLS 1.3 only, with the
         // ring provider — so an initial cipher suite always exists and this

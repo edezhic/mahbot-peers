@@ -15,8 +15,10 @@ use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use mahbot_peers::identity::{Fingerprint, Identity, PeerId};
+use mahbot_peers::peer::RecordStore;
 
 use crate::connect::Inbox;
 use crate::link::{Link, LinkedSocket};
@@ -75,6 +77,9 @@ impl fmt::Display for IsolationRefused {
 
 impl std::error::Error for IsolationRefused {}
 
+/// How long a restart waits for the transport to let go of the old socket.
+pub const RESTART_BUDGET: Duration = Duration::from_secs(45);
+
 /// The message a storage capability gives when its root no longer exists.
 ///
 /// A test matches on it to tell "the root is gone" from "the file is missing",
@@ -91,6 +96,7 @@ pub struct Machine {
     pub(crate) clock: crate::clock::MockClock,
     pub(crate) transport: mahbot_peers::net::Transport,
     pub(crate) trust: Arc<crate::connect::TrustSet>,
+    pub(crate) records: RecordStore,
     pub(crate) inbox: Arc<Inbox>,
     /// The task accepting on this machine's endpoint, once it has started.
     pub(crate) accepting: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -101,6 +107,7 @@ impl Machine {
     pub(crate) fn new(
         identity: Identity,
         root: Root,
+        records: RecordStore,
         socket: Arc<LinkedSocket>,
         link: Link,
         clock: crate::clock::MockClock,
@@ -108,6 +115,7 @@ impl Machine {
         Self {
             identity,
             root,
+            records,
             socket,
             link,
             clock,
@@ -149,6 +157,41 @@ impl Machine {
         Storage { root: &self.root }
     }
 
+    /// This machine's durable peer records.
+    ///
+    /// Every clone shares one map, and the machine's endpoint trusts what it says:
+    /// a store the case writes through is the store the handshake reads. A restart
+    /// reopens it from the root, which is what proves the record survives.
+    #[must_use]
+    pub fn records(&self) -> RecordStore {
+        self.records.clone()
+    }
+
+    /// Open a second store over the same root, reading what is on disk now.
+    ///
+    /// This is how a case proves durability: the machine's own store holds what
+    /// this process wrote, and a fresh open holds only what the files say.
+    ///
+    /// # Errors
+    ///
+    /// The record store's refusal, as text: an unreadable, insecure or malformed
+    /// record.
+    pub fn reopen_records(&self) -> Result<RecordStore, String> {
+        self.root.records()
+    }
+
+    /// A fresh store over this machine's root under explicit limits.
+    ///
+    /// The limits are recorded with each attempt, so a case can shorten an attempt's
+    /// lifetime without changing what the default store applies.
+    ///
+    /// # Errors
+    ///
+    /// The record store's refusal, as text.
+    pub fn records_with(&self, limits: mahbot_peers::peer::Limits) -> Result<RecordStore, String> {
+        self.root.records_with(limits)
+    }
+
     /// Remember `peer` as a machine this one may talk to.
     pub fn trust(&self, peer: &Machine) {
         self.trust.insert(peer.fingerprint());
@@ -179,6 +222,62 @@ impl Machine {
     pub fn with_idle_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.transport.idle_timeout = timeout;
         self
+    }
+
+    /// Set the transport's keep-alive before the endpoint is first built.
+    #[must_use]
+    pub fn with_keep_alive(mut self, keep_alive: Option<std::time::Duration>) -> Self {
+        self.transport.keep_alive = keep_alive;
+        self
+    }
+
+    /// Restart this machine over its own storage root.
+    ///
+    /// The endpoint is closed, the accept task is stopped, and the helper waits —
+    /// advancing the clock, because nothing else moves time — until the transport
+    /// has let go of the socket. Then the machine comes back with a fresh socket
+    /// at a new address, the identity read from the root again, and an empty
+    /// inbox: everything a process restart keeps is the root, and everything it
+    /// loses is in memory.
+    ///
+    /// Every endpoint, connection and manager handle a case holds must be dropped
+    /// before this call: they keep the old socket alive, and the wait would end in
+    /// the budget expiring instead of a restart. A record store holds no socket and
+    /// may be kept; the restart reopens the machine's own anyway.
+    ///
+    /// # Errors
+    ///
+    /// The transport did not release the socket within [`RESTART_BUDGET`], or the
+    /// root no longer holds a key.
+    pub async fn restart(&mut self) -> Result<SocketAddr, String> {
+        if let Some(endpoint) = self.endpoint_slot().take() {
+            endpoint.close(0u32.into(), b"machine restarting");
+        }
+        if let Some(task) = self.accepting().take() {
+            task.abort();
+        }
+        let mut waited = Duration::ZERO;
+        while Arc::strong_count(&self.socket) > 1 {
+            if waited >= RESTART_BUDGET {
+                return Err(format!(
+                    "the transport still holds the socket after {RESTART_BUDGET:?} of virtual time"
+                ));
+            }
+            self.clock.advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+            waited += Duration::from_secs(1);
+        }
+        // A new address, as a machine that came back on another network has: the
+        // remembered one is now stale, which is what the beacon is for.
+        self.socket = self.link.attach_next();
+        self.identity = self
+            .root
+            .load_identity()
+            .map_err(|error| error.to_string())?;
+        self.records = self.root.records()?;
+        self.trust = Arc::new(crate::connect::TrustSet::default());
+        self.inbox = Arc::new(Inbox::default());
+        Ok(self.socket.addr())
     }
 
     /// The endpoint slot: `None` until the first connection, then the endpoint

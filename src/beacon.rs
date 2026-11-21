@@ -31,7 +31,7 @@ mod time;
 pub mod wire;
 
 pub use client::{Beacon, Session};
-pub use time::timeout;
+pub use time::{sleep, timeout};
 pub use wire::{Frame, MAX_FRAME_BYTES, PROTOCOL_VERSION, Push, Refusal, Request, Response};
 
 /// The beacon's own protocol, distinct from the peer layer's: a connection

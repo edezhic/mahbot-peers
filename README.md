@@ -5,9 +5,9 @@ relay in the path, and remember each other by key. This crate is the network
 half — it knows keys, addresses and byte counts; the product knows people,
 accounts, rights, authorship and queues.
 
-The crate holds the seams the rest of the layer is built on, and the beacon: the
-one global service, as its protocol and its client. Pairing, delivery and rights
-are not here yet.
+The crate holds the seams the rest of the layer is built on — identity and its key
+file, the QUIC transport over raw public keys, the beacon — and the peer layer above
+them. Delivery and rights are not here yet.
 
 ## What the crate provides
 
@@ -19,6 +19,11 @@ The library (`src/`) holds:
 | `tls` | TLS 1.3 with raw public keys (RFC 7250), pinned to the peer's fingerprint instead of a certificate chain, with a per-service ALPN |
 | `net` | endpoint construction over an injected datagram socket and an injected clock — no default for either |
 | `beacon` | the beacon: the closed message set (`wire`), the client half (`Beacon`, `Session`) — register, look an id up, learn the address observed on this path, hand a signed introduction over, take the ones pushed to a live session — and the one deadline combinator the client and the server share (`timeout`, whose documentation says why there is one copy and not two) |
+| `peer` | the peer layer: `record` is the durable memory of another machine, `pair` the acquaintance ceremony, `connect` the per-machine connection manager, `presence` the registration refresh. Each is documented where it is enforced |
+
+The key-replacement invariant covers every shipped source: no `fs::rename`,
+`remove_dir` or `fs::copy` anywhere, and no write form in the identity module. The
+record publishes through `tempfile`, not a rename of its own.
 
 ## The identity
 
@@ -155,7 +160,14 @@ The harness (`harness/`, never published) is the test rig:
   harness mints no key of its own. `Sim::clone_of` copies one machine's key into a
   second root, which is what restoring a backup onto another host gives and what the
   clone refusal is about. The handle exposes no filesystem path, and its storage
-  capability refuses any root but its own.
+  capability refuses any root but its own. `Machine::restart` closes the endpoint,
+  waits — on the virtual clock — for the transport to let go of the socket, and
+  brings the machine back over the same root at a new address, with the identity and
+  the records read from disk again: everything a process restart keeps is the root.
+- **Mediator.** `pair::Mediator` is a party with its own key, its own address and a
+  live beacon session. It answers one machine's ceremony and starts another with a
+  second machine, confirming both, so a case can show that the two strings differ and
+  that a pair whose strings differ is recorded on neither side.
 - **Link.** Datagrams travel through an `AsyncUdpSocket` the test controls —
   the same seam a real socket uses. A script or a seed drops, delays, reorders,
   duplicates and re-addresses them, and every run leaves a trace that replays to

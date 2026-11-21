@@ -73,13 +73,14 @@ impl Capability {
     }
 }
 
-/// A recorded case that witnesses exactly one capability.
+/// A recorded case that witnesses one capability, or two when one case carries two
+/// claims. The case runs once, whatever the number.
 #[derive(Clone, Copy)]
 pub struct Witness {
     /// Stable id, unique across the table; this is the "recorded case".
     pub id: &'static str,
-    /// The capability id this case speaks for.
-    pub capability: &'static str,
+    /// The capability ids this case speaks for.
+    pub capabilities: &'static [&'static str],
     /// The case itself. It returns `Err` with the reason it failed.
     pub case: fn() -> Result<(), String>,
 }
@@ -88,7 +89,7 @@ impl fmt::Debug for Witness {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Witness")
             .field("id", &self.id)
-            .field("capability", &self.capability)
+            .field("capabilities", &self.capabilities)
             .finish_non_exhaustive()
     }
 }
@@ -302,8 +303,119 @@ fn platform_capabilities() -> Vec<Capability> {
             UNIX_NAMES_HOW,
         )
     };
-    vec![insecure_file, extended_acl, root_access_list, unix_names]
+    let peer_record_insecure = if cfg!(unix) {
+        Capability::witnessed(
+            "library.peer.record.insecure_file",
+            PEER_RECORD_INSECURE_CLAIM,
+        )
+        .with_procedure(PEER_RECORD_INSECURE_HOW)
+    } else {
+        Capability::unproducible(
+            "library.peer.record.insecure_file",
+            PEER_RECORD_INSECURE_CLAIM,
+            "the case sets a unix mode on the record file: this host has no mode bits, and the access-list state it would need instead has its own entry (`library.peer.record.windows_dacl`)",
+            PEER_RECORD_INSECURE_HOW,
+        )
+    };
+    let peer_record_insecure_dir = if cfg!(unix) {
+        Capability::witnessed(
+            "library.peer.record.insecure_directory",
+            PEER_RECORD_INSECURE_DIR_CLAIM,
+        )
+        .with_procedure(PEER_RECORD_INSECURE_DIR_HOW)
+    } else {
+        Capability::unproducible(
+            "library.peer.record.insecure_directory",
+            PEER_RECORD_INSECURE_DIR_CLAIM,
+            "the case sets a unix mode on the records directory: this host has no mode bits, and the access-list state it would need instead has its own entry (`library.peer.record.windows_dacl`)",
+            PEER_RECORD_INSECURE_DIR_HOW,
+        )
+    };
+    let peer_record_private_dir = if cfg!(unix) {
+        Capability::witnessed(
+            "library.peer.record.private_directory",
+            PEER_RECORD_PRIVATE_DIR_CLAIM,
+        )
+        .with_procedure(PEER_RECORD_PRIVATE_DIR_HOW)
+    } else {
+        Capability::unproducible(
+            "library.peer.record.private_directory",
+            PEER_RECORD_PRIVATE_DIR_CLAIM,
+            "the case reads the created directory's unix mode: this host has no mode bits, and the access list a created directory is given instead is covered by `library.peer.record.windows_dacl`",
+            PEER_RECORD_PRIVATE_DIR_HOW,
+        )
+    };
+    let peer_record_read_only = if cfg!(unix) {
+        Capability::witnessed(
+            "library.peer.record.opens_read_only",
+            PEER_RECORD_READ_ONLY_CLAIM,
+        )
+        .with_procedure(PEER_RECORD_READ_ONLY_HOW)
+    } else {
+        Capability::unproducible(
+            "library.peer.record.opens_read_only",
+            PEER_RECORD_READ_ONLY_CLAIM,
+            "the case makes the records directory read-only with a unix mode: this host has no mode bits, and the access list it would need instead is not built by any case here",
+            PEER_RECORD_READ_ONLY_HOW,
+        )
+    };
+    let peer_record_symlink = if cfg!(unix) {
+        Capability::witnessed(
+            "library.peer.record.symlinked_directory",
+            PEER_RECORD_SYMLINK_CLAIM,
+        )
+        .with_procedure(PEER_RECORD_SYMLINK_HOW)
+    } else {
+        Capability::unproducible(
+            "library.peer.record.symlinked_directory",
+            PEER_RECORD_SYMLINK_CLAIM,
+            "the case replaces `peers/` with a symbolic link: this host has no unix links, and the access-list state it would need instead has its own entry (`library.peer.record.windows_dacl`)",
+            PEER_RECORD_SYMLINK_HOW,
+        )
+    };
+    vec![
+        insecure_file,
+        extended_acl,
+        root_access_list,
+        unix_names,
+        peer_record_insecure,
+        peer_record_insecure_dir,
+        peer_record_private_dir,
+        peer_record_read_only,
+        peer_record_symlink,
+    ]
 }
+
+/// The claim about a peer record reachable by another account.
+const PEER_RECORD_INSECURE_CLAIM: &str = "a peer record whose mode lets group or other read it is refused as insecure, distinct from unreadable and from malformed, and never becomes trust";
+
+/// What a host that can produce [`PEER_RECORD_INSECURE_CLAIM`] does: the mode is
+/// unix's, so a unix host runs the case and the procedure only records it.
+const PEER_RECORD_INSECURE_HOW: &str = "In a scratch root, run the case `peer_record_refuses_other_readers` (`cargo test -p mahbot-peers-harness` on a unix host runs it): it writes one record, `chmod 644` on that record file in the scratch root, and opens the store again, which refuses with `is not private`. `chmod 600` on the same file in the same scratch root makes the same store open and the pairing readable.";
+
+/// The claim about the records directory itself being writable by another account.
+const PEER_RECORD_INSECURE_DIR_CLAIM: &str = "a peer-record directory whose mode lets group or other write it is refused as insecure, distinct from unreadable and from malformed, and never becomes trust";
+
+/// The claim about the directory this crate creates for its records.
+const PEER_RECORD_PRIVATE_DIR_CLAIM: &str = "the `peers/` directory the store creates is private before it is read — owner read, write and search and nothing else";
+
+/// What a host that can produce [`PEER_RECORD_PRIVATE_DIR_CLAIM`] does.
+const PEER_RECORD_PRIVATE_DIR_HOW: &str = "In a scratch root, run the case `peer_record_creates_a_private_directory` (`cargo test -p mahbot-peers-harness` on a unix host runs it): it opens the store on an empty root, which creates `peers/`, and reads the directory's mode — it is 0700.";
+
+/// The claim about opening a records directory its owner cannot write.
+const PEER_RECORD_READ_ONLY_CLAIM: &str = "opening the store writes nothing, so a records directory its owner can read and search but not write still opens and reads the records it holds";
+
+/// What a host that can produce [`PEER_RECORD_READ_ONLY_CLAIM`] does.
+const PEER_RECORD_READ_ONLY_HOW: &str = "In a scratch root, run the case `peer_record_opens_a_read_only_directory` (`cargo test -p mahbot-peers-harness` on a unix host runs it): it opens the store once to create `peers/`, writes a record, `chmod 500` on the directory and opens the store again, which succeeds and reads the same record.";
+
+/// The claim about the records directory being a symbolic link.
+const PEER_RECORD_SYMLINK_CLAIM: &str = "a `peers/` directory that is a symbolic link is refused as insecure, as a linked key file is, so records cannot be made to land outside the root";
+
+/// What a host that can produce [`PEER_RECORD_INSECURE_DIR_CLAIM`] does.
+const PEER_RECORD_INSECURE_DIR_HOW: &str = "In a scratch root, run the case `peer_record_refuses_other_writers` (`cargo test -p mahbot-peers-harness` on a unix host runs it): it writes one record, `chmod 777` on the `peers/` directory in the scratch root, and opens the store again, which refuses with `is not private`. `chmod 700` on the same directory makes the same store open and the pairing readable.";
+
+/// What a host that can produce [`PEER_RECORD_SYMLINK_CLAIM`] does.
+const PEER_RECORD_SYMLINK_HOW: &str = "In a scratch root, run the case `peer_record_refuses_a_symlinked_directory` (`cargo test -p mahbot-peers-harness` on a unix host runs it): it writes one record, renames `peers/` aside and puts a symbolic link in its place, then opens the store again, which refuses with `it is a symbolic link, which is never followed`. Replacing the link with the real directory makes the same store open and the pairing readable.";
 
 /// The claim about a unix file's mode, ownership and links, the same on every host:
 /// only whether this host can produce the file states differs. Foreign ownership is
@@ -552,7 +664,15 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.net.default_idle_timeout",
-        "the default transport carries the documented idle timeout, and a connection built on it stays open until that virtual instant and no longer",
+        "a transport carries the documented idle timeout, and a connection built on it with no keep-alive stays open until that virtual instant and no longer",
+    ),
+    Capability::witnessed(
+        "library.net.keep_alive",
+        "a transport with a keep-alive shorter than its idle timeout keeps a quiet connection open past the instant the timeout would otherwise close it",
+    ),
+    Capability::witnessed(
+        "library.net.quiet_pair_default",
+        "the default transport carries a keep-alive below its idle timeout, so a quiet pair stays connected past twice the timeout with nothing to carry, and a datagram crosses the connection that survived",
     ),
     Capability::witnessed(
         "library.tls.alpn",
@@ -562,11 +682,246 @@ const CAPABILITIES: &[Capability] = &[
         "library.beacon.payload_limit",
         "an introduction is built only through a checked constructor: exactly the documented size is accepted and one byte more is refused as `PayloadTooLarge`, by the client before it sends and by the server if it arrives anyway",
     ),
+    // The peer layer: the durable record, the ceremony and the manager.
+    Capability::witnessed(
+        "library.peer.record.root_required",
+        "opening the store refuses a missing storage root with a typed error naming it, and creates neither the root nor its parents: a mistyped or deleted root cannot pass for a machine that knows nobody",
+    ),
+    Capability::witnessed(
+        "library.peer.record.drops_expired_attempts",
+        "dropping expired attempts removes a record left holding nothing and keeps a pairing and a failure count, while an attempt that has not expired — including one another process restarted after the load, because the prune re-reads the file and checks the expiry again — survives the drop and an open of the store, and one record that cannot be read does not stop the sweep: the rest are still pruned and the refusal names the file",
+    ),
+    Capability::witnessed(
+        "library.peer.record.round_trip",
+        "a peer record is written beside the identity, read back by a second open of the same root with its key, pairing moment, address and failure count intact, an IPv4 address and both an IPv6 address and a link-local one with its scope and flow info survive, and the fingerprint is derived from the stored key rather than stored beside it",
+    ),
+    Capability::witnessed(
+        "library.peer.record.malformed",
+        "an empty file, a foreign magic, version zero and a body with no key are each refused as `Malformed`, distinct from an unreadable file and from an insecure one, none is read as a record, and the refusal names the file so a person can act on it",
+    ),
+    Capability::witnessed(
+        "library.peer.record.additive",
+        "a record of a higher version with a field this build does not know is read, keeps its pairing, and has the unknown field written back by a later write, so a format change never un-pairs a machine",
+    ),
+    Capability::witnessed(
+        "library.peer.record.never_unpairs",
+        "a later write of the address or a failure never removes the pairing or re-dates it, and the store keeps trusting the peer",
+    ),
+    Capability::witnessed(
+        "library.peer.record.survives_restart",
+        "a record written before a restart of the machine holding it is read after the restart, with the same identity, the same address and an unfinished attempt with the expiry it was given — the attempt still guards the peer and its expiry still ends it",
+    ),
+    Capability::witnessed(
+        "library.peer.record.self_update_reload",
+        "two stores over one root see each other's writes after a reload: a pairing written by one is seen by the other, and a write by the other re-reads the file first, so the pairing survives and the address it added is seen after a reload",
+    ),
+    Capability::witnessed(
+        "library.peer.record.oversized_write",
+        "a record a newer build left near the size cap is refused with `TooLarge` before an additive write would cross it; the file is left byte for byte as it was and still opens",
+    ),
+    Capability::witnessed(
+        "library.peer.record.empty_attempt",
+        "an attempt recorded on a peer this machine remembers nothing else about is removed when it ends, so a ceremony with a stranger leaves no file; a clear on that peer creates nothing and removes a record whose only facts were the failures and the attempt, and a record holding a pairing is kept",
+    ),
+    Capability::witnessed(
+        "library.peer.pairing.same_string",
+        "two machines pairing through the beacon compute the same six RFC 4648 base32 symbols from the whole transcript in the same attempt, each showing exactly one comparison, both record the pair, and the outcome carries the peer's beacon-observed address while the record stores no address until a connection authenticates one",
+    ),
+    Capability::witnessed(
+        "library.peer.pairing.both_confirm",
+        "a pair is recorded only when both people confirmed: one rejection leaves both sides unpaired, counts one failure on the side that saw it and none on the other, and the side that confirmed keeps no record at all",
+    ),
+    Capability::witnessed(
+        "library.peer.pairing.one_sided",
+        "a one-sided record does not wedge the pair: the side that holds it keeps it and compares again, both then hold it, and a third ceremony answers `AlreadyPaired` without showing a comparison",
+    ),
+    Capability::witnessed(
+        "library.peer.pairing.own_identity",
+        "a ceremony whose peer fingerprint is this machine's own is refused before anything is written",
+    ),
+    Capability::witnessed(
+        "library.peer.pairing.attempt_limit",
+        "three rejections close the pair on that machine, a fresh open of the same root still sees it closed, a ceremony is refused while it is closed, a connection attempt reports `NotTrusted` with the closure as its cause rather than a missing record, and a person's clear reopens it",
+    ),
+    Capability::witnessed(
+        "library.peer.pairing.flight_timeout",
+        "a peer that is registered and reachable but never answers a ceremony flight ends the attempt as a flight timeout, distinct from a beacon failure, with the attempt counted against nobody and cleared",
+    ),
+    Capability::witnessed(
+        "library.peer.pairing.attempt_expired",
+        "a comparison nobody answered ends the attempt as expired when its lifetime passes, distinct from a beacon failure, and the expired attempt is cleared",
+    ),
+    Capability::witnessed(
+        "library.peer.pairing.person_wait",
+        "a person who never answers the comparison expires the attempt at its lifetime instead of parking the ceremony, distinct from a beacon failure, and the expired attempt is cleared",
+    ),
+    Capability::witnessed(
+        "library.peer.pairing.attempt_expiry",
+        "an unfinished attempt is recorded with its expiry, refuses a second attempt while it is live, and stops blocking once its lifetime has passed without a person doing anything",
+    ),
+    Capability::witnessed(
+        "library.peer.pairing.failure_leaves_no_attempt",
+        "a ceremony that fails before its first flight — the beacon does not answer — leaves no attempt behind, so the retry a person makes when the beacon is back is not refused for the attempt's lifetime",
+    ),
+    Capability::witnessed(
+        "library.peer.pairing.string_not_carried",
+        "every ceremony flight is parsed by the side that receives it — the case fails if any does not — and the message schema has no field for the comparison, so none of the bytes the ceremony sends carries the string; that the beacon stores no part of the ceremony is the claim of `library.beacon.introduction_opaque`, which this case does not inspect",
+    ),
+    Capability::witnessed(
+        "library.peer.pairing.foreign_opening",
+        "an opening flight from a machine that is not the one this ceremony is with is dropped: a third machine cannot end a pairing or have an attempt booked against it, and the pair still completes with one comparison each",
+    ),
+    Capability::witnessed(
+        "library.peer.pairing.respond_waits",
+        "a machine waiting to be paired is not bound by the beacon's request timeout: an introduction that arrives a minute later still starts the ceremony, and the pair completes",
+    ),
+    Capability::witnessed(
+        "library.peer.pairing.bound_flights",
+        "a confirmation or an already-paired flight replayed from an earlier attempt is refused as `BindingMismatch`, and a machine that holds no record refuses an already-paired claim as `NotPaired`: the flights after the reveal are bound to this attempt's transcript or to its commitment, so a relay cannot make a machine record a pairing the other machine did not confirm",
+    ),
+    Capability::witnessed(
+        "library.peer.pairing.respond_ignores_strangers",
+        "a machine waiting to be paired drops a malformed payload and a well-formed non-opening flight from a stranger, keeps waiting, and still pairs with the real initiator, with one comparison each and no record for the stranger",
+    ),
+    Capability::witnessed(
+        "library.peer.pairing.mediator",
+        "a party with its own key between two machines produces a different string on each side, so two people who see the difference reject and the pair is recorded on neither side",
+    ),
+    Capability::witnessed(
+        "library.peer.pairing.simultaneous",
+        "when both machines start at once, the attempt of the smaller fingerprint wins, both people see one comparison each, the pair is recorded on both sides, and the dropped attempt counts against nobody",
+    ),
+    Capability::witnessed(
+        "library.peer.pairing.reordered_opening",
+        "the loser's opening flight delivered after the winner revealed changes nothing — it sends no flight, shows no comparison and records no outcome — and the ceremony still completes with the one comparison both people saw",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.direct",
+        "after pairing, two machines connect at the peer's own address — the beacon is asked once for the address because the pairing stored none, and the data path that follows touches no beacon — and carry a datagram machine to machine",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.hint_first",
+        "a fresh address carried in an introduction is dialed before the remembered one, and the stale remembered address is not touched when the hint works",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.remembered_first",
+        "a reconnect dials the remembered address first and does not consult the beacon when it works, and the accepting side records the address authenticated data arrived from",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.beacon_second",
+        "when the remembered address is stale the beacon is asked after it, in that order, the fresh address it answers is dialed, and the dialing side does not rewrite the address it dialed",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.stops",
+        "after the remembered address and the beacon both fail the manager stops, reports `PeerUnknown` with the remembered address's dial failure as its cause, and dials nothing more as time passes",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.four_failures",
+        "the four failures — beacon unreachable, peer unknown, no direct path, not trusted — are reported as themselves, each with its own words, and none as another",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.unwatchable_transport",
+        "a transport whose idle timeout is not longer than the keeper's settle window is refused when the manager is built, with a typed error naming the timeout, so a caller cannot turn every ordinary link failure into a strike by configuring the transport it hands over; a keep-alive that is not shorter than its idle timeout — one that could never fire — is refused the same way, naming both; one second above the window with a keep-alive just below the timeout builds a manager",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.one_per_pair",
+        "when both machines dial at once each keeps the connection started by the smaller fingerprint, both sides keep the same connection, each keeper is a direct path to the other machine's own address, and a datagram crosses it",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.asymmetric_liveness",
+        "a connection one side has closed and the other has not observed is not replaced by a connection the two sides would hold differently; once the stale one times out, the next dial reconnects the pair and a datagram crosses it",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.closed_not_trusted",
+        "a record that was paired and then closed by rejections is not trusted: the manager refuses it with the closure as its cause, the handshake refuses the peer, and a person's clear reopens it",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.same_starter",
+        "when both connections are started by the same machine, both sides keep the one whose TLS exporter is smaller — a value both endpoints derive identically — and a datagram crosses the keeper",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.tie_break_closes",
+        "the connection the tie-break does not keep is closed with the tie-break's reason and reports that close to its own side, while the kept connection carries a datagram: the pair is left with one connection, not two",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.tie_break_teaches_no_address",
+        "a dial whose connection loses the tie-break to the pair's existing connection records no address: the record keeps the last address authenticated data arrived from, never the address this machine dialled, even when the kept connection is this machine's own outbound one",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.closed_not_live",
+        "a connection that has closed is not reported by the manager's live or started-by query; its entry is replaced or dropped by the next adoption for that peer, so a peer never dialled again keeps a dead handle until the manager is dropped",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.keep_connected",
+        "the manager's keeper re-dials the pair when its connection is gone, with no caller dialling: it keeps the new connection, the old one is gone, and a datagram crosses the replacement",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.keeper_failed",
+        "a keeper whose attempt fails while the pair holds no connection stops at once with the failure itself — a peer the beacon does not know, after the remembered address timed out — and the words it reports say it stopped trying and repeat that failure, not that dials carried nothing",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.keeper_bound",
+        "a peer that accepts a fresh connection and closes it at once does not turn the keeper into a handshake loop: after the stated number of dials in a row that produced a connection which carried nothing and ended inside the settle window, it stops with an unstable pair naming what ended the last connection, and the words it reports say it stopped after dials carried nothing, distinct from the four failures",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.keeper_settle",
+        "the keeper's strikes are cleared by a connection the peer keeps past the settle window: two closes, a settled connection and two more closes leave the keeper running with a live connection, where a counter that never reset would have stopped it",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.keeper_supersession",
+        "two keepers that start together each dial before either can adopt the other's connection — the link is silenced and the trace shows one datagram from each side — the pair converges on the connection the smaller fingerprint started, and neither keeper stops on the collision",
+    ),
     Capability::unproducible(
-        "library.beacon.check_code",
-        "the short check code never passes through the beacon, and the beacon cannot force two machines to compare the same code",
-        "the code is derived by the pairing ceremony, which this workspace does not implement, so nothing here produces a code for a case to compare",
-        "implement the ceremony and add a case that derives the code from a transcript; what is already proven is what the beacon cannot do — the payload is relayed opaquely (`library.beacon.introduction_opaque`), an alteration is refused (`library.beacon.introduction_authenticated`), and the message set has no field for a code (`library.beacon.wire_closed`)",
+        "library.peer.connect.keeper_strike_cleared",
+        "a third strike booked while the accept lane adopts the connection the peer kept does not stop a connected pair: after booking the strike, and before it gives up, the keeper asks whether the pair is connected and clears the count",
+        "the rig cannot book the third strike before the adoption: its accept lane and the keeper share one simulated clock, and the keeper does not yield between booking a strike and asking again, so an adoption cannot be made to land in that gap",
+        "a case would need a hook that parks the keeper between the strike and the final liveness question, or a real network where an accept lands in that instant",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.transient_adoption",
+        "a dial that fails while the accept lane has connected to the same peer does not stop the keeper: it asks whether the pair is connected before it reports the dial failure, and the pair it took carries a datagram",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.keeper_link_failure",
+        "a connection the peer kept past the settle window is ordinary churn: when an idle timeout on both sides of a transport with no keep-alive ends it, the keeper re-dials after each of three such losses and is still running, and the pair carries a datagram afterwards",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.keeper_carried",
+        "a connection that carried a datagram and then died inside the settle window is a link failure, not a strike: a peer that sends one datagram and closes each connection more times than the unstable limit leaves the keeper running",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.keeper_after_restart",
+        "a pair made by a real ceremony and then broken by a restart of one machine reconnects with no caller dialling and no second ceremony: the restarted machine's own start is the trigger, its keeper dials the remembered address by itself, a datagram crosses the new connection, and the pairing is unchanged",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.remembered_cause",
+        "when the remembered address fails and no beacon is configured, the failure is `BeaconUnreachable` whose cause names the address and its dial failure and says no beacon is configured, not a claim that no address was remembered",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.reconnect_after_restart",
+        "two machines that ran a real ceremony reconnect after one restarts over its own root: the pairing survives, no new ceremony runs, and the beacon's answer supplies the fresh address",
+    ),
+    Capability::witnessed(
+        "library.peer.presence.refresh",
+        "a registration that is never refreshed is forgotten on the beacon's own lifetime while its session stays open, and a registration refreshed by `Presence` outlives that lifetime",
+    ),
+    Capability::unproducible(
+        "library.peer.connect.real_network",
+        "a direct path over a real network: two machines reach each other at their own addresses with no relay in the path",
+        "the suite opens no socket and starts no process, so no real path exists here; the simulated link proves the address and the topology, not the network",
+        "on two hosts with a reachable beacon: start the beacon, run one installation per host with its own storage root, pair them by the six-symbol comparison, then dial the peer and read `Connection::remote_address` — it is the peer's own address, the beacon's address never appears on the path, and `ss -u` on either host shows no relay",
+    ),
+    Capability::unproducible(
+        "library.peer.record.crash_mid_publish",
+        "a crash between writing a record beside its path and publishing it leaves the previous record in place, never a partial one",
+        "the suite starts no process, so it cannot kill one at the instant between the write and the rename; every publish is flushed before the rename, so what a crash can still lose is the directory entry, not the file's contents",
+        "in a scratch root, run a process that rewrites one peer record in a loop and kill it with SIGKILL at a random instant; reopen the store — the record is the previous one or the new one, never a partial file, and a leftover `.peer.` temporary file is ignored because it is not a `*.record`",
+    ),
+    Capability::unproducible(
+        "library.peer.record.windows_dacl",
+        "a peer record or the `peers/` directory reachable by an account other than the product's, SYSTEM and Administrators is refused loudly on Windows",
+        "no case builds the access-list state the Windows reader refuses: granting a second account read access needs an elevated prompt and a second account, and the suite spawns no process and holds one account; the rule is type-checked for both Windows targets and witnessed as data (`library.identity.access.dacl_rule`), and the first run on Windows is the operator's. The first open on an empty root is not a refusal: the store gives the `peers/` directory it creates the explicit three-account list, with inheritance switched off, before it reads it",
+        "in a scratch root on Windows, open the store once on an empty root — it creates `peers/`, and `icacls \"%peers%\"` shows the owner, SYSTEM and Administrators with no `(I)` entries — then run `icacls` to grant a second account read access to one `*.record` file and reopen the store: the refusal names the file and the account; repeat on the `peers/` directory itself, which the store checks on every open; `icacls \"%record%\" /inheritance:r /grant:r \"%USERNAME%\":F` restores it and the same store opens",
     ),
     // The harness: machines, the link, the clock, the beacon rig, the raw
     // client, the connect helper and the checks themselves.
@@ -597,6 +952,14 @@ const CAPABILITIES: &[Capability] = &[
     Capability::witnessed(
         "harness.machine.dead_root_refused",
         "a machine whose simulation is gone refuses to write or read instead of quietly recreating its root",
+    ),
+    Capability::witnessed(
+        "harness.pair.mediator",
+        "the rig's mediator is a party with its own key, its own address and its own registration at the beacon — checked by the interposition case — so the two transcripts it sits between genuinely differ",
+    ),
+    Capability::witnessed(
+        "harness.machine.restart",
+        "a machine restarts over its own root: the identity and the record survive, the address is new, and the transport has let go of the old socket before the new one is attached",
     ),
     Capability::witnessed(
         "harness.machine.no_path_on_handle",
@@ -712,7 +1075,7 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.identity.access.unix_rule",
-        "the unix rule refuses group and other bits before ownership, accepts owner-only modes including read-only, refuses another owner as ownership, and reports the more useful of the two facts when both hold; the mode refusal, the two shapes both readers refuse — a symbolic link and a non-regular file — and the storage root's unix clauses print the documented wording on every host",
+        "the unix rule refuses group and other bits before ownership, accepts owner-only modes including read-only, refuses another owner as ownership, and reports the more useful of the two facts when both hold; the mode refusal — with the directory's own repair, `chmod 700`, and a file's `chmod 600` — the two shapes both readers refuse (a symbolic link and a non-regular file) and the storage root's unix clauses print the documented wording on every host",
     ),
     Capability::witnessed(
         "library.identity.access.extended_rule",
@@ -832,6 +1195,10 @@ pub(crate) fn procedure_violations(capability: &'static str, how: &'static str) 
 /// Check the inventory against the witness table, then run every witness whose
 /// capability exists. Both directions are checked: an entry with no witness and
 /// a witness with no entry are each a violation.
+///
+/// A witness names every capability its case speaks for — the rig's mediator speaks
+/// for both the ceremony's interposition and the harness capability — and its case
+/// runs once; each entry gets the verdict.
 #[must_use]
 pub fn check(inventory: &[Capability], witnesses: &[Witness]) -> Report {
     let mut report = Report::new(
@@ -870,7 +1237,7 @@ pub fn check(inventory: &[Capability], witnesses: &[Witness]) -> Report {
         }
         let has_case = witnesses
             .iter()
-            .any(|witness| witness.capability == capability.id);
+            .any(|witness| witness.capabilities.contains(&capability.id));
         if capability.unproducible.is_none() && !has_case {
             report.violations.push(Violation::Unwitnessed {
                 capability: capability.id,
@@ -887,35 +1254,42 @@ pub fn check(inventory: &[Capability], witnesses: &[Witness]) -> Report {
                 .violations
                 .push(Violation::DuplicateWitness(witness.id));
         }
-        let Some(capability) = inventory
-            .iter()
-            .find(|capability| capability.id == witness.capability)
-        else {
-            report.violations.push(Violation::OrphanWitness {
-                witness: witness.id,
-                capability: witness.capability,
-            });
-            continue;
-        };
-        if capability.unproducible.is_some() {
-            report.violations.push(Violation::WitnessForUnproducible {
-                witness: witness.id,
-                capability: witness.capability,
-            });
+        let mut runs = Vec::new();
+        for capability in witness.capabilities {
+            let Some(entry) = inventory.iter().find(|entry| entry.id == *capability) else {
+                report.violations.push(Violation::OrphanWitness {
+                    witness: witness.id,
+                    capability,
+                });
+                continue;
+            };
+            if entry.unproducible.is_some() {
+                report.violations.push(Violation::WitnessForUnproducible {
+                    witness: witness.id,
+                    capability,
+                });
+                continue;
+            }
+            runs.push(*capability);
+        }
+        if runs.is_empty() {
             continue;
         }
-        match std::panic::catch_unwind(witness.case) {
-            Ok(Ok(())) => {}
-            Ok(Err(detail)) => report.violations.push(Violation::Failed {
-                witness: witness.id,
-                capability: witness.capability,
-                detail,
-            }),
-            Err(payload) => report.violations.push(Violation::Panicked {
-                witness: witness.id,
-                capability: witness.capability,
-                detail: crate::report::panic_message(payload.as_ref()),
-            }),
+        let outcome = std::panic::catch_unwind(witness.case);
+        for capability in runs {
+            match &outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(detail)) => report.violations.push(Violation::Failed {
+                    witness: witness.id,
+                    capability,
+                    detail: detail.clone(),
+                }),
+                Err(payload) => report.violations.push(Violation::Panicked {
+                    witness: witness.id,
+                    capability,
+                    detail: crate::report::panic_message(payload.as_ref()),
+                }),
+            }
         }
     }
 

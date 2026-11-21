@@ -51,6 +51,7 @@ pub(crate) fn idle_timeout_bounds() -> Result<(), String> {
         let socket = sim.link().attach_next();
         let transport = Transport {
             idle_timeout: Duration::MAX,
+            keep_alive: None,
         };
         match transport.endpoint(
             Arc::clone(&socket) as Arc<dyn AsyncUdpSocket>,
@@ -269,7 +270,11 @@ pub(crate) fn transport_timer_follows_clock() -> Result<(), String> {
 pub(crate) fn default_idle_timeout_applies() -> Result<(), String> {
     block_on(async {
         let sim = Sim::new().map_err(io_error)?;
+        // The bare timeout, without the default keep-alive: a quiet connection that
+        // is not held must close at the documented instant.
         let (client, server) = sim.trusting_pair().map_err(io_error)?;
+        let client = client.with_keep_alive(None);
+        let server = server.with_keep_alive(None);
         let pair = connect(&client, &server).await.map_err(|e| e.to_string())?;
         assert_idle_timeout(&sim, &pair, DEFAULT_IDLE_TIMEOUT).await
     })
@@ -571,6 +576,27 @@ pub(crate) fn retry_after_an_abandoned_attempt() -> Result<(), String> {
                 client.addr()
             ));
         }
+        Ok(())
+    })
+}
+
+/// A keep-alive holds a quiet connection past the idle timeout that would close it.
+pub(crate) fn keep_alive_holds_a_quiet_connection() -> Result<(), String> {
+    block_on(async {
+        let sim = Sim::new().map_err(io_error)?;
+        let idle = Duration::from_secs(5);
+        let ping = Duration::from_secs(1);
+        let (client, server) = sim.trusting_pair().map_err(io_error)?;
+        let client = client.with_idle_timeout(idle).with_keep_alive(Some(ping));
+        let server = server.with_idle_timeout(idle).with_keep_alive(Some(ping));
+        let pair = connect(&client, &server).await.map_err(|e| e.to_string())?;
+        sim.clock().advance(Duration::from_secs(20)).await;
+        tokio::task::yield_now().await;
+        if pair.client.close_reason().is_some() || pair.server.close_reason().is_some() {
+            return Err("a keep-alive did not hold a quiet connection".to_owned());
+        }
+        // The same connection without the keep-alive is what the idle-timeout cases
+        // close; this case only has to show the interval keeps it open.
         Ok(())
     })
 }

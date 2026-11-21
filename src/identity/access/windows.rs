@@ -30,6 +30,7 @@ use std::fs::File;
 use std::io;
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::ptr::{addr_of_mut, null, null_mut};
@@ -47,7 +48,7 @@ use windows_sys::Win32::Security::{
     SECURITY_MAX_SID_SIZE, TOKEN_QUERY, TOKEN_USER, TokenUser, WELL_KNOWN_SID_TYPE,
     WinBuiltinAdministratorsSid, WinLocalSystemSid,
 };
-use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+use windows_sys::Win32::Storage::FileSystem::{FILE_ALL_ACCESS, FILE_FLAG_BACKUP_SEMANTICS};
 use windows_sys::Win32::System::SystemServices::{
     ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE, SYSTEM_ALARM_ACE_TYPE, SYSTEM_AUDIT_ACE_TYPE,
 };
@@ -84,6 +85,29 @@ pub(super) fn open(path: &Path) -> io::Result<Opening> {
     Ok(Opening::File(File::open(path)?))
 }
 
+/// Check a directory that holds records: its access list and owner, read from a
+/// handle opened for a directory.
+///
+/// `FILE_FLAG_BACKUP_SEMANTICS` is what lets a directory be opened as a file at
+/// all. The link check is by path, for the same reason [`open`]'s is: a handle does
+/// not report that it was reached through a reparse point, and the directory the
+/// handle leads to is checked in its own right.
+pub(super) fn check_dir(dir: &Path) -> io::Result<Option<Insecurity>> {
+    let metadata = std::fs::symlink_metadata(dir)?;
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Ok(Some(Insecurity::Symlink));
+    }
+    if !file_type.is_dir() {
+        return Ok(Some(Insecurity::NotRegular));
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)?;
+    check(&file)
+}
+
 pub(super) fn check(file: &File) -> io::Result<Option<Insecurity>> {
     let mut owner: PSID = null_mut();
     let mut dacl: *mut ACL = null_mut();
@@ -117,9 +141,9 @@ pub(super) fn check(file: &File) -> io::Result<Option<Insecurity>> {
     answer.map(|dacl| super::dacl_refusal(&dacl))
 }
 
-/// Give a freshly created key file an explicit DACL naming only the owner,
-/// `SYSTEM` and `Administrators`, with inheritance switched off, and make this
-/// process's account its owner.
+/// Give a freshly created key file, or the `peers/` directory that holds records, an
+/// explicit DACL naming only the owner, `SYSTEM` and `Administrators`, with
+/// inheritance switched off, and make this process's account its owner.
 ///
 /// Three accounts and not one: a backup or an antivirus tool that could not read
 /// the key would make an operator loosen the check, so the list is the same one
@@ -130,10 +154,11 @@ pub(super) fn check(file: &File) -> io::Result<Option<Insecurity>> {
 /// objects to `Administrators` — so this sets the owner back to the account the
 /// process runs as, the only ownership [`super::dacl_refusal`] accepts.
 ///
-/// Both are applied by path, while the file is still empty, and the caller reads
-/// them back through the handle before writing a key byte: the handle the file was
-/// created with has no `WRITE_DAC`, and the read-back is the proof that what the
-/// key is about to be written into is this list and this owner.
+/// Both are applied by path: the handle `tempfile` creates for a new key has no
+/// `WRITE_DAC`, and a directory is hardened before it is opened at all. For a key the
+/// caller reads them back through the handle before writing a key byte, so no private
+/// half ever sits behind the wrong access; for the directory the read-back is
+/// `check_directory`, which refuses anything this call did not write.
 pub(super) fn make_private(path: &Path) -> io::Result<()> {
     let owner = me()?;
     let system = well_known(WinLocalSystemSid)?;

@@ -10,6 +10,7 @@ use std::path::{Component, Path, PathBuf};
 
 use mahbot_peers::identity::Identity;
 use mahbot_peers::identity::keyfile;
+use mahbot_peers::peer::{Limits, RecordStore};
 use tempfile::TempDir;
 
 use crate::machine::RootId;
@@ -43,6 +44,22 @@ impl Root {
     /// machine does. The copy is the same identity: that is what a clone is.
     pub(crate) fn copy_key_into(&self, target: &Self) -> io::Result<()> {
         copy_key(self.dir.path(), target.dir.path())
+    }
+
+    /// This root's peer records, opened over the real directory.
+    ///
+    /// The store's refusal is text because every case that reads one treats it as
+    /// the failure it is about: a record that cannot be read is never a record to
+    /// trust.
+    pub(crate) fn records(&self) -> Result<RecordStore, String> {
+        self.records_with(Limits::default())
+    }
+
+    /// This root's peer records under explicit limits, for a case that has to make
+    /// an attempt expire without spending the default lifetime.
+    pub(crate) fn records_with(&self, limits: Limits) -> Result<RecordStore, String> {
+        self.ensure_alive().map_err(|error| error.to_string())?;
+        RecordStore::open(self.dir.path(), limits).map_err(|error| error.to_string())
     }
 
     pub(crate) fn write(&self, name: &str, bytes: &[u8]) -> io::Result<()> {

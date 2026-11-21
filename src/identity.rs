@@ -27,6 +27,8 @@ use ring::signature::{self, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
 
+use crate::hex;
+
 /// Who may reach the key file, and the rules that decide it.
 pub mod access;
 /// The key file under a storage root: its name, its format, and its one create.
@@ -139,7 +141,7 @@ impl Fingerprint {
         let digits = text.as_bytes();
         let mut spki = [0u8; FINGERPRINT_LEN];
         for (index, byte) in spki.iter_mut().enumerate() {
-            *byte = (hex_digit(digits[index * 2])? << 4) | hex_digit(digits[index * 2 + 1])?;
+            *byte = (hex::digit(digits[index * 2])? << 4) | hex::digit(digits[index * 2 + 1])?;
         }
         Self::from_spki(&spki)
     }
@@ -168,7 +170,7 @@ impl fmt::Debug for Fingerprint {
 /// characters. Lossless — [`Fingerprint::from_hex`] gives the same bytes back.
 impl fmt::Display for Fingerprint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_hex(f, &self.0)
+        hex::write(f, &self.0)
     }
 }
 
@@ -262,21 +264,4 @@ impl fmt::Debug for Identity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Identity").field(&self.fingerprint).finish()
     }
-}
-
-/// One lowercase hex digit, and nothing else: an identity has one spelling, so the
-/// uppercase form of the same bytes is not it.
-fn hex_digit(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        _ => None,
-    }
-}
-
-fn write_hex(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
-    for byte in bytes {
-        write!(f, "{byte:02x}")?;
-    }
-    Ok(())
 }

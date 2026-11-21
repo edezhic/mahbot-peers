@@ -27,7 +27,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use quinn::{Connection, Endpoint, Runtime};
+use quinn::{Connection, Endpoint, RecvStream, Runtime};
 
 use crate::identity::{Fingerprint, Identity, PeerId};
 
@@ -70,6 +70,14 @@ impl Beacon {
         }
     }
 
+    /// The runtime that measures every bound, so a caller can wait on it — the
+    /// registration refresh does, and so does any other timer a caller needs to
+    /// line up with the beacon's.
+    #[must_use]
+    pub fn runtime(&self) -> &Arc<dyn Runtime> {
+        &self.runtime
+    }
+
     /// Open a session, pinning the beacon's key.
     ///
     /// # Errors
@@ -105,6 +113,12 @@ pub struct Session {
 }
 
 impl Session {
+    /// The runtime this session's timers run on, for a caller that has to bound a
+    /// wait of its own.
+    pub(crate) fn runtime(&self) -> &Arc<dyn Runtime> {
+        &self.runtime
+    }
+
     /// Close the session, telling the beacon why.
     pub fn close(&self, reason: &[u8]) {
         self.connection.close(0u32.into(), reason);
@@ -202,11 +216,40 @@ impl Session {
     /// [`BeaconError::Unavailable`] when the session is closed or the frame does
     /// not arrive, or the beacon's refusal.
     pub async fn next_introduction(&self) -> Result<Introduction, BeaconError> {
-        let mut recv = self
+        let recv = self
             .connection
             .accept_uni()
             .await
             .map_err(|_| BeaconError::Unavailable)?;
+        self.read_introduction(recv).await
+    }
+
+    /// The next introduction, waiting at most `after` for the beacon to speak.
+    ///
+    /// [`Self::next_introduction`] waits for the caller; this one puts a bound on
+    /// the wait for a stream as well, for a caller with its own deadline — a
+    /// ceremony whose flight must not wait forever. `Ok(None)` is the bound
+    /// passing with nothing to read: the beacon is fine and the peer was silent,
+    /// which is not the same failure as a closed session. Both bounds are measured
+    /// by the injected runtime.
+    ///
+    /// # Errors
+    ///
+    /// [`BeaconError::Unavailable`] when the session is closed, or the beacon's
+    /// refusal.
+    pub async fn next_introduction_within(
+        &self,
+        after: Duration,
+    ) -> Result<Option<Introduction>, BeaconError> {
+        match timeout(&*self.runtime, after, self.connection.accept_uni()).await {
+            Some(Ok(recv)) => self.read_introduction(recv).await.map(Some),
+            Some(Err(_)) => Err(BeaconError::Unavailable),
+            None => Ok(None),
+        }
+    }
+
+    /// Read and authenticate one pushed introduction from an accepted stream.
+    async fn read_introduction(&self, mut recv: RecvStream) -> Result<Introduction, BeaconError> {
         let frame = match timeout(
             &*self.runtime,
             BEACON_REQUEST_TIMEOUT,

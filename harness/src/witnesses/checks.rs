@@ -93,7 +93,7 @@ pub(crate) fn inventory_check_is_two_way() -> Result<(), String> {
     let claim = Capability::witnessed("test.claim", "a claim");
     let case = |case: fn() -> Result<(), String>| Witness {
         id: "test.case",
-        capability: "test.claim",
+        capabilities: &["test.claim"],
         case,
     };
 
@@ -115,7 +115,7 @@ pub(crate) fn inventory_check_is_two_way() -> Result<(), String> {
         )],
         &[Witness {
             id: "test.case",
-            capability: "test.impossible",
+            capabilities: &["test.impossible"],
             case: ok_case,
         }],
     );
@@ -137,7 +137,7 @@ pub(crate) fn inventory_check_is_two_way() -> Result<(), String> {
             &[],
             &[Witness {
                 id: "test.case",
-                capability: "test.gone",
+                capabilities: &["test.gone"],
                 case: ok_case,
             }],
         ),

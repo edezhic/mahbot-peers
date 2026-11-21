@@ -2,9 +2,9 @@
 //!
 //! The beacon never reads a clock of its own: the timer comes from the
 //! `quinn::Runtime` the endpoint runs on, so a test moves time and a real process
-//! waits on real time without the protocol knowing the difference. The one
-//! combinator is published as `beacon::timeout`; its documentation says why both
-//! halves share one copy instead of each holding its own.
+//! waits on real time without the protocol knowing the difference. Both the
+//! bounded wait and the plain sleep are here, so no other module builds a timer of
+//! its own — one copy, not two.
 
 use std::future::Future;
 use std::pin::pin;
@@ -16,9 +16,9 @@ use quinn::Runtime;
 /// Run `future`, giving up after `after` of the runtime's time. `None` means the
 /// deadline passed first.
 ///
-/// This is the beacon's own bound, not a general-purpose utility: the client's
-/// request bound and the server's exchange bound are both measured with it, so the
-/// two halves cannot drift apart in how they compute a deadline — one copy, not two.
+/// The crate's one runtime-bound timer: the beacon's client and server bounds and the
+/// peer layer's waits are all measured with it, so no module builds a timer of its
+/// own — one copy, not two.
 pub async fn timeout<F: Future>(
     runtime: &dyn Runtime,
     after: Duration,
@@ -33,4 +33,10 @@ pub async fn timeout<F: Future>(
         timer.as_mut().poll(context).map(|()| None)
     })
     .await
+}
+
+/// Wait `after` of the runtime's time.
+pub async fn sleep(runtime: &dyn Runtime, after: Duration) {
+    let mut timer = runtime.new_timer(runtime.now() + after);
+    std::future::poll_fn(|context| timer.as_mut().poll(context)).await;
 }

@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use mahbot_peers::identity::access::{
-    Account, Dacl, DaclEntry, Entry, Insecurity, acl_refusal, dacl_refusal, unix_refusal,
+    Account, Dacl, DaclEntry, Entry, Insecurity, Object, acl_refusal, dacl_refusal, unix_refusal,
 };
 use mahbot_peers::identity::keyfile::{self, KeyFileError, Malformed};
 use mahbot_peers::identity::{FINGERPRINT_LEN, Fingerprint, Identity};
@@ -120,11 +120,11 @@ pub(crate) fn key_file_is_one_identity_per_root() -> Result<(), String> {
         return Err("the file written for a new identity is not that identity's key".to_owned());
     }
     // The root is the caller's: a missing one is refused as a failed create, never
-    // created — the error kind is the one a missing path gives, which is what tells
-    // "there is no root" from "the key is unreadable".
+    // created — the refusal is the same shape the peer store gives, so a product
+    // matches one error, not two.
     let missing = first_root.path().join("no-such-root");
     match keyfile::load_or_create(&missing) {
-        Err(KeyFileError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {}
+        Err(KeyFileError::RootMissing { path }) if path == missing => {}
         other => return Err(format!("a missing storage root was answered {other:?}")),
     }
     if missing.exists() {
@@ -329,23 +329,38 @@ pub(crate) fn key_file_refuses_other_readers() -> Result<(), String> {
 /// The unix rule, decided on facts nothing else can supply: bits, and two accounts.
 ///
 /// Pinned here, because these are decided as data on every host: the mode message with
-/// its POSIX `chmod`, the two shapes both readers refuse (a symbolic link, and something
-/// that is not a regular file), and the two storage-root clauses unix owns. The
+/// its POSIX `chmod`, for a file and for a directory, the two shapes both readers
+/// refuse (a symbolic link, and something that is not a regular file), and the two
+/// storage-root clauses unix owns. The
 /// ownership wording needs the account directory, so it is pinned in
 /// `unix_account_names_are_exact`; the Windows clauses are pinned beside the Windows
 /// rule.
 pub(crate) fn unix_rule_is_exact() -> Result<(), String> {
     let me = 501;
-    if unix_refusal(0o600, me, me).is_some() || unix_refusal(0o400, me, me).is_some() {
+    if unix_refusal(0o600, me, me, Object::File).is_some()
+        || unix_refusal(0o400, me, me, Object::File).is_some()
+    {
         return Err("an owner-only mode was refused".to_owned());
     }
-    match unix_refusal(0o644, me, me) {
-        Some(Insecurity::Mode { mode: 0o644 }) => {}
+    match unix_refusal(0o644, me, me, Object::File) {
+        Some(Insecurity::Mode { mode: 0o644, .. }) => {}
         other => return Err(format!("mode 0644 was not refused as a mode: {other:?}")),
     }
-    match unix_refusal(0o600, me + 1, me) {
+    match unix_refusal(0o600, me + 1, me, Object::File) {
         Some(Insecurity::Owner { owner, me: found }) if owner == me + 1 && found == me => {}
         other => return Err(format!("another owner was not refused as one: {other:?}")),
+    }
+    // A directory must also keep the owner's read and search bits: 0400 passes the
+    // file rule and then cannot be listed at all.
+    match unix_refusal(0o400, me, me, Object::Directory) {
+        Some(Insecurity::Mode {
+            mode: 0o400,
+            directory: true,
+        }) => {}
+        other => return Err(format!("an unsearchable directory was answered {other:?}")),
+    }
+    if unix_refusal(0o700, me, me, Object::Directory).is_some() {
+        return Err("an owner-only directory was refused".to_owned());
     }
     // The messages are the ones the docs quote. The quoting follows the cause, not the
     // host: a unix mode is repaired by `chmod`, so it is a POSIX argument wherever the
@@ -353,9 +368,22 @@ pub(crate) fn unix_rule_is_exact() -> Result<(), String> {
     for (what, reason, expected) in [
         (
             "the mode refusal",
-            Insecurity::Mode { mode: 0o644 },
+            Insecurity::Mode {
+                mode: 0o644,
+                directory: false,
+            },
             "/key is not private: group or other permission bits are set (mode 0644); \
              chmod 600 '/key'",
+        ),
+        (
+            "the directory-mode refusal",
+            Insecurity::Mode {
+                mode: 0o755,
+                directory: true,
+            },
+            "/key is not private: its mode 0755 is not owner-only read, write and search: \
+             group or other bits are set, or the owner cannot read and search it; \
+             chmod 700 '/key'",
         ),
         (
             "the symbolic-link refusal",
@@ -380,11 +408,14 @@ pub(crate) fn unix_rule_is_exact() -> Result<(), String> {
         "the account the new file belongs to is what has to change",
     )?;
     root_clause(
-        Insecurity::Mode { mode: 0o755 },
+        Insecurity::Mode {
+            mode: 0o755,
+            directory: true,
+        },
         "the directory is what has to change",
     )?;
     // A mode that reaches past the owner is the more useful refusal of the two.
-    match unix_refusal(0o640, me + 1, me) {
+    match unix_refusal(0o640, me + 1, me, Object::File) {
         Some(Insecurity::Mode { .. }) => Ok(()),
         other => Err(format!(
             "a file that is both foreign and group-readable was reported as {other:?}"
@@ -898,8 +929,8 @@ pub(crate) fn no_key_rotation_is_proven() -> Result<(), String> {
     };
     for form in [
         "std::fs::remove_dir_all(&root)?",
-        "std::fs::rename(&a, &b)?",
         "std::fs::copy(&a, &b)?",
+        "std::fs::rename(&a, &key)?",
     ] {
         if (replacing.check)(&at("src/net.rs", form)).is_empty() {
             return Err(format!(

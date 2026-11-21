@@ -56,7 +56,8 @@
 //!
 //! | Refusal | Platform | What it says | What it appends |
 //! | --- | --- | --- | --- |
-//! | `Mode` | unix | group or other permission bits are set (mode 0644) | `chmod 600 '<path>'` |
+//! | `Mode`, file | unix | group or other permission bits are set (mode 0644) | `chmod 600 '<path>'` |
+//! | `Mode`, directory | unix | group or other bits are set, or the owner cannot read and search it (mode 0755) | `chmod 700 '<path>'` |
 //! | `Owner` | unix | it belongs to account `<owner>`, not to account `<me>`, each with the login name and number the platform reports | nothing; the hand-back is in the bullets below |
 //! | `ForeignOwner` | Windows | it belongs to `Administrators`, which may rewrite the list | `icacls "<path>" /setowner "%USERNAME%"` |
 //! | `Unowned` | Windows | it has no owner at all, so no account can be named as owning it | `icacls "<path>" /setowner "%USERNAME%"` |
@@ -119,7 +120,10 @@
 //! carries `%USERNAME%` for the account that runs the product.
 //!
 //! Refusing too much is the safe direction — a key file that only its owner can read
-//! is accepted, and so is one that is stricter still.
+//! is accepted, and so is one that is stricter still. A directory is stricter in a
+//! different direction: it must keep the owner's read and search bits, because
+//! without them its records cannot be listed at all, so a directory is judged by
+//! [`Object::Directory`](crate::identity::access::Object) rather than as a file.
 //!
 //! The rules — [`unix_refusal`](crate::identity::access::unix_refusal),
 //! [`acl_refusal`](crate::identity::access::acl_refusal),
@@ -154,6 +158,10 @@ pub enum Insecurity {
     Mode {
         /// The permission bits that were found, `0o777`-masked.
         mode: u32,
+        /// Whether the object is a directory. A directory's rule also requires the
+        /// owner's read and search bits, and its repair is `chmod 700` rather than
+        /// `chmod 600`, which would strip the search bit.
+        directory: bool,
     },
     /// The file belongs to another account. Unix's spelling, reported with both
     /// accounts: the owner and this process's, each as its login name and number
@@ -298,11 +306,19 @@ impl Insecurity {
     /// a new key file still gets `chmod -N`.
     pub(crate) fn write_fact(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Mode { mode } => {
-                write!(
-                    f,
-                    "group or other permission bits are set (mode {mode:04o})"
-                )
+            Self::Mode { mode, directory } => {
+                if *directory {
+                    write!(
+                        f,
+                        "its mode {mode:04o} is not owner-only read, write and search: \
+                         group or other bits are set, or the owner cannot read and search it"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "group or other permission bits are set (mode {mode:04o})"
+                    )
+                }
             }
             Self::Owner { owner, me } => {
                 write!(
@@ -334,6 +350,9 @@ impl Insecurity {
     /// runs as; on Windows the owner is a name, so `icacls /setowner` is the command.
     pub(crate) fn remedy(&self, path: &Path) -> Option<String> {
         match self {
+            Self::Mode {
+                directory: true, ..
+            } => Some(format!("chmod 700 {}", Shell::Posix.quote(path))),
             Self::Mode { .. } => Some(format!("chmod 600 {}", Shell::Posix.quote(path))),
             Self::ForeignOwner { .. } | Self::Unowned => Some(format!(
                 r#"icacls {} /setowner "%USERNAME%""#,
@@ -413,6 +432,25 @@ pub(crate) fn check(file: &File) -> std::io::Result<Option<Insecurity>> {
     }
 }
 
+/// Check a directory the crate owns — the peer-record directory — with the same
+/// owner-only rule as a key file.
+///
+/// On unix the mode, the owner and (on macOS) the extended list are read from a
+/// descriptor opened without following a link; on Windows the directory's access
+/// list and owner are read from a handle opened for a directory, with the same rule
+/// the key file gets, the Windows allowed set included. A directory another account
+/// can write is refused: it could delete a record, which is a silent un-pairing.
+pub(crate) fn check_directory(dir: &Path) -> std::io::Result<Option<Insecurity>> {
+    #[cfg(unix)]
+    {
+        unix::check_dir(dir)
+    }
+    #[cfg(windows)]
+    {
+        windows::check_dir(dir)
+    }
+}
+
 /// Give a freshly created key file the access its rule requires.
 ///
 /// Unix pins the mode on the descriptor; Windows writes its list and the file's owner
@@ -429,22 +467,58 @@ pub(crate) fn make_private(_file: &File, path: &Path) -> std::io::Result<()> {
     windows::make_private(path)
 }
 
-/// Whether unix mode bits and ownership keep the file to its owner.
+/// Give a directory this crate just created the access its rule requires.
 ///
-/// Owner read and write is the intended state; owner-only execute or a read-only
-/// file is stricter and accepted. Group and other bits are refused whatever they
-/// grant: a mode is a summary of many accounts, and the key is one machine's.
+/// Called before [`check_directory`], which would otherwise refuse what a fresh
+/// directory inherits: Windows creates it with the parent's list, and the rule
+/// accepts only an explicit one.
+#[cfg(unix)]
+pub(crate) fn make_directory_private(dir: &Path) -> std::io::Result<()> {
+    unix::make_directory_private(dir)
+}
+
+#[cfg(windows)]
+pub(crate) fn make_directory_private(dir: &Path) -> std::io::Result<()> {
+    windows::make_private(dir)
+}
+
+/// What the owner-only rule is judging.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Object {
+    /// A file: owner read and write, nothing for group or other.
+    File,
+    /// A directory: owner read, write and search, nothing for group or other. The
+    /// search bit is required as well as the read bit, because a directory without
+    /// it cannot be listed or traversed even by its owner.
+    Directory,
+}
+
+/// Whether unix mode bits and ownership keep the object to its owner.
 ///
-/// A file that belongs to another account is [`Insecurity::Owner`], which names both
-/// accounts when the platform printing the message can resolve them. This rule takes
-/// numbers because it is decided as data on every host; the login names are added by
-/// the message, where this host can read them.
+/// For a file, owner read and write is the intended state; owner-only execute or a
+/// read-only file is stricter and accepted. For a directory, the owner must also be
+/// able to read and search it, or the records inside cannot be listed at all. Group
+/// and other bits are refused whatever they grant: a mode is a summary of many
+/// accounts, and the key is one machine's.
+///
+/// An object that belongs to another account is [`Insecurity::Owner`], which names
+/// both accounts when the platform printing the message can resolve them. This rule
+/// takes numbers because it is decided as data on every host; the login names are
+/// added by the message, where this host can read them.
 #[must_use]
 // The mask is the rule: group and other bits, and nothing else.
 #[allow(clippy::verbose_bit_mask)]
-pub fn unix_refusal(mode: u32, owner: u32, me: u32) -> Option<Insecurity> {
-    if mode & 0o077 != 0 {
-        return Some(Insecurity::Mode { mode: mode & 0o777 });
+pub fn unix_refusal(mode: u32, owner: u32, me: u32, object: Object) -> Option<Insecurity> {
+    let unusable = match object {
+        Object::File => false,
+        // Owner read and search: without both, `read_dir` fails even for the owner.
+        Object::Directory => mode & 0o500 != 0o500,
+    };
+    if mode & 0o077 != 0 || unusable {
+        return Some(Insecurity::Mode {
+            mode: mode & 0o777,
+            directory: object == Object::Directory,
+        });
     }
     if owner != me {
         return Some(Insecurity::Owner { owner, me });

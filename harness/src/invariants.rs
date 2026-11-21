@@ -393,7 +393,7 @@ pub const INVARIANTS: &[Invariant] = &[
     },
     Invariant {
         id: "identity.key_is_never_replaced",
-        claim: "no shipped source removes a directory, renames or copies a path — any of those can take the key with the path it lives in — and no source of the identity module truncates, renames onto, deletes, copies onto or overwrites the key file: the one write path publishes a new file beside it, and a publish that would clobber an existing key is not on this list",
+        claim: "no shipped source removes a directory, copies a path or calls `fs::rename` — any can take the key with the path it lives in or clone the identity; the peer record's publish renames a temporary file of its own into place through `tempfile`, which moves no key and replaces no file but the record it just wrote; and no source of the identity module truncates, deletes, copies onto or overwrites the key file: the one write path publishes a new file beside it, and a publish that would clobber an existing key is not on this list",
         scope: SHIPPED_SCOPE,
         control: "std::fs::remove_dir_all(&root)?;",
         check: no_key_replacement,
@@ -603,33 +603,40 @@ fn handle_names_no_path(source: &Source) -> Vec<Finding> {
 
 /// The ways the key can be replaced, or taken away with the path that holds it.
 ///
-/// Removing a directory, renaming or copying a path judges every shipped source: any
-/// of those can take the key with the directory it lives in. The forms that write one
-/// file judge the module that owns the key, because writing a file anywhere else is
-/// ordinary work that does not reach this one.
+/// Removing a directory, copying a path and renaming a path judge every shipped
+/// source: the first destroys the key with the directory it lives in, the second
+/// clones the identity, and the third can move the storage root or publish over the
+/// key. The record publishes with `tempfile`'s persist, not `fs::rename`, so no
+/// shipped source needs a rename. The forms that write one file judge the identity
+/// module.
 fn no_key_replacement(source: &Source) -> Vec<Finding> {
-    let mut needles = vec!["remove_dir", "fs::rename", "fs::copy"];
+    // Removing a directory, copying a path or renaming a path can take the key with
+    // it, wherever it happens: these judge every shipped source.
+    let mut findings = forbidden(source, &["remove_dir", "fs::copy", "fs::rename"]);
     if !in_scope(IDENTITY_SCOPE, &source.path) {
-        return forbidden(source, &needles);
+        return findings;
     }
-    // Everything that could replace an existing key, or open it for writing:
-    // `create_new` is the one write the key file's module performs, and it lives in
-    // `tempfile`, which is not on this list because its temporary file is not the
-    // key. `persist(` is the overwriting publish beside the one this crate uses;
-    // `persist_noclobber(` does not contain it, so the safe call stays legal while
-    // the one that clobbers a racing creator's key does not.
-    needles.extend([
-        "remove_file",
-        "fs::write",
-        "File::create",
-        "persist(",
-        "truncate",
-        "set_len",
-        ".append(",
-        "create(true)",
-        ".write(true)",
-    ]);
-    forbidden(source, &needles)
+    // Writing one file judges the module that owns the key. `create_new` is the one
+    // write it performs, and it lives in `tempfile`, which is not on this list
+    // because its temporary file is not the key. `persist(` is the overwriting
+    // publish beside the one this crate uses; `persist_noclobber(` does not contain
+    // it, so the safe call stays legal while the one that clobbers a racing
+    // creator's key does not.
+    findings.extend(forbidden(
+        source,
+        &[
+            "remove_file",
+            "fs::write",
+            "File::create",
+            "persist(",
+            "truncate",
+            "set_len",
+            ".append(",
+            "create(true)",
+            ".write(true)",
+        ],
+    ));
+    findings
 }
 
 fn key_file_name_is_one_place(source: &Source) -> Vec<Finding> {

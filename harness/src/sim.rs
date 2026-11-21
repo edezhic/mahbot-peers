@@ -83,9 +83,14 @@ impl Sim {
     }
 
     fn machine_on(&self, root: Root) -> io::Result<Machine> {
+        let identity = root.load_identity()?;
+        let records = root
+            .records()
+            .map_err(|error| io::Error::other(error.to_owned()))?;
         Ok(Machine::new(
-            root.load_identity()?,
+            identity,
             root,
+            records,
             self.link.attach_next(),
             self.link.clone(),
             self.clock.clone(),
