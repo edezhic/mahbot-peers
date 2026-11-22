@@ -218,6 +218,33 @@ impl Machine {
         ))
     }
 
+    /// This machine's message layer, over its own root.
+    ///
+    /// The records and the log are this machine's, so the queues, the decision about a
+    /// peer and the record of it come from one root. The floor, the clock the layer
+    /// reads moments from and the sink a delivery goes to are the case's; the runtime
+    /// is this machine's own, because the layer's waits and its receiving tasks belong
+    /// to the runtime the endpoint runs on.
+    ///
+    /// # Errors
+    ///
+    /// The layer's refusal, as text: a gone root, an unreadable or insecure queue.
+    pub fn messages(
+        &self,
+        floor: Arc<dyn mahbot_peers::peer::Floor + Send + Sync>,
+        moment: Arc<dyn mahbot_peers::peer::Moment + Send + Sync>,
+        deliveries: Arc<dyn mahbot_peers::peer::Deliveries + Send + Sync>,
+    ) -> Result<mahbot_peers::peer::Messages, String> {
+        self.root.messages(
+            self.records.clone(),
+            self.audit()?,
+            floor,
+            moment,
+            deliveries,
+            self.clock.runtime(),
+        )
+    }
+
     /// Remember `peer` as a machine this one may talk to.
     pub fn trust(&self, peer: &Machine) {
         self.trust.insert(peer.fingerprint());
@@ -528,6 +555,117 @@ impl Storage<'_> {
     /// The filesystem's refusal.
     pub fn record_name(&self, peer: &PeerId) -> io::Result<String> {
         self.root.record_name(peer)
+    }
+
+    /// The name `peer`'s message queue has under this root, as the message module spells
+    /// it: a name, not a path, so a case can compare it with what a refusal says.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's refusal.
+    pub fn message_name(&self, peer: &PeerId) -> io::Result<String> {
+        self.root.message_name(peer)
+    }
+
+    /// `peer`'s message queue, read through this root's handle.
+    ///
+    /// A case that asserts on a queue's bytes reads them here, the way it reads a
+    /// record, rather than through a path.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's refusal.
+    pub fn read_message(&self, peer: &PeerId) -> io::Result<Vec<u8>> {
+        self.root.read_message(peer)
+    }
+
+    /// `peer`'s message queue, replaced through this root's handle.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's refusal.
+    pub fn write_message(&self, peer: &PeerId, bytes: &[u8]) -> io::Result<()> {
+        self.root.write_message(peer, bytes)
+    }
+
+    /// The name of the file a writer locks for `peer`'s queue, as the message module spells
+    /// it: a name, not a path, so a case can compare it with what a refusal says.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's refusal.
+    pub fn message_lock_name(&self, peer: &PeerId) -> io::Result<String> {
+        self.root.message_lock_name(peer)
+    }
+
+    /// The whole `messages/` directory, removed as a cleaner or a botched restore removes it.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's refusal.
+    pub fn remove_message_dir(&self) -> io::Result<()> {
+        self.root.remove_message_dir()
+    }
+
+    /// `peer`'s message queue, removed as a lost or restored-over queue file is.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's refusal.
+    pub fn remove_message(&self, peer: &PeerId) -> io::Result<()> {
+        self.root.remove_message(peer)
+    }
+
+    /// Hold `peer`'s queue lock, as a second process on the same root does for the span of
+    /// one read-modify-publish.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's refusal.
+    pub fn lock_message(&self, peer: &PeerId) -> io::Result<std::fs::File> {
+        self.root.lock_message(peer)
+    }
+
+    /// Give `peer`'s queue file a mode, as an installation whose root was never
+    /// hardened leaves it reachable by another account.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's refusal.
+    #[cfg(unix)]
+    pub fn set_message_mode(&self, peer: &PeerId, mode: u32) -> io::Result<()> {
+        self.root.set_message_file_mode(peer, mode)
+    }
+
+    /// The mode of the messages directory.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's refusal.
+    #[cfg(unix)]
+    pub fn message_dir_mode(&self) -> io::Result<u32> {
+        self.root.message_dir_mode()
+    }
+
+    /// Give the messages directory a mode, as a root that was never hardened leaves it.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's refusal.
+    #[cfg(unix)]
+    pub fn set_message_dir_mode(&self, mode: u32) -> io::Result<()> {
+        self.root.set_message_dir_mode(mode)
+    }
+
+    /// Turn the messages directory into a symbolic link to a directory beside it, as a
+    /// backup tool that moved it leaves it.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's refusal.
+    #[cfg(unix)]
+    pub fn replace_message_dir_with_a_link(&self) -> io::Result<()> {
+        self.root.replace_message_dir_with_a_link()
     }
 }
 

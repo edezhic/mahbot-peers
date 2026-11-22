@@ -17,6 +17,7 @@ pub mod invariants;
 pub mod inventory;
 pub mod link;
 pub mod machine;
+pub mod messages;
 pub mod pair;
 pub mod raw;
 pub mod report;

@@ -30,6 +30,7 @@ mod connection;
 mod identity;
 mod link;
 mod machines;
+mod messages;
 mod peer;
 mod rights;
 mod server;
@@ -102,6 +103,16 @@ pub const UNIX_WITNESSES: &[Witness] = &[
         id: "an_unreadable_record_is_not_an_unpaired_machine",
         capabilities: &["library.peer.connect.unreadable_record"],
         case: connection::an_unreadable_record_is_not_an_unpaired_machine,
+    },
+    Witness {
+        id: "a_message_file_is_private_to_the_account",
+        capabilities: &["library.peer.messages.private"],
+        case: messages::a_message_file_is_private_to_the_account,
+    },
+    Witness {
+        id: "a_service_that_cannot_read_or_write_ends",
+        capabilities: &["library.peer.messages.service_reports_a_broken_queue"],
+        case: messages::a_service_that_cannot_read_or_write_ends,
     },
 ];
 
@@ -987,6 +998,210 @@ const WITNESSES: &[Witness] = &[
         id: "machine_restarts_over_the_same_root",
         capabilities: &["harness.machine.restart"],
         case: connection::machine_restarts_over_the_same_root,
+    },
+    Witness {
+        id: "a_message_is_queued_and_stored_as_written",
+        capabilities: &[
+            "library.peer.messages.compose",
+            "library.peer.messages.body_stored_as_written",
+        ],
+        case: messages::a_message_is_queued_and_stored_as_written,
+    },
+    Witness {
+        id: "a_full_queue_is_refused",
+        capabilities: &["library.peer.messages.queue_bounded"],
+        case: messages::a_full_queue_is_refused,
+    },
+    Witness {
+        id: "a_queue_that_cannot_grow_is_refused",
+        capabilities: &["library.peer.messages.too_large"],
+        case: messages::a_queue_that_cannot_grow_is_refused,
+    },
+    Witness {
+        id: "a_body_longer_than_the_cap_is_refused",
+        capabilities: &["library.peer.messages.body_bounded"],
+        case: messages::a_body_longer_than_the_cap_is_refused,
+    },
+    Witness {
+        id: "the_composed_moment_is_only_a_remark",
+        capabilities: &["library.peer.messages.composed_moment"],
+        case: messages::the_composed_moment_is_only_a_remark,
+    },
+    Witness {
+        id: "a_message_for_a_closed_pair_is_refused",
+        capabilities: &["library.peer.messages.closed_pair"],
+        case: messages::a_message_for_a_closed_pair_is_refused,
+    },
+    Witness {
+        id: "the_queue_survives_the_senders_restart",
+        capabilities: &["library.peer.messages.queue_survives_restart"],
+        case: messages::the_queue_survives_the_senders_restart,
+    },
+    Witness {
+        id: "an_untaken_message_is_dropped_after_retention_and_recorded",
+        capabilities: &["library.peer.messages.retention"],
+        case: messages::an_untaken_message_is_dropped_after_retention_and_recorded,
+    },
+    Witness {
+        id: "a_withdrawn_trust_drops_the_queue_and_records_it",
+        capabilities: &["library.peer.messages.trust_withdrawn"],
+        case: messages::a_withdrawn_trust_drops_the_queue_and_records_it,
+    },
+    Witness {
+        id: "the_same_envelope_reaches_the_caller_once",
+        capabilities: &["library.peer.messages.taken_once"],
+        case: messages::the_same_envelope_reaches_the_caller_once,
+    },
+    Witness {
+        id: "the_receivers_memory_survives_its_restart",
+        capabilities: &["library.peer.messages.dedup_survives_restart"],
+        case: messages::the_receivers_memory_survives_its_restart,
+    },
+    Witness {
+        id: "a_taken_identifier_is_forgotten_after_a_week",
+        capabilities: &["library.peer.messages.taken_retention"],
+        case: messages::a_taken_identifier_is_forgotten_after_a_week,
+    },
+    Witness {
+        id: "a_declined_delivery_is_offered_again",
+        capabilities: &["library.peer.messages.delivery_declined"],
+        case: messages::a_declined_delivery_is_offered_again,
+    },
+    Witness {
+        id: "a_rewound_count_is_declared_and_the_message_is_delivered",
+        capabilities: &["library.peer.messages.rewind"],
+        case: messages::a_rewound_count_is_declared_and_the_message_is_delivered,
+    },
+    Witness {
+        id: "the_queue_waits_for_the_binding_and_a_message_composed_while_away_arrives",
+        capabilities: &[
+            "library.peer.messages.waiting_for_binding",
+            "library.peer.messages.offered_when_connected",
+        ],
+        case: messages::the_queue_waits_for_the_binding_and_a_message_composed_while_away_arrives,
+    },
+    Witness {
+        id: "order_is_kept_within_a_pair_and_two_peers_do_not_share_it",
+        capabilities: &["library.peer.messages.order"],
+        case: messages::order_is_kept_within_a_pair_and_two_peers_do_not_share_it,
+    },
+    Witness {
+        id: "a_dropped_message_is_declared_as_a_gap",
+        capabilities: &["library.peer.messages.gap"],
+        case: messages::a_dropped_message_is_declared_as_a_gap,
+    },
+    Witness {
+        id: "a_body_claiming_another_author_is_handed_over_with_the_transport_sender",
+        capabilities: &["library.peer.messages.authorship"],
+        case: messages::a_body_claiming_another_author_is_handed_over_with_the_transport_sender,
+    },
+    Witness {
+        id: "a_queue_that_cannot_be_read_ends_the_service",
+        capabilities: &["library.peer.messages.service_reports_a_broken_queue"],
+        case: messages::a_queue_that_cannot_be_read_ends_the_service,
+    },
+    Witness {
+        id: "a_replaced_connection_still_carries_messages",
+        capabilities: &["library.peer.messages.reconnect"],
+        case: messages::a_replaced_connection_still_carries_messages,
+    },
+    Witness {
+        id: "no_write_right_means_no_offer_and_service_resumes",
+        capabilities: &["library.peer.messages.right"],
+        case: messages::no_write_right_means_no_offer_and_service_resumes,
+    },
+    Witness {
+        id: "the_hosts_floor_refuses_a_message_and_its_words_stay_local",
+        capabilities: &["library.peer.messages.floor"],
+        case: messages::the_hosts_floor_refuses_a_message_and_its_words_stay_local,
+    },
+    Witness {
+        id: "a_refusal_is_final_and_the_queue_moves_on",
+        capabilities: &["library.peer.messages.refusal_is_final"],
+        case: messages::a_refusal_is_final_and_the_queue_moves_on,
+    },
+    Witness {
+        id: "a_peer_cannot_fill_the_log_with_refusals",
+        capabilities: &["library.peer.messages.peer_cannot_fill_the_log"],
+        case: messages::a_peer_cannot_fill_the_log_with_refusals,
+    },
+    Witness {
+        id: "a_flood_is_throttled_and_the_sender_is_told",
+        capabilities: &["library.peer.messages.throttle"],
+        case: messages::a_flood_is_throttled_and_the_sender_is_told,
+    },
+    Witness {
+        id: "the_beacon_never_carries_a_message",
+        capabilities: &["library.peer.messages.not_on_the_beacon"],
+        case: messages::the_beacon_never_carries_a_message,
+    },
+    Witness {
+        id: "offering_a_message_is_not_the_pairs_traffic",
+        capabilities: &["library.peer.messages.offering_is_not_traffic"],
+        case: messages::offering_a_message_is_not_the_pairs_traffic,
+    },
+    Witness {
+        id: "a_taken_message_is_the_pairs_traffic",
+        capabilities: &["library.peer.messages.offering_is_not_traffic"],
+        case: messages::a_taken_message_is_the_pairs_traffic,
+    },
+    Witness {
+        id: "a_queue_another_writer_holds_is_busy",
+        capabilities: &["library.peer.messages.busy"],
+        case: messages::a_queue_another_writer_holds_is_busy,
+    },
+    Witness {
+        id: "the_service_sweeps_its_own_queue",
+        capabilities: &["library.peer.messages.service_sweeps"],
+        case: messages::the_service_sweeps_its_own_queue,
+    },
+    Witness {
+        id: "a_receivers_fault_ends_the_service",
+        capabilities: &["library.peer.messages.service_reports_a_broken_queue"],
+        case: messages::a_receivers_fault_ends_the_service,
+    },
+    Witness {
+        id: "an_unreadable_frame_is_answered",
+        capabilities: &["library.peer.messages.unreadable_answered"],
+        case: messages::an_unreadable_frame_is_answered,
+    },
+    Witness {
+        id: "a_held_queue_does_not_stop_the_service",
+        capabilities: &["library.peer.messages.held_queue"],
+        case: messages::a_held_queue_does_not_stop_the_service,
+    },
+    Witness {
+        id: "a_panicking_delivery_ends_the_service",
+        capabilities: &["library.peer.messages.delivery_panic"],
+        case: messages::a_panicking_delivery_ends_the_service,
+    },
+    Witness {
+        id: "an_unanswered_offer_costs_one_round",
+        capabilities: &["library.peer.messages.unanswered_offer"],
+        case: messages::an_unanswered_offer_costs_one_round,
+    },
+    Witness {
+        id: "a_peer_that_will_not_take_the_answer_does_not_park_the_pair",
+        capabilities: &["library.peer.messages.answer_write_bounded"],
+        case: messages::a_peer_that_will_not_take_the_answer_does_not_park_the_pair,
+    },
+    Witness {
+        id: "a_message_the_receiver_took_is_never_recorded_as_a_drop",
+        capabilities: &["library.peer.messages.taken_is_not_a_drop"],
+        case: messages::a_message_the_receiver_took_is_never_recorded_as_a_drop,
+    },
+    Witness {
+        id: "a_body_cannot_reach_a_capability",
+        capabilities: &["library.peer.messages.body_cannot_reach_a_capability"],
+        case: messages::a_body_cannot_reach_a_capability,
+    },
+    Witness {
+        id: "a_message_file_is_additive_and_refuses_garbage",
+        capabilities: &[
+            "library.peer.messages.format",
+            "library.peer.messages.malformed",
+        ],
+        case: messages::a_message_file_is_additive_and_refuses_garbage,
     },
 ];
 

@@ -137,7 +137,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::hex;
-use crate::identity::access::{self, Insecurity};
+use crate::identity::access::Insecurity;
 use crate::identity::{Fingerprint, PEER_ID_LEN, PeerId};
 use crate::peer::access::{Binding, Capability, Claim, Fact, Label, Pair, Right, Standing};
 use crate::peer::address;
@@ -520,7 +520,16 @@ impl RecordStore {
             });
         }
         let dir = root.join(PEERS_DIR);
-        create_private_dir(&dir)?;
+        private::create_private_dir(&dir).map_err(|error| match error {
+            private::PrivateFileError::Io(source) => RecordError::Io {
+                path: dir.clone(),
+                source,
+            },
+            private::PrivateFileError::Insecure(reason) => RecordError::Insecure {
+                path: dir.clone(),
+                reason,
+            },
+        })?;
         let records = load(&dir)?;
         Ok(Self {
             inner: Arc::new(Inner {
@@ -1292,50 +1301,6 @@ impl fmt::Display for Malformed {
             }
         }
     }
-}
-
-/// Create `dir` if it is missing, and hold it to the key file's rule.
-///
-/// A directory another account can write lets it delete a record, which is a silent
-/// un-pairing, so an existing directory is checked as well as a new one. The check
-/// is the same on both platforms: unix reads the mode, the owner and (on macOS) the
-/// extended list from a descriptor opened without following a link; Windows reads
-/// the directory's access list and owner from a handle opened for the directory.
-///
-/// A directory this crate creates is hardened before it is checked: a fresh
-/// directory inherits its parent's access list on Windows and the umask's mode on
-/// unix, and the rule would refuse what it inherited.
-fn create_private_dir(dir: &Path) -> Result<(), RecordError> {
-    if !dir.is_dir() {
-        match fs::create_dir(dir) {
-            Ok(()) => {
-                access::make_directory_private(dir).map_err(|source| RecordError::Io {
-                    path: dir.to_owned(),
-                    source,
-                })?;
-            }
-            // Something is at the path and is not a directory — a regular file, or a
-            // link to one. The check below refuses a link as a link; a regular file
-            // fails its `O_DIRECTORY` open and surfaces as `Io`.
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(source) => {
-                return Err(RecordError::Io {
-                    path: dir.to_owned(),
-                    source,
-                });
-            }
-        }
-    }
-    if let Some(reason) = access::check_directory(dir).map_err(|source| RecordError::Io {
-        path: dir.to_owned(),
-        source,
-    })? {
-        return Err(RecordError::Insecure {
-            path: dir.to_owned(),
-            reason,
-        });
-    }
-    Ok(())
 }
 
 /// Read every record in `dir`.

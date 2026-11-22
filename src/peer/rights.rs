@@ -184,6 +184,42 @@ impl Decision {
     }
 }
 
+/// Whether this machine may speak to a peer now, and as which pair.
+///
+/// The sender's side of the decision: `Rights::writing` answers it from the record alone.
+/// It is not [`Decision`], because the floor is not applied here — the floor is what this
+/// machine allows others to do, not what it may do — and because the answer names the pair
+/// a message would travel under. The message layer's own question; a product asks
+/// [`crate::peer::messages::Messages::state`] instead, which is this answer for a queue.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Writing {
+    /// The pair may be written to, and this is the pair.
+    Allowed(Pair),
+    /// Neither a binding this machine decided nor a claim has arrived: there is no
+    /// pair to name.
+    Unbound,
+    /// The machine is not trusted: no pairing, a closed pair, or a withdrawn trust.
+    Untrusted,
+    /// The record is trusted, but the pair's "write to me" is not live here.
+    Refused(Refusal),
+}
+
+/// Whether this machine may take a peer's message now, and as which pair.
+///
+/// The receiver's side of the decision: `Rights::may_take_message` answers it with the same
+/// fixed order and the same record as [`Rights::decide`], and the message layer turns it
+/// into one wire answer. The message layer's own question, like [`Writing`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Taking {
+    /// The message may be taken, as this pair.
+    Allowed(Pair),
+    /// Neither a binding this machine decided nor a claim has arrived: there is no pair to
+    /// name yet, so the sender is told nothing and offers again.
+    Unbound,
+    /// The decision refused this message.
+    Refused(Refusal),
+}
+
 /// This machine's standing say over what it will allow at all.
 ///
 /// The crate never decides what the floor says: the product supplies it. It can only
@@ -279,6 +315,11 @@ impl Rights {
         self.acts.lock().expect("the act lock is not poisoned")
     }
 
+    /// The record this decision reads.
+    pub(crate) const fn records(&self) -> &RecordStore {
+        &self.records
+    }
+
     /// Decide the one question, in the plan's order.
     ///
     /// The record is re-read first, so the answer never comes from a stale view. A
@@ -350,6 +391,91 @@ impl Rights {
             return self.refuse(question, Refusal::Floor { reason }, now);
         }
         Ok(Decision::Allowed { right })
+    }
+
+    /// Whether this machine may speak to `peer` now, and as which pair.
+    ///
+    /// The sender's question, answered from one fresh read of the record. The record
+    /// must be trusted; when this machine decided the binding, the pair is the
+    /// binding's and its "write to me" must be live; when it did not, the claim names
+    /// the pair and the receiver decides, so the claim alone allows. `Unbound` when
+    /// neither a binding nor a claim has arrived.
+    ///
+    /// The floor is not applied: the floor is what this machine allows others to do,
+    /// and a message this machine offers is its own act. Nothing is written and nothing
+    /// is recorded — the answer changes no state, and the entry that matters is the
+    /// receiver's.
+    ///
+    /// # Errors
+    ///
+    /// The record's own refusal.
+    pub(crate) fn writing(&self, peer: &PeerId, now: Timestamp) -> Result<Writing, RightsError> {
+        let Some(record) = self.records.reread(peer)? else {
+            return Ok(Writing::Untrusted);
+        };
+        if !record.trusted(&self.records.limits()) {
+            return Ok(Writing::Untrusted);
+        }
+        if let Some(binding) = record.binding() {
+            let pair = Pair::of_binding(*peer, binding);
+            let Some(right) = record.right(&pair, Capability::WRITE) else {
+                return Ok(Writing::Refused(Refusal::NoRight));
+            };
+            return Ok(match right.standing(now) {
+                Standing::Live => Writing::Allowed(pair),
+                Standing::Withdrawn(at) => Writing::Refused(Refusal::Withdrawn { at }),
+                Standing::Ended(at) => Writing::Refused(Refusal::Ended { at }),
+            });
+        }
+        if let Some(claim) = record.claim() {
+            return Ok(Writing::Allowed(Pair::of_claim(&claim)));
+        }
+        Ok(Writing::Unbound)
+    }
+
+    /// The receiver's question: may a message from `peer` be taken now?
+    ///
+    /// The same fixed order and the same record of what happened as [`Self::decide`]:
+    /// the question is the pair's assistant asking to "write to me", with the host's
+    /// floor. The pair is the binding's when this machine decided one, the claim's
+    /// otherwise; with neither there is no pair to name, so the answer is
+    /// [`Taking::Unbound`] — nothing decided, nothing recorded — and the sender offers
+    /// again rather than losing its message to a state that is about to change. A peer
+    /// with no record at all is [`Refusal::Untrusted`], the authenticate step's answer.
+    ///
+    /// # Errors
+    ///
+    /// The record's and the log's own refusals.
+    pub(crate) fn may_take_message(
+        &self,
+        peer: &PeerId,
+        floor: &dyn Floor,
+        now: Timestamp,
+    ) -> Result<Taking, RightsError> {
+        let Some(record) = self.records.reread(peer)? else {
+            // No record is no acquaintance: the handshake would already have refused
+            // this peer, so the answer is the one the authenticate step gives.
+            return Ok(Taking::Refused(Refusal::Untrusted));
+        };
+        let pair = record
+            .binding()
+            .map(|binding| Pair::of_binding(*peer, binding))
+            .or_else(|| record.claim().map(|claim| Pair::of_claim(&claim)));
+        let Some(pair) = pair else {
+            return Ok(Taking::Unbound);
+        };
+        match self.decide(
+            &Question {
+                speaker: Speaker::Authenticated(*peer),
+                pair: pair.clone(),
+                capability: Capability::WRITE,
+            },
+            floor,
+            now,
+        )? {
+            Decision::Allowed { .. } => Ok(Taking::Allowed(pair)),
+            Decision::Refused { refusal } => Ok(Taking::Refused(refusal)),
+        }
     }
 
     /// Write the refusal down and answer it.

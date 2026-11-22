@@ -426,6 +426,17 @@ fn platform_capabilities() -> Vec<Capability> {
             UNREADABLE_RECORD_HOW,
         )
     };
+    let messages_private = if cfg!(unix) {
+        Capability::witnessed("library.peer.messages.private", MESSAGES_PRIVATE_CLAIM)
+            .with_procedure(MESSAGES_PRIVATE_HOW)
+    } else {
+        Capability::unproducible(
+            "library.peer.messages.private",
+            MESSAGES_PRIVATE_CLAIM,
+            "the case sets a unix mode on the messages directory and on one queue file: this host has no mode bits, and the access-list state it would need instead is the one `library.peer.record.windows_dacl` records, which no case builds here",
+            MESSAGES_PRIVATE_HOW,
+        )
+    };
     vec![
         insecure_file,
         extended_acl,
@@ -440,6 +451,7 @@ fn platform_capabilities() -> Vec<Capability> {
         peer_record_private_dir,
         peer_record_read_only,
         peer_record_symlink,
+        messages_private,
     ]
 }
 
@@ -506,6 +518,13 @@ const AUDIT_PRIVATE_ON_WRITE_HOW: &str = "In a scratch root, run the case `the_a
 
 /// The claim about a record that is there and cannot be read.
 const UNREADABLE_RECORD_CLAIM: &str = "a peer record that is present and cannot be read is refused as its own cause, naming the file, and is never reported as a machine this one never paired; the handshake fails closed over it too";
+
+/// The claim about a message queue and its directory being private to the account.
+const MESSAGES_PRIVATE_CLAIM: &str = "a message file and its directory are private to the account the product runs as: a directory another account can write, a linked directory and a queue another account can read are each refused with the file named, and restoring the owner-only mode reads the same queue";
+
+/// What a host that can produce [`MESSAGES_PRIVATE_CLAIM`] does: the mode is unix's, so a
+/// unix host runs the case and the procedure only records it.
+const MESSAGES_PRIVATE_HOW: &str = "In a scratch root, run the case `a_message_file_is_private_to_the_account` (`cargo test -p mahbot-peers-harness` on a unix host runs it): it opens the message layer on an empty root, which creates `messages/` mode 0700, and queues one message; `chmod 777` on the `messages/` directory in the scratch root makes the next open refuse with `is not private`, and `chmod 700` on the same directory opens it again; `chmod 644` on the queue file makes `pending` refuse with `is not private`, and `chmod 600` on the same file reads the queue.";
 
 /// What a host that can produce [`UNREADABLE_RECORD_CLAIM`] does.
 const UNREADABLE_RECORD_HOW: &str = "In a scratch root, run the case `an_unreadable_record_is_not_an_unpaired_machine` (`cargo test -p mahbot-peers-harness` on a unix host runs it): it pairs two machines, `chmod 644` on the peer's record file in the scratch root, and dials, which refuses with `not trusted: its record cannot be read` and names the record. `chmod 600` on the same file in the same scratch root makes the same dial connect.";
@@ -1175,6 +1194,168 @@ const CAPABILITIES: &[Capability] = &[
     Capability::witnessed(
         "library.peer.presence.refresh",
         "a registration that is never refreshed is forgotten on the beacon's own lifetime while its session stays open, and a registration refreshed by `Presence` outlives that lifetime",
+    ),
+    // The message layer: the queue a sender keeps, the offer it makes, the answers a
+    // receiver gives, and the rights around both.
+    Capability::witnessed(
+        "library.peer.messages.compose",
+        "a message is durable in the sender's queue before any connection, with an identifier unique for that sender, a count within the pair and the composed moment",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.body_stored_as_written",
+        "a body is stored and handed over exactly as composed, never escaped or rendered",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.queue_bounded",
+        "a pair's queue is bounded and a full queue is refused rather than dropping an older message",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.too_large",
+        "a queue that would grow past its file cap is refused and left exactly as it was, so nothing is truncated",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.body_bounded",
+        "a body of exactly the cap is queued and one byte more is refused before anything is written",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.composed_moment",
+        "the moment a message says it was composed is a remark: the queue orders by count and measures retention from when it stored the message",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.closed_pair",
+        "a message for a pair closed by three failed comparisons is refused before it is written, and a withdrawn trust is still answered as withdrawn",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.queue_survives_restart",
+        "a sender's queue survives its restart",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.retention",
+        "a message untaken after 72 hours is dropped and the drop is recorded",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.trust_withdrawn",
+        "withdrawing trust drops that pair's queue and records it",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.taken_once",
+        "the same envelope offered three times reaches the receiver's caller once",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.dedup_survives_restart",
+        "the receiver's memory of taken identifiers survives its restart",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.taken_retention",
+        "a taken identifier is remembered for a week and then forgotten: a retry inside it is answered `already taken`, one after it is delivered again, and a fresh identifier under a count already used is delivered with the rewind declared — a sender whose queue was lost is never wedged for the pair's life",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.delivery_declined",
+        "a caller that cannot store is handed the message again and nothing is recorded as taken until it says it kept it",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.rewind",
+        "a count that does not move forward is declared as a rewind and its message is delivered: only a remembered identifier suppresses a message, and a drop is never written for one that reached a caller",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.offered_when_connected",
+        "a message composed while the peer was away arrives when it returns",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.waiting_for_binding",
+        "a pair whose binding has not arrived is not spoken to, and the queue says so",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.order",
+        "messages from one machine arrive in the order of the sender's count, and two peers' orders are independent",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.gap",
+        "a count that jumps forward is declared as the number of missing messages instead of being renumbered or silently continued",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.authorship",
+        "the sender is the transport's attested peer; a body's claim about its author is text",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.right",
+        "a message is offered only under the pair's live write right, and service resumes when it is given",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.floor",
+        "the host's own floor can refuse a message a right gives, and the host's words stay on the receiver while the right stays live",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.refusal_is_final",
+        "a refusal is recorded, the message is dropped at the sender, and the queue moves on",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.peer_cannot_fill_the_log",
+        "a peer's refusals stop at the log's room kept for a person's acts, so a peer cannot fill the log, and the message is still answered",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.service_reports_a_broken_queue",
+        "a queue or record the service cannot read or write ends it and reaches whoever started it, whether the service's own round or a receiving task it started met the refusal",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.unreadable_answered",
+        "a frame the receiver cannot read — bytes that are not a message, or a frame longer than any message this build writes — is answered `unreadable`, so the sender drops it instead of keeping it for the retention",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.held_queue",
+        "another writer holding a queue is not a fault: the service keeps the message, waits a round, and the message leaves when the writer lets go, delivered once; a refusal repeated while the queue is held is written once a second, not once an offer",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.delivery_panic",
+        "a caller whose delivery panics ends the service with that bug named, and the message stays queued, rather than the pair going silent",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.answer_write_bounded",
+        "writing an answer back is bounded like every other wait this crate makes: a peer whose stream window will not take it costs one budget and an ended stream, and the receiving task takes the next offer instead of parking the pair for the connection's life",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.taken_is_not_a_drop",
+        "a message the receiver took is never recorded as a drop: offered again — after a removal another writer held, or from a restored queue — it is answered `already taken`, the sender drops its copy, and the log gains nothing",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.busy",
+        "a queue another writer holds — the second process a self-update leaves on one root — answers `busy` and the same call is worth making again, rather than waiting unboundedly",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.service_sweeps",
+        "a running service sweeps its own peer, so a retention and a trust withdrawn while it runs drop that queue and record it without the caller sweeping by hand",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.unanswered_offer",
+        "an offer nobody answers costs one round a second, so a peer that resets each offer stream cannot make the sender spin through its queue files",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.reconnect",
+        "after the pair's connection is replaced — a reconnection, a tie-break — the pair still receives: the layer attaches a receiving task to the new connection. A case cannot force a dropped connection's address to be handed out again, so the rule that tells the two apart is not mutation-checked; the behaviour is",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.throttle",
+        "a flood is throttled, the sender is told, and a throttle is not a refusal",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.not_on_the_beacon",
+        "the beacon carries no message",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.offering_is_not_traffic",
+        "offering a message does not count as the pair's traffic for the keeper, while a message the peer took does",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.body_cannot_reach_a_capability",
+        "the message layer names no capability, so no body can select one or reach a grant",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.format",
+        "a message file's unknown fields are kept and written back, so the format is additive",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.malformed",
+        "a file that is not a message file is refused, not believed",
     ),
     Capability::unproducible(
         "library.peer.connect.real_network",

@@ -429,6 +429,13 @@ pub const INVARIANTS: &[Invariant] = &[
         control: "std::fs::write(path, bytes)?;",
         check: no_persistent_state,
     },
+    Invariant {
+        id: "messages.no_capability_from_a_body",
+        claim: "the message layer names no capability and asks no question of its own: its one decision is `Rights::may_take_message`, whose inputs are the transport's peer, the host's floor and the moment, so a body cannot select a capability or reach a grant",
+        scope: &["src/peer/messages.rs", "src/peer/messages/"],
+        control: r#"let capability = Capability::WORK;"#,
+        check: messages_name_no_capability,
+    },
 ];
 
 /// The invariant with this id, for a case that has to run one directly.
@@ -707,4 +714,25 @@ fn key_is_minted_in_one_place(source: &Source) -> Vec<Finding> {
 
 fn no_persistent_state(source: &Source) -> Vec<Finding> {
     forbidden(source, &["std::fs", "OpenOptions", "File::"])
+}
+
+/// The message layer names no capability and asks no question of its own.
+///
+/// Its one decision is `Rights::may_take_message`, taken from the transport's peer and
+/// the moment: nothing a body says is an input, so no body can select a capability, ask a
+/// question or reach a grant. The tokens are the layer's own: a grant, a withdrawal, a
+/// binding or a decision taken here would be a second path from bytes to a right.
+fn messages_name_no_capability(source: &Source) -> Vec<Finding> {
+    forbidden(
+        source,
+        &[
+            "Capability",
+            "Question",
+            "Authority",
+            "grant(",
+            "withdraw(",
+            "bind(",
+            "decide(",
+        ],
+    )
 }

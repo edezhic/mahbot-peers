@@ -2,9 +2,12 @@
 //!
 //! # What it holds
 //!
-//! Every grant, every refusal, every ending, every withdrawal, every return, and the
-//! clearing of a pairing attempt lock: what was decided, under whose rights, and
-//! when. The moment is the caller's, like every other moment this crate records.
+//! Every grant, every refusal, every ending, every withdrawal, every return, the
+//! clearing of a pairing attempt lock, and — at the message layer — every message a
+//! receiver refused and every queue that was dropped: what was decided, under whose
+//! rights, and when. The moment is the caller's, like every other moment this crate
+//! records. A message's body is never here: the entry names the envelope and the
+//! reason, so the log says what happened without keeping what was said.
 //!
 //! # Why append-only
 //!
@@ -65,12 +68,12 @@
 //! file past it is refused rather than read into memory. Within it, the bytes above
 //! [`RESERVED_FOR_PERSON_BYTES`] below the cap are kept for a person's acts. The
 //! entries a peer causes by asking — a refusal, a refused write, the ending a question
-//! notices — are not written once they would reach into that reserve, while a grant, a
-//! withdrawal, a trust withdrawal, a return and an attempt-lock clearing still are. So
-//! a peer cannot fill the log and take away the acts that stop it, and a refusal that
-//! cannot be written is still answered: nothing changes when a question is refused, so
-//! the answer does not depend on the entry. An ending that cannot be written leaves its
-//! row unmarked and refuses all the same — the term passed, and the row's own
+//! notices, a message a receiver refuses — are not written once they would reach into that
+//! reserve, while a grant, a withdrawal, a trust withdrawal, a return and an attempt-lock
+//! clearing still are. So a peer cannot fill the log and take away the acts that stop it,
+//! and a refusal that cannot be written is still answered: nothing changes when a question
+//! is refused, so the answer does not depend on the entry. An ending that cannot be written
+//! leaves its row unmarked and refuses all the same — the term passed, and the row's own
 //! `expires_at` names it. Nothing frees that room: the log is never compacted, so the
 //! part a peer may fill only shrinks, and an ending or refusal skipped for want of room
 //! stays unrecorded. A product at the cap must decide what to keep before a person's own
@@ -149,6 +152,8 @@ mod code {
     pub const TRUST_RESTORED: u8 = 6;
     pub const ATTEMPT_LOCK_CLEARED: u8 = 7;
     pub const WRITE_REFUSED: u8 = 8;
+    pub const MESSAGE_REFUSED: u8 = 9;
+    pub const MESSAGES_DROPPED: u8 = 10;
 }
 
 /// The act body's field tags.
@@ -167,6 +172,10 @@ mod field_tag {
     pub const REMOVED: u8 = 0x0c;
     pub const REMOTE: u8 = 0x0d;
     pub const WRITE_REFUSAL: u8 = 0x0e;
+    pub const MESSAGE_ID: u8 = 0x0f;
+    pub const COUNT: u8 = 0x10;
+    pub const DROPPED: u8 = 0x11;
+    pub const DROP: u8 = 0x12;
 }
 
 /// The entry body's field tags.
@@ -226,24 +235,97 @@ pub enum Act {
         capability: Capability,
         reason: WriteRefusal,
     },
+    /// A message this machine dropped because a receiver refused it or could not read it.
+    MessageRefused {
+        peer: PeerId,
+        /// The envelope's identifier, 16 bytes: the message is named without its body.
+        id: [u8; 16],
+        /// The envelope's count, so a person can order what was refused.
+        count: u64,
+        /// Why this machine dropped it. A class, not a sentence: nothing a peer sends is
+        /// written here.
+        reason: RefusedReason,
+    },
+    /// Messages were dropped: what waited past the retention, or a whole queue whose peer's
+    /// trust was withdrawn.
+    MessagesDropped {
+        peer: PeerId,
+        /// What was dropped, oldest first.
+        dropped: Vec<Dropped>,
+        /// Why they went.
+        reason: DropReason,
+    },
     /// An act a newer build wrote: kept so nothing hides, never acted on.
     Unrecognised { code: u8 },
+}
+
+/// Why this machine dropped a message the receiver would not take.
+///
+/// A closed set for this build: the log writes one byte, and a byte it does not know is not
+/// guessed. The entry is kept as [`Act::Unrecognised`] — the act's code without its fields —
+/// so a newer build's reason costs the detail of that one entry, never the log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefusedReason {
+    /// The receiver's rights refused the message.
+    Rights,
+    /// The receiver could not read the frame.
+    Unreadable,
+}
+
+impl fmt::Display for RefusedReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Rights => "the receiver's rights refused the message",
+            Self::Unreadable => "the receiver could not read the message",
+        })
+    }
+}
+
+/// Why messages were dropped.
+///
+/// A closed set for this build, for the reason [`RefusedReason`] gives. Every reason here is
+/// this machine's own doing: a peer's answer never drops a message, so it never writes one of
+/// these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropReason {
+    /// The message waited past the layer's retention.
+    Expired,
+    /// This machine's trust in the peer was withdrawn, so its queue went with it.
+    TrustWithdrawn,
+}
+
+/// One dropped message, named without its body.
+///
+/// A plain record rather than the message layer's own type: the log keeps what it needs
+/// to say which messages went, and a dependency the other way would make the audit
+/// module know the queue's shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dropped {
+    /// The envelope's count.
+    pub count: u64,
+    /// The envelope's identifier, 16 bytes.
+    pub id: [u8; 16],
 }
 
 impl Act {
     /// Whether a question or a peer's write can cause this act.
     ///
-    /// A refused question, a refused write and the ending a question notices are the
-    /// acts a peer causes by asking: none of them changes a right, and a peer that
-    /// keeps asking can cause another one each time — an ending that cannot be marked
-    /// on the row is noticed again by the next question. Every other act is a person's,
-    /// or the default's at a pair's coming-into-being, and is bounded by what the record
-    /// holds. Only these stop at [`RESERVED_FOR_PERSON_BYTES`].
+    /// A refused question, a refused write, an ending a question notices and a message
+    /// a receiver refuses are the acts a peer causes by asking: none of them changes a
+    /// right, and a peer that keeps asking can cause another one each time — an ending
+    /// that cannot be marked on the row is noticed again by the next question. Every
+    /// other act is a person's, or the default's at a pair's coming-into-being, and is
+    /// bounded by what the record holds. Only these stop at [`RESERVED_FOR_PERSON_BYTES`].
+    /// A drop is not among them: every drop is this machine's own — a sweep, or a withdrawal
+    /// a person made — so a peer cannot cause one at all.
     #[must_use]
     pub(crate) const fn is_peer_driven(&self) -> bool {
         matches!(
             self,
-            Self::Refused { .. } | Self::WriteRefused { .. } | Self::Ended { .. }
+            Self::Refused { .. }
+                | Self::WriteRefused { .. }
+                | Self::Ended { .. }
+                | Self::MessageRefused { .. }
         )
     }
 }
@@ -763,6 +845,10 @@ struct Fields {
     removed: Option<usize>,
     remote: Option<PeerId>,
     write_refusal: Option<u8>,
+    message_id: Option<[u8; 16]>,
+    count: Option<u64>,
+    dropped: Option<Vec<Dropped>>,
+    drop: Option<DropReason>,
 }
 
 impl Fields {
@@ -830,6 +916,18 @@ impl Fields {
                 field_tag::WRITE_REFUSAL => {
                     fields.write_refusal = Some(one_byte(tag, body)?);
                 }
+                field_tag::MESSAGE_ID => {
+                    fields.message_id = Some(tlv::id_of(tag, body).map_err(field_error)?);
+                }
+                field_tag::COUNT => {
+                    fields.count = Some(tlv::u64_of(tag, body).map_err(field_error)?);
+                }
+                field_tag::DROPPED => {
+                    fields.dropped = Some(read_dropped(tag, body)?);
+                }
+                field_tag::DROP => {
+                    fields.drop = Some(read_drop_reason(tag, body)?);
+                }
                 // An act field a newer build wrote: read past it, keep the rest.
                 _ => {}
             }
@@ -863,6 +961,11 @@ fn field_detail(tag: u8, detail: &str) -> String {
     format!("act field {tag:#04x} {detail}")
 }
 
+/// The framing's fault, in the act field's words.
+fn field_error(error: tlv::FieldError) -> String {
+    field_detail(error.tag, error.detail)
+}
+
 /// One byte, or the act field's refusal naming the tag.
 fn one_byte(tag: u8, body: &[u8]) -> Result<u8, String> {
     let [byte] = body else {
@@ -884,10 +987,41 @@ fn read_label(tag: u8, body: &[u8]) -> Result<Label, String> {
 }
 
 fn read_moment(tag: u8, body: &[u8]) -> Result<Timestamp, String> {
-    let bytes: [u8; 8] = body
-        .try_into()
-        .map_err(|_| field_detail(tag, "is not eight bytes"))?;
-    Ok(Timestamp::from_unix_seconds(u64::from_be_bytes(bytes)))
+    Ok(Timestamp::from_unix_seconds(
+        tlv::u64_of(tag, body).map_err(field_error)?,
+    ))
+}
+
+/// A `DROPPED` field: 24-byte records of a count and an identifier.
+fn read_dropped(tag: u8, body: &[u8]) -> Result<Vec<Dropped>, String> {
+    let (chunks, rest) = body.as_chunks::<24>();
+    if !rest.is_empty() {
+        return Err(field_detail(tag, "is not 24-byte records"));
+    }
+    let mut dropped = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let (count, id) = chunk.split_at(8);
+        let count: [u8; 8] = count
+            .try_into()
+            .map_err(|_| field_detail(tag, "is not 24-byte records"))?;
+        let id: [u8; 16] = id
+            .try_into()
+            .map_err(|_| field_detail(tag, "is not 24-byte records"))?;
+        dropped.push(Dropped {
+            count: u64::from_be_bytes(count),
+            id,
+        });
+    }
+    Ok(dropped)
+}
+
+/// A `DROP` field: why messages went.
+fn read_drop_reason(tag: u8, body: &[u8]) -> Result<DropReason, String> {
+    match one_byte(tag, body)? {
+        1 => Ok(DropReason::Expired),
+        2 => Ok(DropReason::TrustWithdrawn),
+        other => Err(field_detail(tag, &format!("is {other}"))),
+    }
 }
 
 /// One entry's body: the moment and the act.
@@ -908,16 +1042,7 @@ fn encode_entry(entry: &Entry) -> Result<Vec<u8>, String> {
             kind,
         } => {
             act.push(code::GRANTED);
-            put_capability(&mut act, pair, *capability)?;
-            put_issuer(&mut act, issuer)?;
-            if let Some(expires_at) = expires_at {
-                put_field(
-                    &mut act,
-                    field_tag::EXPIRY,
-                    &expires_at.unix_seconds().to_be_bytes(),
-                )?;
-            }
-            put_field(&mut act, field_tag::KIND, &[grant_kind_byte(*kind)])?;
+            put_granted(&mut act, pair, *capability, issuer, *expires_at, *kind)?;
         }
         Act::Refused {
             pair,
@@ -972,10 +1097,74 @@ fn encode_entry(entry: &Entry) -> Result<Vec<u8>, String> {
                 put_field(&mut act, field_tag::REMOTE, remote.as_bytes())?;
             }
         }
+        Act::MessageRefused {
+            peer,
+            id,
+            count,
+            reason,
+        } => {
+            act.push(code::MESSAGE_REFUSED);
+            put_message_refused(&mut act, peer, id, *count, *reason)?;
+        }
+        Act::MessagesDropped {
+            peer,
+            dropped,
+            reason,
+        } => {
+            act.push(code::MESSAGES_DROPPED);
+            put_field(&mut act, field_tag::PEER, peer.as_bytes())?;
+            put_dropped(&mut act, dropped)?;
+            put_field(&mut act, field_tag::DROP, &[drop_reason_byte(*reason)])?;
+        }
         Act::Unrecognised { code } => act.push(*code),
     }
     put_field(&mut body, entry_tag::ACT, &act)?;
     Ok(body)
+}
+
+/// Append a grant: the pair and capability, the issuer, the term and the kind.
+fn put_granted(
+    act: &mut Vec<u8>,
+    pair: &Pair,
+    capability: Capability,
+    issuer: &Issuer,
+    expires_at: Option<Timestamp>,
+    kind: GrantKind,
+) -> Result<(), String> {
+    put_capability(act, pair, capability)?;
+    put_issuer(act, issuer)?;
+    if let Some(expires_at) = expires_at {
+        put_field(
+            act,
+            field_tag::EXPIRY,
+            &expires_at.unix_seconds().to_be_bytes(),
+        )?;
+    }
+    put_field(act, field_tag::KIND, &[grant_kind_byte(kind)])
+}
+
+/// Append a refused message: the machine, the envelope and the class of the refusal.
+fn put_message_refused(
+    act: &mut Vec<u8>,
+    peer: &PeerId,
+    id: &[u8; 16],
+    count: u64,
+    reason: RefusedReason,
+) -> Result<(), String> {
+    put_field(act, field_tag::PEER, peer.as_bytes())?;
+    put_field(act, field_tag::MESSAGE_ID, id)?;
+    put_field(act, field_tag::COUNT, &count.to_be_bytes())?;
+    put_field(act, field_tag::REASON, &[refused_reason_byte(reason)])
+}
+
+/// Append the dropped messages: 24 bytes each, a count and an identifier.
+fn put_dropped(act: &mut Vec<u8>, dropped: &[Dropped]) -> Result<(), String> {
+    let mut body = Vec::with_capacity(dropped.len() * 24);
+    for one in dropped {
+        body.extend_from_slice(&one.count.to_be_bytes());
+        body.extend_from_slice(&one.id);
+    }
+    put_field(act, field_tag::DROPPED, &body)
 }
 
 /// Append a refusal: its step, its reason, and the moment or the floor's words.
@@ -1070,6 +1259,20 @@ const fn step_byte(step: Step) -> u8 {
     }
 }
 
+const fn drop_reason_byte(reason: DropReason) -> u8 {
+    match reason {
+        DropReason::Expired => 1,
+        DropReason::TrustWithdrawn => 2,
+    }
+}
+
+const fn refused_reason_byte(reason: RefusedReason) -> u8 {
+    match reason {
+        RefusedReason::Rights => 1,
+        RefusedReason::Unreadable => 2,
+    }
+}
+
 /// One entry's body, back to an [`Entry`].
 fn decode_entry(body: &[u8]) -> Result<Entry, String> {
     let mut at = None;
@@ -1094,7 +1297,7 @@ fn decode_act(body: &[u8]) -> Result<Act, String> {
     if code == 0 {
         return Err("the act code is zero".to_owned());
     }
-    if !(code::GRANTED..=code::WRITE_REFUSED).contains(&code) {
+    if !(code::GRANTED..=code::MESSAGES_DROPPED).contains(&code) {
         return Ok(Act::Unrecognised { code });
     }
     // A code this build knows but whose fields it cannot read is a newer build's
@@ -1172,6 +1375,21 @@ fn decode_known_act(code: u8, fields: &[u8]) -> Result<Act, String> {
                 reason,
             })
         }
+        code::MESSAGE_REFUSED => Ok(Act::MessageRefused {
+            peer: fields.peer.ok_or("the act names no machine")?,
+            id: fields.message_id.ok_or("the act names no message")?,
+            count: fields.count.ok_or("the act names no count")?,
+            reason: match fields.reason.ok_or("the act names no reason")? {
+                1 => RefusedReason::Rights,
+                2 => RefusedReason::Unreadable,
+                other => return Err(format!("a refused message has reason {other}")),
+            },
+        }),
+        code::MESSAGES_DROPPED => Ok(Act::MessagesDropped {
+            peer: fields.peer.ok_or("the act names no machine")?,
+            dropped: fields.dropped.clone().ok_or("the act names no messages")?,
+            reason: fields.drop.ok_or("the act names no reason")?,
+        }),
         _ => Ok(Act::Unrecognised { code }),
     }
 }

@@ -118,6 +118,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -189,33 +190,57 @@ pub enum Started {
 struct Live {
     connection: Connection,
     started_by: Started,
-    watch: Watch,
+    /// Made once per connection and shared with every handle on it: two handles are the
+    /// same connection exactly when they share this cell, so nothing has to compare an id
+    /// that a dropped connection's address can hand out again.
+    watch: Arc<Watch>,
 }
 
 /// What the keeper reads to tell the pair's use from the manager's own exchange.
 ///
 /// The frame counters at adoption, and the frames written since then that belong to
 /// the binding exchange — the manager's handshake and not the pair's use: a connection
-/// that only exchanged its binding and then died carried nothing.
-#[derive(Clone, Debug, Default)]
+/// that only exchanged its binding and then died carried nothing. The message layer
+/// adds its own measurement: a round is an offer in flight, `quiet` is where the
+/// frames stood when the last one finished, and `taken` is a message the peer took.
+#[derive(Debug)]
 struct Watch {
     carried_from: Frames,
     /// The frames the exchange wrote, once it has finished; `None` while it is still
     /// in flight.
-    exchanged: Arc<Mutex<Option<Frames>>>,
+    exchanged: Mutex<Option<Frames>>,
+    /// How many messages this connection has taken from this machine.
+    taken: AtomicU64,
+    /// The frames up to the end of the last message round; `None` before one ran.
+    quiet: Mutex<Option<Frames>>,
+    /// How many message rounds are in flight now.
+    rounds: AtomicU32,
 }
 
 impl Live {
     /// Adopt `connection`, taking the frame counters the keeper judges it from now.
     fn new(connection: Connection, started_by: Started) -> Self {
         Self {
-            watch: Watch {
+            watch: Arc::new(Watch {
                 carried_from: Frames::of(&connection),
-                exchanged: Arc::new(Mutex::new(None)),
-            },
+                exchanged: Mutex::new(None),
+                taken: AtomicU64::new(0),
+                quiet: Mutex::new(None),
+                rounds: AtomicU32::new(0),
+            }),
             connection,
             started_by,
         }
+    }
+}
+
+impl Watch {
+    /// Whether the binding exchange has finished on this connection.
+    fn exchange_done(&self) -> bool {
+        self.exchanged
+            .lock()
+            .expect("the exchange count is not poisoned")
+            .is_some()
     }
 }
 
@@ -260,6 +285,108 @@ impl Frames {
     }
 }
 
+/// One pair's live connection, as the message layer offers over it.
+///
+/// Cheap to clone: the connection is a handle and the watch is shared with the keeper, so
+/// what the message layer reports — a round begun or ended, a message taken — is what the
+/// keeper judges the connection by. An offer in flight and an offer that finished are not
+/// the pair's traffic; a message the peer took always is.
+#[derive(Clone)]
+pub struct Traffic {
+    connection: Connection,
+    watch: Arc<Watch>,
+}
+
+impl fmt::Debug for Traffic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Traffic")
+            .field("connection", &self.connection.stable_id())
+            .field("exchange_done", &self.exchange_done())
+            .field("taken", &self.watch.taken.load(Ordering::SeqCst))
+            .field("rounds", &self.watch.rounds.load(Ordering::SeqCst))
+            .finish_non_exhaustive()
+    }
+}
+
+impl Traffic {
+    /// The live connection to offer over.
+    ///
+    /// The connection is the manager's own: [`Connections::connect`] hands the same one to
+    /// a caller that asks, so this exposes nothing a caller could not reach. A stream a
+    /// caller opens on it before [`Self::exchange_done`] is taken for the binding
+    /// exchange's by the far side, so a caller that speaks its own frames waits for the
+    /// exchange to finish first.
+    #[must_use]
+    pub const fn connection(&self) -> &Connection {
+        &self.connection
+    }
+
+    /// Whether `self` and `other` are the same live connection.
+    ///
+    /// A connection's own id is not what decides this: it is the address of the connection
+    /// object, and a connection dropped by the manager can be replaced by a new one at the
+    /// same address. The watch is made once per connection, shared by every handle on it and
+    /// dropped with the last one, so sharing it is what "the same connection" means.
+    #[must_use]
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.watch, &other.watch)
+    }
+
+    /// Whether the binding exchange has finished on this connection.
+    ///
+    /// The exchange owns the first stream a kept connection carries, so a message is
+    /// never offered before it: a receiver would take the exchange's stream for an
+    /// offer.
+    #[must_use]
+    pub fn exchange_done(&self) -> bool {
+        self.watch.exchange_done()
+    }
+
+    /// Mark one offer as started, until the guard is dropped.
+    ///
+    /// Until then the connection is not judged by its frames: an offer in flight is this
+    /// machine's own act, not evidence the pair is alive. A guard rather than a paired call,
+    /// because a round abandoned mid-offer — a service dropped, a task cancelled — must not
+    /// leave the connection looking like one that carries nothing for the rest of its life.
+    pub(crate) fn round(&self) -> Round<'_> {
+        self.watch.rounds.fetch_add(1, Ordering::SeqCst);
+        Round { traffic: self }
+    }
+
+    /// Record that the peer took a message over this connection.
+    ///
+    /// A taken message is the pair's use however the frames are counted, so it is
+    /// remembered separately from them.
+    pub(crate) fn took(&self) {
+        self.watch.taken.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Mark the offer as finished, keeping where the frames stood when it ended.
+    ///
+    /// The measurement is taken from the connection's adoption, so it already contains
+    /// the binding exchange's frames and nothing has to be added to it.
+    fn end_round(&self) {
+        *self
+            .watch
+            .quiet
+            .lock()
+            .expect("the message round is not poisoned") =
+            Some(self.watch.carried_from.delta(Frames::of(&self.connection)));
+        self.watch.rounds.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// One offer in flight, ended when it is dropped however the round ends.
+pub(crate) struct Round<'a> {
+    traffic: &'a Traffic,
+}
+
+impl Drop for Round<'_> {
+    fn drop(&mut self) {
+        self.traffic.end_round();
+    }
+}
+
 /// What one attempt to reach a peer produced, before it is folded into the four
 /// failures.
 enum Attempt {
@@ -270,7 +397,7 @@ enum Attempt {
     Kept {
         connection: Connection,
         kept_this: bool,
-        watch: Watch,
+        watch: Arc<Watch>,
     },
     /// A handshake completed at `address`, but the tie-break dropped the connection
     /// and no other took its place: a dial that carried nothing, not a failed dial.
@@ -282,6 +409,13 @@ enum Attempt {
     },
     /// The attempt failed with one of the four failures.
     Failed(ConnectFailure),
+}
+
+/// The pair's live connection, or `None` when the pair has none or the recorded one has
+/// closed.
+fn open<'a>(pairs: &'a BTreeMap<PeerId, Live>, peer: &PeerId) -> Option<&'a Live> {
+    let live = pairs.get(peer)?;
+    live.connection.close_reason().is_none().then_some(live)
 }
 
 /// The connection manager of one machine.
@@ -377,14 +511,41 @@ impl Connections {
         self.current(peer).map(|(_, started_by)| started_by)
     }
 
+    /// The pair's live connection as the message layer offers over it, or `None` when
+    /// the pair has no live connection.
+    ///
+    /// A closed connection is not one; see [`Self::live`]. The handle shares the
+    /// manager's own measurement of the connection, so what the message layer reports
+    /// back — a round begun or ended, a message taken — is what the keeper judges the
+    /// connection by.
+    #[must_use]
+    pub fn traffic(&self, peer: &PeerId) -> Option<Traffic> {
+        let pairs = self.pairs();
+        let live = open(&pairs, peer)?;
+        Some(Traffic {
+            connection: live.connection.clone(),
+            watch: live.watch.clone(),
+        })
+    }
+
+    /// Whether `traffic` is the pair's live connection now.
+    ///
+    /// A receiver task belongs to one connection: when the manager replaces it — a
+    /// reconnection, a tie-break, a withdrawal — the task's connection is no longer the
+    /// pair's, and the task stops instead of reading a connection nobody keeps. The
+    /// comparison is [`Traffic::same`]'s, so one rule decides what "the pair's connection"
+    /// means for both the manager and the layer above it.
+    #[must_use]
+    pub(crate) fn is_live(&self, peer: &PeerId, traffic: &Traffic) -> bool {
+        let pairs = self.pairs();
+        open(&pairs, peer).is_some_and(|live| Arc::ptr_eq(&live.watch, &traffic.watch))
+    }
+
     /// The pair's live connection and its starter, or `None` when the recorded
     /// connection has closed. The rule is [`Self::live`]'s.
     fn current(&self, peer: &PeerId) -> Option<(Connection, Started)> {
         let pairs = self.pairs();
-        let live = pairs.get(peer)?;
-        if live.connection.close_reason().is_some() {
-            return None;
-        }
+        let live = open(&pairs, peer)?;
         Some((live.connection.clone(), live.started_by))
     }
 
@@ -602,18 +763,24 @@ impl Connections {
     /// once the connection is gone.
     ///
     /// A connection that carried anything — a QUIC datagram or stream frame either
-    /// way, beyond the manager's own binding exchange — and then died is a link
-    /// failure: the keeper re-dials it however many times it happens and however long
-    /// it lived, with no bound, because that is recovery and not a loop. A connection
-    /// that only exchanged its binding and then died carried nothing, because the
-    /// exchange is the manager's handshake and not the pair's use: the frames it wrote
-    /// are measured and subtracted, and a connection that dies before that measurement
-    /// lands is judged as carrying nothing too. That window is the whole
-    /// [`crate::peer::EXCHANGE_BUDGET`], so a pair's own traffic inside it is
-    /// discounted with the exchange's — the price of a bound the keeper can keep
-    /// without a second handshake. A connection that outlives [`KEEPER_SETTLE`] is
+    /// way, beyond the manager's own binding exchange and the message layer's own
+    /// rounds — and then died is a link failure: the keeper re-dials it however many
+    /// times it happens and however long it lived, with no bound, because that is
+    /// recovery and not a loop. A connection that only exchanged its binding and then
+    /// died carried nothing, because the exchange is the manager's handshake and not
+    /// the pair's use: the frames it wrote are measured and subtracted, and a connection
+    /// that dies before that measurement lands is judged as carrying nothing too. That
+    /// window is the whole [`crate::peer::EXCHANGE_BUDGET`], so a pair's own traffic
+    /// inside it is discounted with the exchange's — the price of a bound the keeper can
+    /// keep without a second handshake. A connection that outlives [`KEEPER_SETTLE`] is
     /// settled the same way: the pair got to use it, so its loss is ordinary churn and
     /// clears the count.
+    ///
+    /// The message layer's offers are measured with the exchange: an offer in flight,
+    /// and an offer that finished, are not the pair's traffic, so a peer that keeps
+    /// dropping a connection after one unanswered offer is not mistaken for a live pair.
+    /// A message the peer took is: it is the peer acting, so the connection carried
+    /// something and its loss is a link failure.
     ///
     /// Only a dial whose connection ends before the pair carried anything and inside
     /// [`KEEPER_SETTLE`] is bounded: [`KEEPER_UNSTABLE_LIMIT`] of those in a row stop
@@ -754,7 +921,7 @@ impl Connections {
         &self,
         peer: PeerId,
         connection: &Connection,
-        watch: &Watch,
+        watch: &Arc<Watch>,
         started: Started,
     ) {
         let local = self
@@ -765,20 +932,20 @@ impl Connections {
         let from = watch.carried_from;
         let store = self.store.clone();
         let runtime = Arc::clone(&self.runtime);
-        let watch = watch.clone();
+        let watch = Arc::clone(watch);
         let spawned = Arc::clone(&runtime);
         runtime.spawn(Box::pin(async move {
             let fact = binding::exchange(&connection, local, started, &*spawned).await;
-            // Measured before the claim is kept, so a case that waits for the claim
-            // waits for the measurement too.
+            if let Some(fact) = fact {
+                let _ = store.record_claim(&peer, &fact);
+            }
+            // Marked after the claim is kept: the message layer offers once this is set,
+            // and a message offered before the claim landed would find no pair to name.
             let written = from.delta(Frames::of(&connection));
             *watch
                 .exchanged
                 .lock()
                 .expect("the exchange count is not poisoned") = Some(written);
-            if let Some(fact) = fact {
-                let _ = store.record_claim(&peer, &fact);
-            }
         }));
     }
 
@@ -836,7 +1003,7 @@ impl Connections {
         peer: PeerId,
         connection: Connection,
         started_by: Started,
-    ) -> Result<(Connection, bool, Watch), &'static str> {
+    ) -> Result<(Connection, bool, Arc<Watch>), &'static str> {
         let preferred = if self.me < peer {
             Started::Here
         } else {
@@ -886,7 +1053,7 @@ impl Connections {
 }
 
 /// The fingerprint a completed handshake proved, if it proved one.
-fn presented(connection: &Connection) -> Option<Fingerprint> {
+pub(crate) fn presented(connection: &Connection) -> Option<Fingerprint> {
     let identity = connection.peer_identity()?;
     let certificates = identity.downcast::<Vec<CertificateDer<'static>>>().ok()?;
     Fingerprint::from_spki(certificates.first()?.as_ref())
@@ -894,7 +1061,7 @@ fn presented(connection: &Connection) -> Option<Fingerprint> {
 
 /// Whether a connection carried anything the pair used: one QUIC datagram or stream
 /// frame either way, beyond what the connection had when it was adopted, less the
-/// stream frames the binding exchange wrote.
+/// stream frames the binding exchange wrote and those of the last message round.
 ///
 /// Keep-alives, handshake frames and acknowledgements are not traffic, so they do
 /// not turn a peer that drops a fresh connection into a link failure. Neither is the
@@ -905,12 +1072,32 @@ fn presented(connection: &Connection) -> Option<Fingerprint> {
 /// re-dial. That window is the exchange's whole budget, [`crate::peer::EXCHANGE_BUDGET`],
 /// and not only the handshake: traffic the pair sends inside it is discounted too,
 /// which is the price of the bound.
+///
+/// The message layer is measured the same way and for the same reason: an offer in
+/// flight is this machine's own act, and an offer that finished is measured back to
+/// where the frames stood when the round ended, so neither counts as the pair's use.
+/// A message the peer took is different — the peer acted on it, which is the pair
+/// being alive — so it counts however the frames are read. The receiving half is not
+/// measured at all: a stream the peer opened is the peer acting, and answering it is
+/// the pair being used, so only this machine's own rounds are discounted.
 fn carried(connection: &Connection, watch: &Watch) -> bool {
+    if watch.taken.load(Ordering::SeqCst) > 0 {
+        return true;
+    }
+    if watch.rounds.load(Ordering::SeqCst) > 0 {
+        return false;
+    }
     let quiet = *watch
+        .quiet
+        .lock()
+        .expect("the message round is not poisoned");
+    let exchanged = *watch
         .exchanged
         .lock()
         .expect("the exchange count is not poisoned");
-    quiet.is_some_and(|quiet| Frames::of(connection).beyond(watch.carried_from, quiet))
+    quiet
+        .or(exchanged)
+        .is_some_and(|quiet| Frames::of(connection).beyond(watch.carried_from, quiet))
 }
 
 /// What a connection is closed with when the record does not vouch for the pair.

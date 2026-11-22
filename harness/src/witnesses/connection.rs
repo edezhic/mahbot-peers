@@ -20,7 +20,7 @@ use crate::sim::Sim;
 
 use super::peer::{NOW, Shown, pair_together, paired, session};
 use super::rights::person;
-use super::support::{io_error, within};
+use super::support::{io_error, spawn_keeper, within};
 
 /// A machine's manager, its endpoint and the accept loops the case spawned.
 ///
@@ -1686,14 +1686,6 @@ fn closing_peer(
         }
     });
     Ok((task, accepted))
-}
-
-/// Run the manager's keeper for `peer` on its own task, as a caller does.
-fn spawn_keeper(managed: &Managed, peer: &Machine) -> tokio::task::JoinHandle<Keeper> {
-    let connections = Arc::clone(&managed.connections);
-    let endpoint = managed.endpoint.clone();
-    let peer = peer.fingerprint();
-    tokio::spawn(async move { connections.keep_connected(&endpoint, &peer).await })
 }
 
 /// Two keepers that start at the same moment both dial — the link is silenced until

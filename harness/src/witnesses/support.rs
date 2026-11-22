@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
+use mahbot_peers::peer::{Account, Binding, Instance, Keeper, Label, Pair};
 use mahbot_peers::tls::PeerPolicy;
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::udp::RecvMeta;
@@ -16,8 +17,42 @@ use crate::invariants::Source;
 use crate::machine::Machine;
 use crate::sim::Sim;
 
+use super::connection::Managed;
+use super::peer::NOW;
+
 pub(crate) fn io_error(error: io::Error) -> String {
     error.to_string()
+}
+
+/// The connection level a machine records for `peer`, with its own account, instance and
+/// assistant: the two sides of a case never share one, so a claim that arrived is always
+/// the peer's.
+pub(super) fn binding(account: &str, instance: &str, assistant: &Label) -> Result<Binding, String> {
+    Ok(Binding::new(
+        Account::new(account).map_err(|error| error.to_string())?,
+        Instance::new(instance).map_err(|error| error.to_string())?,
+        assistant.clone(),
+        NOW,
+    ))
+}
+
+/// The same, for the machine a case calls the main one: its own account and instance, and
+/// the assistant the case names.
+pub(super) fn main_binding(assistant: &Label) -> Result<Binding, String> {
+    binding("main-account", "main-instance", assistant)
+}
+
+/// The pair a machine's binding of `peer` names.
+pub(super) fn pair(peer: &Machine, assistant: &Label) -> Pair {
+    Pair::new(peer.peer_id(), assistant)
+}
+
+/// Run the manager's keeper for `peer` on its own task, as a product does.
+pub(super) fn spawn_keeper(managed: &Managed, peer: &Machine) -> tokio::task::JoinHandle<Keeper> {
+    let connections = Arc::clone(&managed.connections);
+    let endpoint = managed.endpoint.clone();
+    let peer = peer.fingerprint();
+    tokio::spawn(async move { connections.keep_connected(&endpoint, &peer).await })
 }
 
 /// How much virtual time one request may take before a case fails instead of

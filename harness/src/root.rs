@@ -4,13 +4,16 @@
 //! public. `machine.rs` holds the handle a test is given, and that file does not
 //! name a path at all — the invariant table checks it.
 
-use std::fs;
+use std::fs::{self, File};
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use mahbot_peers::identity::keyfile;
 use mahbot_peers::identity::{Identity, PeerId};
-use mahbot_peers::peer::{AuditError, AuditLog, Limits, RecordError, RecordStore};
+use mahbot_peers::peer::{
+    AuditError, AuditLog, Deliveries, Floor, Limits, Messages, Moment, RecordError, RecordStore,
+};
 use tempfile::TempDir;
 
 use crate::machine::RootId;
@@ -153,6 +156,122 @@ impl Root {
     pub(crate) fn record_name(&self, peer: &PeerId) -> io::Result<String> {
         self.ensure_alive()?;
         self.relative(&RecordStore::path_for(self.dir.path(), peer))
+    }
+
+    /// This root's message layer, opened over the real directory.
+    ///
+    /// The records and the log are the machine's own handles, so the queues, the
+    /// decision and the record of it come from one root.
+    pub(crate) fn messages(
+        &self,
+        records: RecordStore,
+        audit: AuditLog,
+        floor: Arc<dyn Floor + Send + Sync>,
+        moment: Arc<dyn Moment + Send + Sync>,
+        deliveries: Arc<dyn Deliveries + Send + Sync>,
+        runtime: Arc<dyn quinn::Runtime>,
+    ) -> Result<Messages, String> {
+        self.ensure_alive().map_err(|error| error.to_string())?;
+        Messages::open(
+            self.dir.path(),
+            records,
+            audit,
+            floor,
+            moment,
+            deliveries,
+            runtime,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    /// The name `peer`'s queue has under this root, as the message module spells it.
+    pub(crate) fn message_name(&self, peer: &PeerId) -> io::Result<String> {
+        self.ensure_alive()?;
+        self.relative(&Messages::path_for(self.dir.path(), peer))
+    }
+
+    /// `peer`'s queue file, read as this root's bytes.
+    pub(crate) fn read_message(&self, peer: &PeerId) -> io::Result<Vec<u8>> {
+        self.read(&self.message_name(peer)?)
+    }
+
+    /// `peer`'s queue file, replaced as this root's bytes.
+    pub(crate) fn write_message(&self, peer: &PeerId, bytes: &[u8]) -> io::Result<()> {
+        self.write(&self.message_name(peer)?, bytes)
+    }
+
+    /// `peer`'s queue file, removed as a deleted file or a restored backup removes it.
+    pub(crate) fn remove_message(&self, peer: &PeerId) -> io::Result<()> {
+        self.ensure_alive()?;
+        fs::remove_file(self.resolve(&self.message_name(peer)?)?)
+    }
+
+    /// The name of the file a writer locks for `peer`'s queue: beside the queue, as the
+    /// message module spells it.
+    pub(crate) fn message_lock_name(&self, peer: &PeerId) -> io::Result<String> {
+        self.ensure_alive()?;
+        self.relative(&Messages::lock_path_for(self.dir.path(), peer))
+    }
+
+    /// Hold `peer`'s queue lock, as the self-update window's second process does for the span
+    /// of one read-modify-publish. The file is created privately, by the crate's own rule, so
+    /// the lock the case holds is one the crate would take itself.
+    pub(crate) fn lock_message(&self, peer: &PeerId) -> io::Result<File> {
+        let name = self.message_lock_name(peer)?;
+        self.write(&name, b"")?;
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .open(self.resolve(&name)?)?;
+        file.lock()?;
+        Ok(file)
+    }
+
+    /// The directory holding this root's queues, removed whole, as a cleaner or a botched
+    /// restore removes it.
+    pub(crate) fn remove_message_dir(&self) -> io::Result<()> {
+        self.ensure_alive()?;
+        fs::remove_dir_all(Messages::dir_in(self.dir.path()))
+    }
+
+    /// The directory holding this root's queues, as the message module spells it.
+    #[cfg(unix)]
+    fn messages_dir(&self) -> io::Result<PathBuf> {
+        self.ensure_alive()?;
+        Ok(Messages::dir_in(self.dir.path()))
+    }
+
+    /// The mode of the messages directory.
+    #[cfg(unix)]
+    pub(crate) fn message_dir_mode(&self) -> io::Result<u32> {
+        use std::os::unix::fs::PermissionsExt;
+        Ok(fs::metadata(self.messages_dir()?)?.permissions().mode() & 0o777)
+    }
+
+    /// Give the messages directory a mode, as a root that was never hardened leaves it.
+    #[cfg(unix)]
+    pub(crate) fn set_message_dir_mode(&self, mode: u32) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(self.messages_dir()?, fs::Permissions::from_mode(mode))
+    }
+
+    /// Give `peer`'s queue file a mode, as an installation whose root was never hardened
+    /// leaves it reachable by another account.
+    #[cfg(unix)]
+    pub(crate) fn set_message_file_mode(&self, peer: &PeerId, mode: u32) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let path = self.resolve(&self.message_name(peer)?)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+    }
+
+    /// Turn the messages directory into a symbolic link to a directory beside it, as a
+    /// backup tool that moved it leaves it.
+    #[cfg(unix)]
+    pub(crate) fn replace_message_dir_with_a_link(&self) -> io::Result<()> {
+        let dir = self.messages_dir()?;
+        let elsewhere = dir.with_file_name("messages-elsewhere");
+        fs::rename(&dir, &elsewhere)?;
+        std::os::unix::fs::symlink(&elsewhere, &dir)
     }
 
     /// The audit log's bytes, as this root's file.

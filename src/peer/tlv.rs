@@ -1,10 +1,10 @@
-//! `[tag][len u16 big-endian][body]`: the one framing the peer record, the audit
-//! log and the connection fact share.
+//! `[tag][len u16 big-endian][body]`: the one framing every peer file and frame shares.
 //!
-//! Three formats spell it — a record's fields, an audit entry's fields, a fact's
-//! fields — and each reader must refuse a length that runs past the end the same
-//! way. This is the one place the framing is written and walked, so a field is
-//! framed once and its frame's faults are named once.
+//! Every format this crate writes spells it — a record's fields, an audit entry's fields, a
+//! fact's fields, a queue file's fields (and those of the message or taken identifier inside
+//! one), and the message and answer frames — and each reader must refuse a length that runs
+//! past the end the same way. This is the one place the framing is written and walked, so a
+//! field is framed once and its frame's faults are named once.
 
 /// A body longer than the `u16` length a field can name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,6 +20,23 @@ pub(crate) fn put(bytes: &mut Vec<u8>, tag: u8, body: &[u8]) -> Result<(), TooLo
     bytes.extend_from_slice(&length.to_be_bytes());
     bytes.extend_from_slice(body);
     Ok(())
+}
+
+/// One field's body as a `u64`, or the field's frame fault.
+pub(crate) fn u64_of(tag: u8, body: &[u8]) -> Result<u64, FieldError> {
+    let bytes: [u8; 8] = body.try_into().map_err(|_| FieldError {
+        tag,
+        detail: "is not eight bytes",
+    })?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+/// One field's body as the sixteen bytes an envelope identifier is spelled in.
+pub(crate) fn id_of(tag: u8, body: &[u8]) -> Result<[u8; 16], FieldError> {
+    body.try_into().map_err(|_| FieldError {
+        tag,
+        detail: "is not 16 bytes",
+    })
 }
 
 /// What is wrong with one field's frame.

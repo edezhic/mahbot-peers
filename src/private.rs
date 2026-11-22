@@ -1,17 +1,22 @@
 //! The one way this crate publishes a private file: a temporary file beside the
 //! destination, given the rule and checked, flushed, and published by one rename.
 //!
-//! The key file, the peer record and the audit log's creation all write this way, and
-//! all read through the same checked open, so the ordering that keeps a private half
-//! out of the wrong access has one spelling: a file is private before its first byte
-//! lands, not made private afterwards. The log is only *created* this way — it is
-//! appended in place, because an append-only record cannot be rewritten without losing
-//! a concurrent writer's entry, so its appends are opened, checked and written through
-//! the same descriptor, and `peer::audit` states the lock and the flush that make them
-//! safe. The rule itself is `identity::access`; this module only applies it around the
-//! write and the read.
+//! The key file, the peer record, the audit log's creation and the message queues all
+//! write this way, and all read through the same checked open, so the ordering that
+//! keeps a private half out of the wrong access has one spelling: a file is private
+//! before its first byte lands, not made private afterwards. The log is only *created*
+//! this way — it is appended in place, because an append-only record cannot be
+//! rewritten without losing a concurrent writer's entry, so its appends are opened,
+//! checked and written through the same descriptor, and `peer::audit` states the lock
+//! and the flush that make them safe. The rule itself is `identity::access`; this
+//! module only applies it around the write and the read.
+//!
+//! The directories this crate keeps under a root — `peers/` and `messages/` — are made
+//! and checked by the one function here too: a directory another account can write
+//! lets it delete what this crate keeps, which is a silent un-pairing, so a directory
+//! this crate creates is hardened before it is checked and one it finds is checked.
 
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::Path;
 
@@ -87,6 +92,84 @@ pub(crate) fn private_temp(
         Ok(None) => Ok(temp),
         Err(source) => Err(PrivateFileError::Io(source)),
     }
+}
+
+/// How many times a directory that carries a half-made shape is re-checked before it is
+/// refused: a creator that started at the same instant is a moment from applying the rule.
+#[cfg(not(unix))]
+const SETTLE_ATTEMPTS: usize = 1000;
+
+/// Create `dir` if it is missing, and hold it to the key file's rule.
+///
+/// A directory another account can write lets it delete a record or a queue, which is
+/// a silent un-pairing, so an existing directory is checked as well as a new one. The
+/// check is the same on both platforms: unix reads the mode, the owner and (on macOS)
+/// the extended list from a descriptor opened without following a link; Windows reads
+/// the directory's access list and owner from a handle opened for the directory.
+///
+/// A directory this crate creates is hardened before it is checked: a fresh directory
+/// inherits its parent's access list on Windows and the umask's mode on unix, and the
+/// rule would refuse what it inherited. Nothing is repaired: a directory that really is
+/// reachable by another account is refused, with its remedy. See [`settle`] for the one
+/// window the platforms differ on.
+pub(crate) fn create_private_dir(dir: &Path) -> Result<(), PrivateFileError> {
+    if !dir.is_dir() {
+        match create_directory(dir) {
+            Ok(()) => access::make_directory_private(dir).map_err(PrivateFileError::Io)?,
+            // Something is at the path and is not a directory — a regular file, or a
+            // link to one. The check below refuses a link as a link; a regular file
+            // fails its `O_DIRECTORY` open and surfaces as `Io`.
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(source) => return Err(PrivateFileError::Io(source)),
+        }
+    }
+    settle(dir)
+}
+
+/// Check `dir`, refusing at once on unix and re-checking a half-made shape on Windows.
+///
+/// Unix creates the directory with its final mode in the one `mkdir`, so a second process
+/// never sees it half-made and a directory that does not pass is refused without a retry:
+/// an operator's directory left at 0755 costs one check, not a thousand descriptor opens.
+/// Windows applies the access list after the creation, so a directory that carries a
+/// merely half-made shape is re-checked a bounded number of times before it is refused.
+#[cfg(unix)]
+fn settle(dir: &Path) -> Result<(), PrivateFileError> {
+    match access::check_directory(dir).map_err(PrivateFileError::Io)? {
+        None => Ok(()),
+        Some(reason) => Err(PrivateFileError::Insecure(reason)),
+    }
+}
+
+#[cfg(not(unix))]
+fn settle(dir: &Path) -> Result<(), PrivateFileError> {
+    let mut half_made = None;
+    for _ in 0..SETTLE_ATTEMPTS {
+        match access::check_directory(dir).map_err(PrivateFileError::Io)? {
+            None => return Ok(()),
+            Some(reason) if matches!(&reason, Insecurity::AccessList { .. }) => {
+                half_made = Some(reason);
+                std::thread::yield_now();
+            }
+            Some(reason) => return Err(PrivateFileError::Insecure(reason)),
+        }
+    }
+    Err(PrivateFileError::Insecure(half_made.expect(
+        "a half-made directory was found before the last attempt",
+    )))
+}
+
+/// Make `dir`, carrying the final mode from its first instant where the platform can.
+#[cfg(unix)]
+fn create_directory(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    fs::DirBuilder::new().mode(0o700).create(dir)
+}
+
+#[cfg(not(unix))]
+fn create_directory(dir: &Path) -> io::Result<()> {
+    fs::create_dir(dir)
 }
 
 /// Read at most `max` bytes from `file`, and answer the length the file claimed.

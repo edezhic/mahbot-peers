@@ -15,7 +15,6 @@
 //! and `tls::server_config` say why): the handshake after a withdrawal is a full one,
 //! the pin runs, and the key the far side presents is refused as untrusted.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use mahbot_peers::identity::PeerId;
@@ -29,13 +28,12 @@ use mahbot_peers::tls::PeerPolicy;
 
 use crate::beacon::TestBeacon;
 use crate::clock::block_on;
-use crate::machine::Machine;
 use crate::sim::Sim;
 
 use super::connection::Managed;
 use super::peer::NOW;
 use super::rights::{label, paired_machines, person, refused, wait_claim};
-use super::support::{io_error, within};
+use super::support::{io_error, spawn_keeper, within};
 
 /// The bytes a fact opens with: the offset of its version byte is this length.
 const FACT_MAGIC: &[u8] = b"mahbot-peer-binding";
@@ -62,14 +60,6 @@ fn fact_at(assistant: &Label, at: Timestamp) -> Result<Vec<u8>, String> {
         .fact()
         .encode()
         .map_err(|error| error.to_string())
-}
-
-/// Run the manager's keeper for `peer` on its own task, as a caller does.
-fn spawn_keeper(managed: &Managed, peer: &Machine) -> tokio::task::JoinHandle<Keeper> {
-    let connections = Arc::clone(&managed.connections);
-    let endpoint = managed.endpoint.clone();
-    let peer = peer.fingerprint();
-    tokio::spawn(async move { connections.keep_connected(&endpoint, &peer).await })
 }
 
 /// Wait until the pair holds no live connection, so the next dial is not judged by the

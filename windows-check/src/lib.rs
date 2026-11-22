@@ -14,6 +14,22 @@
 //!
 //! It proves the code compiles; it runs nothing. The reader and writer are exercised
 //! on a Windows host, and the capability inventory records that procedure.
+//!
+//! # The message layer is covered through the same gate
+//!
+//! `src/peer/messages/` holds no `#[cfg(windows)]` code and calls no access rule
+//! directly: its storage goes through `crate::private`, whose directory and file rule
+//! *is* `identity::access` — the module this crate compiles for both Windows targets. A
+//! queue's privacy on Windows is therefore decided by the code checked here, reached
+//! through `private::create_private_dir`, `private::create_private` (one lock file per
+//! peer's queue) and `private::open_private`, and no second include is added: the layer
+//! depends on `quinn`, `ring` and `rustls`, so its own sources cannot be checked for a
+//! Windows target on a host without the Windows headers. What that leaves unchecked is the
+//! layer's own logic — the queue's framing, the offer and the decision — which is not
+//! platform-specific, and the one branch `private` takes per platform: `create_private_dir`
+//! settles a half-made directory only where the platform applies the access list after the
+//! creation, and the Windows arm of that is reached by neither this crate nor a case on this
+//! host. What it does check is every access decision the layer makes.
 #![allow(dead_code)]
 // The library calls these; this crate only compiles them.
 // The included module's documentation links into `mahbot_peers`, which this crate is

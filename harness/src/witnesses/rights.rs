@@ -11,9 +11,9 @@ use std::time::Duration;
 use mahbot_peers::identity::PeerId;
 use mahbot_peers::peer::audit::{MAX_FILE_BYTES, RESERVED_FOR_PERSON_BYTES};
 use mahbot_peers::peer::{
-    Account, Act, AuditError, Authority, Binding, Capability, Claim, Decision, Entry, GrantKind,
-    Instance, Issuer, Label, NoFloor, Pair, PersonName, Question, Refusal, Rights, RightsError,
-    Speaker, Standing, Step, Timestamp, WriteRefusal,
+    Act, AuditError, Authority, Capability, Claim, Decision, Entry, GrantKind, Issuer, Label,
+    NoFloor, Pair, PersonName, Question, Refusal, Rights, RightsError, Speaker, Standing, Step,
+    Timestamp, WriteRefusal,
 };
 
 use crate::clock::block_on;
@@ -21,7 +21,7 @@ use crate::machine::Machine;
 use crate::sim::Sim;
 
 use super::peer::NOW;
-use super::support::{io_error, within};
+use super::support::{io_error, main_binding, pair, within};
 
 /// The assistant a case declares. The product's guest declaration changes no decision
 /// the crate makes, so the crate keeps the name alone; see `peer::access::Binding`.
@@ -31,21 +31,6 @@ pub(super) fn label(text: &str) -> Result<Label, String> {
 
 pub(super) fn person(name: &str) -> Result<PersonName, String> {
     PersonName::new(name).map_err(|error| error.to_string())
-}
-
-/// The pair of `machine`'s peer and the assistant the product names.
-fn pair(peer: &Machine, assistant: &Label) -> Pair {
-    Pair::new(peer.peer_id(), assistant)
-}
-
-/// The connection level a deciding machine records for `peer`.
-fn binding(assistant: &Label) -> Result<Binding, String> {
-    Ok(Binding::new(
-        Account::new("main-account").map_err(|error| error.to_string())?,
-        Instance::new("main-instance").map_err(|error| error.to_string())?,
-        assistant.clone(),
-        NOW,
-    ))
 }
 
 /// A question asked by a connection the handshake proved.
@@ -145,7 +130,7 @@ pub(crate) fn connection_binding_is_decided_by_one_machine() -> Result<(), Strin
         let rights = main.rights()?;
         // The deciding machine decides, and the default acts for the pair it makes.
         let issued = rights
-            .bind(&laptop.peer_id(), binding(&admin)?, NOW)
+            .bind(&laptop.peer_id(), main_binding(&admin)?, NOW)
             .map_err(|error| error.to_string())?;
         let Some(issued) = issued else {
             return Err("the default did not issue for the new pair".to_owned());
@@ -422,7 +407,7 @@ pub(crate) fn a_guest_assistant_gets_the_default_and_a_person_may_widen_it() -> 
         let rights = main.rights()?;
         let pair = pair(&laptop, &guest);
         rights
-            .bind(&laptop.peer_id(), binding(&guest)?, NOW)
+            .bind(&laptop.peer_id(), main_binding(&guest)?, NOW)
             .map_err(|error| error.to_string())?;
         // The binding names the assistant the product called a guest, and the
         // default it issued is the same single right every assistant gets.
@@ -1164,7 +1149,7 @@ pub(crate) fn a_moved_machine_starts_from_the_new_pairs_default() -> Result<(), 
         let pair_alpha = pair(&laptop, &alpha);
         let pair_beta = pair(&laptop, &beta);
         rights
-            .bind(&laptop.peer_id(), binding(&alpha)?, NOW)
+            .bind(&laptop.peer_id(), main_binding(&alpha)?, NOW)
             .map_err(|error| error.to_string())?
             .ok_or("the first binding did not issue the default")?;
         rights
@@ -1178,7 +1163,7 @@ pub(crate) fn a_moved_machine_starts_from_the_new_pairs_default() -> Result<(), 
             .map_err(|error| error.to_string())?;
         let at = NOW.plus(Duration::from_secs(1));
         let issued = rights
-            .bind(&laptop.peer_id(), binding(&beta)?, at)
+            .bind(&laptop.peer_id(), main_binding(&beta)?, at)
             .map_err(|error| error.to_string())?
             .ok_or("the new binding did not issue the default")?;
         if issued.capability() != Capability::WRITE {
@@ -1766,7 +1751,7 @@ pub(crate) fn a_question_for_a_pair_the_machine_left_is_refused() -> Result<(), 
         let egor = person("egor")?;
         let pair_alpha = pair(&laptop, &alpha);
         rights
-            .bind(&laptop.peer_id(), binding(&alpha)?, NOW)
+            .bind(&laptop.peer_id(), main_binding(&alpha)?, NOW)
             .map_err(|error| error.to_string())?
             .ok_or("the first binding did not issue the default")?;
         rights
@@ -1780,7 +1765,7 @@ pub(crate) fn a_question_for_a_pair_the_machine_left_is_refused() -> Result<(), 
             .map_err(|error| error.to_string())?;
         let at = NOW.plus(Duration::from_secs(1));
         rights
-            .bind(&laptop.peer_id(), binding(&beta)?, at)
+            .bind(&laptop.peer_id(), main_binding(&beta)?, at)
             .map_err(|error| error.to_string())?
             .ok_or("the new binding did not issue the default")?;
         let refusal = refused(
@@ -1840,7 +1825,7 @@ pub(crate) fn restoring_trust_issues_the_default_for_the_binding_pair() -> Resul
         let pair_alpha = pair(&laptop, &alpha);
         let pair_beta = pair(&laptop, &beta);
         rights
-            .bind(&laptop.peer_id(), binding(&alpha)?, NOW)
+            .bind(&laptop.peer_id(), main_binding(&alpha)?, NOW)
             .map_err(|error| error.to_string())?
             .ok_or("the binding did not issue the default")?;
         rights
@@ -2225,7 +2210,7 @@ fn field(tag: u8, body: &[u8]) -> Result<Vec<u8>, String> {
 /// entry last when the fill is about the room kept for a person's acts. The file is
 /// written through the machine's own storage handle, so the case stays inside the root
 /// the rig confines it to.
-fn fill_log(machine: &Machine, target: u64) -> Result<(), String> {
+pub(super) fn fill_log(machine: &Machine, target: u64) -> Result<(), String> {
     let storage = machine.storage();
     let whole = storage.read_audit().map_err(io_error)?;
     let frame = last_frame(&whole)?.to_vec();

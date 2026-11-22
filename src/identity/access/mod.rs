@@ -433,8 +433,8 @@ pub(crate) fn check(file: &File) -> std::io::Result<Option<Insecurity>> {
     }
 }
 
-/// Check a directory the crate owns — the peer-record directory — with the same
-/// owner-only rule as a key file.
+/// Check a directory the crate owns — the peer-record and message directories — with the
+/// same owner-only rule as a key file.
 ///
 /// On unix the mode, the owner and (on macOS) the extended list are read from a
 /// descriptor opened without following a link; on Windows the directory's access

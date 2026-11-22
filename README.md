@@ -2,12 +2,15 @@
 
 The peer layer between mahbot instances: machines connect directly, with no
 relay in the path, and remember each other by key. This crate is the network
-half — it knows keys, addresses and byte counts; the product knows people,
-accounts, rights, authorship and queues.
+half — it knows keys, addresses, byte counts, and the messages one machine
+queues for another; the product knows people, accounts, rights, what a message
+means and how it is shown.
 
 The crate holds the seams the rest of the layer is built on — identity and its key
 file, the QUIC transport over raw public keys, the beacon — and the peer layer above
-them. Delivery is not here yet; the connection level and the rights are.
+them. Delivery is here: a message is queued at its sender, offered over the pair's
+direct connection, decided by the receiver's rights and delivered at least once.
+Actions, files and the screen are not.
 
 ## What the crate provides
 
@@ -19,7 +22,7 @@ The library (`src/`) holds:
 | `tls` | TLS 1.3 with raw public keys (RFC 7250), pinned to the peer's fingerprint instead of a certificate chain, with a per-service ALPN and resumption off so the pin always runs |
 | `net` | endpoint construction over an injected datagram socket and an injected clock — no default for either |
 | `beacon` | the beacon: the closed message set (`wire`), the client half (`Beacon`, `Session`) — register, look an id up, learn the address observed on this path, hand a signed introduction over, take the ones pushed to a live session — and the one deadline combinator the client and the server share (`timeout`, whose documentation says why there is one copy and not two) |
-| `peer` | the peer layer: `record` is the durable memory of another machine, at both levels; `access` is the connection level's vocabulary — the account on the instance, the assistant, the pair, the four capabilities, the rights and the small versioned fact; `pair` the acquaintance ceremony, `connect` the per-machine connection manager, `presence` the registration refresh, `binding` the exchange that carries the connection level over a live connection, `rights` the decision, `audit` the record of what happened. Each is documented where it is enforced |
+| `peer` | the peer layer: `record` is the durable memory of another machine, at both levels; `access` is the connection level's vocabulary — the account on the instance, the assistant, the pair, the four capabilities, the rights and the small versioned fact; `pair` the acquaintance ceremony, `connect` the per-machine connection manager, `presence` the registration refresh, `binding` the exchange that carries the connection level over a live connection, `rights` the decision, `audit` the record of what happened, `messages` the queue a machine keeps for a peer and the offer it makes over the pair's own connection. Each is documented where it is enforced |
 
 The key-replacement invariant covers every shipped source: no `fs::rename`,
 `remove_dir` or `fs::copy` anywhere, and no write form in the identity module. The
@@ -202,10 +205,108 @@ log is never compacted, so what a peer's part loses stays lost. The record is re
 before every question, so a withdrawal by another process on the same root refuses the
 next question on this one. Every moment is the caller's; the crate reads no clock.
 
-The connection manager's rule for a fresh connection now reads the binding exchange as
-what it is: the manager's own handshake, not the pair's use. A connection that only
-exchanged its binding and then died carried nothing, and the keeper's strike rule
-applies to it.
+The connection manager's rule for a fresh connection reads the binding exchange and a
+message offer as what they are: the manager's own handshake and the sender's own act, not
+the pair's use. A connection that only exchanged its binding, or offered a message nobody
+took, and then died carried nothing, and the keeper's strike rule applies to it. A
+message the receiver took is the pair's use and clears the count, which is what keeps a
+machine holding one queued message from being re-dialled for ever.
+
+## The messages
+
+A message is a body and an envelope. The body is opaque bytes: the crate stores it as
+written, hands it over as written, and never reads it. No path leads from a body to a
+capability, and the invariant `messages.no_capability_from_a_body` scans the module to
+keep it that way: the one decision a message meets is `Rights::may_take_message`, whose
+inputs are the transport's peer, the host's floor and the moment, so nothing a body says can
+select a capability, ask a question or reach a grant. The envelope is a 16-byte identifier
+minted once at the sender, a count that starts at one for the first message to a peer and
+grows by one, and the moment the sender says it composed the message. The composed moment
+is a remark: nothing decides, orders or expires by it.
+
+The author is the connection's attested peer, never a field in the frame. A body that
+claims to be from someone else is text like any other; the product marks it and escapes
+it, as it already does for a guest's report, and a peer's name never becomes an account
+name anywhere the crate stores, shows or answers it.
+
+`Messages::send` publishes the message into this machine's queue for that peer before it
+returns, so a restart keeps it, and a queue holds at most `MAX_QUEUE` messages rather
+than dropping an older one. It refuses before writing anything when the record says the
+pair is not one to speak to: no pairing, a withdrawn trust, or a pair closed by three
+failed comparisons. `Messages::serve` runs once per paired peer: it offers the head of the
+queue over the pair's live direct connection, one bidirectional stream per offer, bounded
+by `MESSAGE_BUDGET`, and repeats until the receiver answers or the message expires. A
+connection that dies mid-offer costs a retry, not the message, and so does an offer nobody
+answers: the next one waits a round, so a peer that resets each offer stream costs a round a
+second rather than a spin through this machine's queue files. A queue this machine cannot
+read or write is not a queue with nothing in it — the service ends with that refusal and
+hands it to whoever started it, whether its own round met it or a receiving task it started.
+A product that runs only the services still has its queues swept: the service sweeps its own
+peer every `SWEEP_EVERY`, so the retention and a withdrawn trust take effect without the
+caller sweeping by hand. The queue waits while the pair is not one this machine may speak to:
+with the binding not yet arrived it says so and sends nothing, and with the pair's "write to
+me" not live it holds. Withdrawing trust in a machine drops that pair's queue with a record
+of it.
+
+A queue is rewritten whole, so a read-modify-publish holds that peer's lock file in
+`messages/` for the whole of itself: the self-update window's second process on a root
+cannot lose a message the first just queued, where the record merges and the log appends. The
+lock file is per peer, so two processes writing two peers never wait for each other; this
+process writes one queue at a time, so two peers written at the same instant wait for one
+write and its flush. The delivery sink runs with no lock held, so a slow caller delays that
+peer's later messages and no other peer's, and a drop's audit entry is appended between two
+short holdings of the queue rather than inside one, so the log's own lock is never taken while
+a peer's queue is held. A lock another writer holds is not waited on without a bound: the
+write answers `MessageError::Busy` and is retried, while a read does not need it — the queue is
+published by one rename, so a reader sees a whole file whatever a writer is doing. This
+process's own writer is the one wait a caller's disk decides: a second task writing a queue
+waits for it, and it is held across the whole read-modify-publish. Two waits in this layer are
+not the crate's to bound: the caller's own `Deliveries::deliver`, which runs synchronously
+inside the receiving task and holds that pair's receiving for as long as it takes, and the
+log's cross-process lock, which every append on the root takes — a blocked log delays every
+pair's entry, and no queue is held while it is waited for. Dropping a queue — after the
+retention, after a refusal, after a withdrawal — does not depend on the log taking the entry:
+the bodies go either way, and a drop that could not be recorded is better than bodies kept for
+a machine nobody trusts.
+
+The receiver asks the same question everything else asks, in the plan's order and with
+the same record of what happened — the host's floor included, and a floor refusal is not a
+withdrawal. On the machine that did not decide the binding, the claim names the pair and
+the receiver's own decision is the one that counts: a sender cannot see the peer's rights,
+so it offers and is answered. A refusal is of that message and not of the pair: it is
+recorded, the sender drops its copy, and the queue moves on. It travels as a class and not
+as a sentence — the receiver's words, the host's floor among them, stay on the receiver,
+and what the sender writes is this crate's own phrase. A message may arrive more than once:
+the receiver records the identifier as taken only after its caller's `Deliveries::deliver`
+returns `true`, so a caller that stores durably inside that call never loses one; a caller
+that cannot store — a full disk — answers `false` and is offered the message again, and a
+crash between the call and the record — or another writer holding the queue at that instant —
+delivers it twice, which is what at least once by construction means. A caller whose
+`deliver` panics ends the service with that bug named and the message still queued, rather
+than leaving the pair silent; a frame the receiver cannot read — bytes that are not a
+message, or one longer than any message this build writes — is answered as unreadable, so
+the sender drops it instead of keeping it for the retention.
+
+Only a remembered identifier suppresses a message. One the receiver already took is answered
+`already taken`: by the peer's own account it reached a caller, so the sender drops its copy
+and records nothing — and the peer is the only one who can say so. Every other identifier is
+delivered, whatever its count. The taken identifiers are durable for about a week and bounded
+in number, so past that week the same message can be delivered twice: that is what remembering
+by identifier costs, and it is stated rather than hidden. The sender's count is durable beside
+its queue. Messages from one machine arrive in the order of the sender's count, and a count
+that jumps is declared to the caller as a `Gap` — the number missing when it jumps forward,
+and a rewind when it does not move forward: a sender whose queue was lost starts again from
+one, or a retry lands after its identifier was forgotten. A count is never renumbered,
+silently continued, or the reason a message is destroyed; across pairs no order is promised.
+
+A receiver takes at most `MAX_OFFERS_PER_WINDOW` offers from one peer per `MESSAGE_WINDOW`
+and answers the rest with a delay the sender waits out, clamped to one window so a peer
+that names a century is not believed. A throttle is not a refusal: no right changes and
+nothing is recorded against the pair. A refusal a peer does cause is written in the log's
+peer part, which stops at its reserve, so a flood cannot take the room a person's own acts
+need. A body is at most `MAX_BODY_BYTES`, and a message untaken after `MESSAGE_RETENTION`
+is dropped and the drop recorded. The beacon carries no message: a message travels only on
+the pair's own connection, and the beacon's memory holds registrations and nothing else.
 
 ## The server
 
@@ -293,6 +394,11 @@ The harness (`harness/`, never published) is the test rig:
   version check and the introduction's signature are exercised against the real
   server. A killed beacon is a process that is gone: the link stops delivering to
   its address, so a client only learns from its own bound.
+- **Message rig.** `Messaging` opens a machine's message layer over its own root, with
+  a moment read from the simulated clock and a sink that keeps what the receiver's
+  caller was handed; `serve` starts the layer's per-peer task and the rig stops it on
+  drop. A case that has to count the answers offers by hand on the pair's live
+  connection; a case that proves the queue runs the real service and reads the sink.
 - **Witnesses and invariants.** The capability inventory and the cross-cutting
   invariant table live here, together with the checks that enforce them: every
   entry is either witnessed by a recorded case or marked unproducible with the
