@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use mahbot_peers::beacon::{Introduction, Session};
 use mahbot_peers::peer::pair::{self, Ceremony, Opening, Outcome};
-use mahbot_peers::peer::record::Malformed;
 use mahbot_peers::peer::{
-    ConnectFailure, Connections, Limits, NotTrustedCause, RecordError, RecordStore, Timestamp,
+    ConnectFailure, Connections, Limits, Malformed, NotTrustedCause, RecordError, RecordStore,
+    Rights, Timestamp,
 };
 
 use crate::beacon::TestBeacon;
@@ -20,6 +20,7 @@ use crate::machine::Machine;
 use crate::pair::Mediator;
 use crate::sim::Sim;
 
+use super::rights::person;
 use super::support::{BUDGET, io_error, within};
 
 /// A moment a case uses; the library never reads one.
@@ -137,24 +138,6 @@ pub(super) async fn pair_together(
     ))
 }
 
-/// Write a file a record reader will judge by its bytes, not by its mode.
-///
-/// A plain write creates 0644 on unix, which the reader refuses before it parses
-/// anything; a temporary file beside the destination is created 0600 and published
-/// by one rename, exactly as a record is.
-fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
-    use std::io::Write as _;
-    let dir = path.parent().ok_or("a record path has a directory")?;
-    let mut temp = tempfile::Builder::new()
-        .prefix(".case.")
-        .tempfile_in(dir)
-        .map_err(io_error)?;
-    temp.write_all(bytes).map_err(io_error)?;
-    temp.persist(path)
-        .map_err(|error| error.error.to_string())?;
-    Ok(())
-}
-
 pub(super) fn paired(outcome: &Result<Outcome, String>) -> bool {
     matches!(outcome, Ok(Outcome::Paired { .. }))
 }
@@ -195,7 +178,10 @@ pub(crate) fn peer_record_round_trips() -> Result<(), String> {
         }
         // The fingerprint is not a second fact in the file: its 44 bytes are not
         // there, and the 32-byte key is.
-        let bytes = std::fs::read(store.path_for(&peer.peer_id())).map_err(io_error)?;
+        let bytes = machine
+            .storage()
+            .read_record(&peer.peer_id())
+            .map_err(io_error)?;
         if bytes
             .windows(record.fingerprint().as_bytes().len())
             .any(|window| window == record.fingerprint().as_bytes())
@@ -244,7 +230,6 @@ pub(crate) fn peer_record_round_trips() -> Result<(), String> {
 #[cfg(unix)]
 pub(crate) fn peer_record_refuses_other_readers() -> Result<(), String> {
     block_on(async {
-        use std::os::unix::fs::PermissionsExt;
         let sim = Sim::new().map_err(io_error)?;
         let machine = sim.machine().map_err(io_error)?;
         let peer = sim.machine().map_err(io_error)?;
@@ -252,13 +237,25 @@ pub(crate) fn peer_record_refuses_other_readers() -> Result<(), String> {
         store
             .record_pairing(&peer.peer_id(), NOW)
             .map_err(|error| error.to_string())?;
-        let path = store.path_for(&peer.peer_id());
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+        machine
+            .storage()
+            .set_record_mode(&peer.peer_id(), 0o644)
             .map_err(io_error)?;
         match machine.reopen_records() {
-            Err(error) if error.contains("not private") => Ok(()),
-            Err(error) => Err(format!("the insecure record reads `{error}`")),
-            Ok(_) => Err("a record readable by others was accepted".to_owned()),
+            Err(error) if error.contains("not private") => {}
+            Err(error) => return Err(format!("the insecure record reads `{error}`")),
+            Ok(_) => return Err("a record readable by others was accepted".to_owned()),
+        }
+        // The repair a person runs reaches a record the store refuses: naming the file
+        // does not open the store, so the mode can be put back.
+        machine
+            .storage()
+            .set_record_mode(&peer.peer_id(), 0o600)
+            .map_err(io_error)?;
+        match machine.reopen_records() {
+            Ok(store) if store.is_paired(&peer.peer_id()) => Ok(()),
+            Ok(_) => Err("a repaired record lost its pairing".to_owned()),
+            Err(error) => Err(format!("a repaired record reads `{error}`")),
         }
     })
 }
@@ -266,7 +263,6 @@ pub(crate) fn peer_record_refuses_other_readers() -> Result<(), String> {
 #[cfg(unix)]
 pub(crate) fn peer_record_refuses_other_writers() -> Result<(), String> {
     block_on(async {
-        use std::os::unix::fs::PermissionsExt;
         let sim = Sim::new().map_err(io_error)?;
         let machine = sim.machine().map_err(io_error)?;
         let peer = sim.machine().map_err(io_error)?;
@@ -274,18 +270,26 @@ pub(crate) fn peer_record_refuses_other_writers() -> Result<(), String> {
         store
             .record_pairing(&peer.peer_id(), NOW)
             .map_err(|error| error.to_string())?;
-        let dir = store
-            .path_for(&peer.peer_id())
-            .parent()
-            .ok_or("a record path has a directory")?
-            .to_owned();
         // A directory another account can write lets it delete a record, which is a
         // silent un-pairing: the store refuses it as it refuses an insecure file.
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).map_err(io_error)?;
+        machine
+            .storage()
+            .set_records_dir_mode(0o777)
+            .map_err(io_error)?;
         match machine.reopen_records() {
-            Err(error) if error.contains("not private") => Ok(()),
-            Err(error) => Err(format!("the insecure directory reads `{error}`")),
-            Ok(_) => Err("a record directory writable by others was accepted".to_owned()),
+            Err(error) if error.contains("not private") => {}
+            Err(error) => return Err(format!("the insecure directory reads `{error}`")),
+            Ok(_) => return Err("a record directory writable by others was accepted".to_owned()),
+        }
+        // The repair reaches the directory the store refuses, as it reaches a record.
+        machine
+            .storage()
+            .set_records_dir_mode(0o700)
+            .map_err(io_error)?;
+        match machine.reopen_records() {
+            Ok(store) if store.is_paired(&peer.peer_id()) => Ok(()),
+            Ok(_) => Err("a repaired directory lost its pairing".to_owned()),
+            Err(error) => Err(format!("a repaired directory reads `{error}`")),
         }
     })
 }
@@ -342,7 +346,7 @@ pub(crate) fn peer_record_refuses_garbage() -> Result<(), String> {
             .machine()
             .map_err(io_error)?
             .peer_id();
-        let path = store.path_for(&peer);
+        let path = RecordStore::path_for(root.path(), &peer);
         drop(store);
 
         type Case = (&'static str, Vec<u8>, fn(&Malformed) -> bool);
@@ -374,7 +378,7 @@ pub(crate) fn peer_record_refuses_garbage() -> Result<(), String> {
             ),
         ];
         for (what, bytes, expected) in cases {
-            write_private(&path, &bytes)?;
+            crate::root::write_private(&path, &bytes).map_err(io_error)?;
             let Err(error) = RecordStore::open(root.path(), Limits::default()) else {
                 return Err(format!("{what} was read as a record"));
             };
@@ -392,11 +396,8 @@ pub(crate) fn peer_record_refuses_garbage() -> Result<(), String> {
         // The name's spelling is part of the format: one peer, one file. The
         // lowercase file from the last case goes, so only the name is judged.
         std::fs::remove_file(&path).map_err(io_error)?;
-        let upper = root
-            .path()
-            .join("peers")
-            .join(format!("{}.record", "AB".repeat(32)));
-        write_private(&upper, b"not a record")?;
+        let upper = path.with_file_name(format!("{}.record", "AB".repeat(32)));
+        crate::root::write_private(&upper, b"not a record").map_err(io_error)?;
         match RecordStore::open(root.path(), Limits::default()) {
             Err(RecordError::Malformed {
                 reason: Malformed::Name { .. },
@@ -418,12 +419,14 @@ pub(crate) fn peer_record_reads_unknown_fields() -> Result<(), String> {
         store
             .record_pairing(&peer.peer_id(), NOW)
             .map_err(|error| error.to_string())?;
-        let path = store.path_for(&peer.peer_id());
         // A newer build: a higher version and a field this one does not know.
-        let mut bytes = std::fs::read(&path).map_err(io_error)?;
+        let storage = machine.storage();
+        let mut bytes = storage.read_record(&peer.peer_id()).map_err(io_error)?;
         bytes[b"mahbot-peer-record".len()] = 2;
         bytes.extend_from_slice(&[0x7f, 0x00, 0x03, 0xde, 0xad, 0xbe]);
-        std::fs::write(&path, &bytes).map_err(io_error)?;
+        storage
+            .write_record(&peer.peer_id(), &bytes)
+            .map_err(io_error)?;
 
         let store = machine.reopen_records()?;
         let record = store
@@ -439,7 +442,7 @@ pub(crate) fn peer_record_reads_unknown_fields() -> Result<(), String> {
                 std::net::SocketAddr::from(([10, 0, 0, 1], 1)),
             )
             .map_err(|error| error.to_string())?;
-        let rewritten = std::fs::read(&path).map_err(io_error)?;
+        let rewritten = storage.read_record(&peer.peer_id()).map_err(io_error)?;
         if !rewritten
             .windows(3)
             .any(|window| window == [0xde, 0xad, 0xbe])
@@ -472,9 +475,12 @@ pub(crate) fn peer_record_never_unpairs() -> Result<(), String> {
                 std::net::SocketAddr::from(([10, 0, 0, 2], 2)),
             )
             .map_err(|error| error.to_string())?;
-        let record = store
+        store
             .record_failure(&peer.peer_id())
             .map_err(|error| error.to_string())?;
+        let record = store
+            .get(&peer.peer_id())
+            .ok_or("the record a failure was counted in is gone")?;
         if !record.is_paired() || record.paired_at() != Some(NOW) {
             return Err("a later write dropped the pairing or re-dated it".to_owned());
         }
@@ -702,7 +708,10 @@ pub(crate) fn pairing_is_repeatable_until_both_hold() -> Result<(), String> {
             return Err("the first ceremony did not pair both sides".to_owned());
         }
         // One side loses its record, as a restored backup or a deleted file does.
-        std::fs::remove_file(right_store.path_for(&left.peer_id())).map_err(io_error)?;
+        right
+            .storage()
+            .remove_record(&left.peer_id())
+            .map_err(io_error)?;
         right_store.reload().map_err(|error| error.to_string())?;
         if right_store.is_paired(&left.peer_id()) {
             return Err("the removed record was still trusted".to_owned());
@@ -878,9 +887,9 @@ pub(crate) fn pairing_closes_after_three_rejections() -> Result<(), String> {
             }) => {}
             other => return Err(format!("a closed pair connected as {other:?}")),
         }
-        // A person clears it on this machine.
-        left_store
-            .clear(&right.peer_id())
+        // A person clears it on this machine, through the audited act.
+        Rights::new(left_store.clone(), left.audit()?)
+            .clear_attempt_lock(&right.peer_id(), person("egor")?, NOW)
             .map_err(|error| error.to_string())?;
         if left_store.is_closed(&right.peer_id()) {
             return Err("a person's clear did not reopen the pair".to_owned());
@@ -1680,6 +1689,57 @@ pub(crate) fn pairing_attempt_expiry_is_its_own_failure() -> Result<(), String> 
     })
 }
 
+/// A right that says it ended and names no term is not a row this build can read: the
+/// decision's moment is the term's end, so the shape is refused where it is decoded
+/// rather than left to be answered from a row that has no moment to name.
+pub(crate) fn an_ending_without_a_term_is_not_a_record() -> Result<(), String> {
+    block_on(async {
+        let sim = Sim::new().map_err(io_error)?;
+        let machine = sim.machine().map_err(io_error)?;
+        let peer = sim.machine().map_err(io_error)?;
+        // `[capability][label][term][issuer][withdrawn][ended]`, with the term absent and
+        // the ending present: a shape this build never writes.
+        let mut body = vec![1u8];
+        body.extend_from_slice(&5u16.to_be_bytes());
+        body.extend_from_slice(b"admin");
+        body.push(0);
+        body.push(1);
+        body.push(0);
+        body.push(1);
+        body.extend_from_slice(&NOW.unix_seconds().to_be_bytes());
+        let mut record = b"mahbot-peer-record".to_vec();
+        record.push(1);
+        record.extend_from_slice(&[0x01, 0x00, 0x20]);
+        record.extend_from_slice(peer.peer_id().as_bytes());
+        record.push(0x0a);
+        record.extend_from_slice(
+            &u16::try_from(body.len())
+                .map_err(|_| "the right is too long to frame".to_owned())?
+                .to_be_bytes(),
+        );
+        record.extend_from_slice(&body);
+        let storage = machine.storage();
+        storage
+            .write_record(&peer.peer_id(), &record)
+            .map_err(io_error)?;
+        match storage.records_typed() {
+            Err(RecordError::Malformed {
+                reason: Malformed::Field { tag: 0x0a, detail },
+                ..
+            }) => {
+                if !detail.contains("no term") {
+                    return Err(format!("the refusal reads `{detail}`, not a missing term"));
+                }
+                Ok(())
+            }
+            Err(error) => Err(format!(
+                "the ending without a term was refused as `{error}`"
+            )),
+            Ok(_) => Err("a right that ended without a term was read as a record".to_owned()),
+        }
+    })
+}
+
 /// A write that would cross the record's size cap is refused before it lands.
 pub(crate) fn peer_record_refuses_an_oversized_write() -> Result<(), String> {
     block_on(async {
@@ -1690,19 +1750,30 @@ pub(crate) fn peer_record_refuses_an_oversized_write() -> Result<(), String> {
         store
             .record_pairing(&peer.peer_id(), NOW)
             .map_err(|error| error.to_string())?;
-        let path = store.path_for(&peer.peer_id());
         // Pad the record with an unknown field to just under the cap, as a newer
         // build could: the address field this build adds would cross it.
-        let mut bytes = std::fs::read(&path).map_err(io_error)?;
-        let pad = 4090usize
+        let mut bytes = machine
+            .storage()
+            .read_record(&peer.peer_id())
+            .map_err(io_error)?;
+        let cap = usize::try_from(mahbot_peers::peer::record::MAX_RECORD_BYTES)
+            .expect("the cap fits usize");
+        let pad = cap
+            .saturating_sub(6)
             .checked_sub(bytes.len() + 3)
             .ok_or("the base record is already near the cap")?;
         bytes.push(0x7f);
         bytes.extend_from_slice(&u16::try_from(pad).expect("a small pad").to_be_bytes());
         bytes.resize(bytes.len() + pad, 0xaa);
-        write_private(&path, &bytes)?;
+        machine
+            .storage()
+            .write_record(&peer.peer_id(), &bytes)
+            .map_err(io_error)?;
         let store = machine.reopen_records()?;
-        let before = std::fs::read(&path).map_err(io_error)?;
+        let before = machine
+            .storage()
+            .read_record(&peer.peer_id())
+            .map_err(io_error)?;
         match store.record_address(
             &peer.peer_id(),
             std::net::SocketAddr::from(([10, 0, 0, 1], 1)),
@@ -1710,7 +1781,12 @@ pub(crate) fn peer_record_refuses_an_oversized_write() -> Result<(), String> {
             Err(RecordError::TooLarge { .. }) => {}
             other => return Err(format!("an oversized write reads {other:?}")),
         }
-        if std::fs::read(&path).map_err(io_error)? != before {
+        if machine
+            .storage()
+            .read_record(&peer.peer_id())
+            .map_err(io_error)?
+            != before
+        {
             return Err("a refused write changed the file".to_owned());
         }
         // The file is still a record this build opens.
@@ -1732,14 +1808,10 @@ pub(crate) fn peer_record_refuses_a_symlinked_directory() -> Result<(), String> 
         store
             .record_pairing(&peer.peer_id(), NOW)
             .map_err(|error| error.to_string())?;
-        let dir = store
-            .path_for(&peer.peer_id())
-            .parent()
-            .ok_or("a record path has a directory")?
-            .to_owned();
-        let elsewhere = dir.with_file_name("peers-elsewhere");
-        std::fs::rename(&dir, &elsewhere).map_err(io_error)?;
-        std::os::unix::fs::symlink(&elsewhere, &dir).map_err(io_error)?;
+        machine
+            .storage()
+            .replace_records_dir_with_a_link()
+            .map_err(io_error)?;
         match machine.reopen_records() {
             Err(error) if error.contains("symbolic link") => Ok(()),
             Err(error) => Err(format!("the symlinked directory reads `{error}`")),
@@ -1755,25 +1827,33 @@ pub(crate) fn peer_record_drops_an_empty_attempt() -> Result<(), String> {
         let machine = sim.machine().map_err(io_error)?;
         let stranger = sim.machine().map_err(io_error)?;
         let store = machine.records();
-        let path = store.path_for(&stranger.peer_id());
+        let exists = || {
+            machine
+                .storage()
+                .record_exists(&stranger.peer_id())
+                .map_err(io_error)
+        };
         store
             .begin_attempt(&stranger.peer_id(), NOW)
             .map_err(|error| error.to_string())?;
-        if !path.exists() {
+        if !exists()? {
             return Err("an attempt on an unknown peer wrote no record".to_owned());
         }
         store
             .end_attempt(&stranger.peer_id())
             .map_err(|error| error.to_string())?;
-        if store.get(&stranger.peer_id()).is_some() || path.exists() {
+        if store.get(&stranger.peer_id()).is_some() || exists()? {
             return Err("an attempt that ended left an empty record behind".to_owned());
         }
-        // A person's clear on a peer this machine remembers nothing about creates
-        // nothing either.
-        store
-            .clear(&stranger.peer_id())
-            .map_err(|error| error.to_string())?;
-        if store.get(&stranger.peer_id()).is_some() || path.exists() {
+        // A person's clear on a peer this machine remembers nothing about is refused
+        // and creates nothing either.
+        let rights = Rights::new(store.clone(), machine.audit()?);
+        match rights.clear_attempt_lock(&stranger.peer_id(), person("egor")?, NOW) {
+            Err(mahbot_peers::peer::RightsError::NotPaired { peer })
+                if peer == stranger.peer_id() => {}
+            other => return Err(format!("a clear on an unknown peer reads {other:?}")),
+        }
+        if store.get(&stranger.peer_id()).is_some() || exists()? {
             return Err("a clear fabricated a record".to_owned());
         }
         // A rejected peer whose only facts were the failures and the attempt is
@@ -1784,10 +1864,10 @@ pub(crate) fn peer_record_drops_an_empty_attempt() -> Result<(), String> {
         store
             .begin_attempt(&stranger.peer_id(), NOW)
             .map_err(|error| error.to_string())?;
-        store
-            .clear(&stranger.peer_id())
+        rights
+            .clear_attempt_lock(&stranger.peer_id(), person("egor")?, NOW)
             .map_err(|error| error.to_string())?;
-        if store.get(&stranger.peer_id()).is_some() || path.exists() {
+        if store.get(&stranger.peer_id()).is_some() || exists()? {
             return Err("a clear published an empty record".to_owned());
         }
         // A record with something worth keeping is not removed.
@@ -1800,7 +1880,7 @@ pub(crate) fn peer_record_drops_an_empty_attempt() -> Result<(), String> {
         store
             .end_attempt(&stranger.peer_id())
             .map_err(|error| error.to_string())?;
-        if !store.is_paired(&stranger.peer_id()) || !path.exists() {
+        if !store.is_paired(&stranger.peer_id()) || !exists()? {
             return Err("ending an attempt removed a pairing".to_owned());
         }
         Ok(())
@@ -1970,16 +2050,10 @@ pub(crate) fn peer_record_requires_its_root() -> Result<(), String> {
 /// A `peers/` directory this crate creates is private before it is read.
 #[cfg(unix)]
 pub(crate) fn peer_record_creates_a_private_directory() -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let root = super::support::temp_root()?;
-    drop(RecordStore::open(root.path(), Limits::default()).map_err(|error| error.to_string())?);
-    let dir = root.path().join("peers");
-    let mode = std::fs::metadata(&dir)
-        .map_err(io_error)?
-        .permissions()
-        .mode()
-        & 0o777;
+    let sim = Sim::new().map_err(io_error)?;
+    let machine = sim.machine().map_err(io_error)?;
+    drop(machine.records());
+    let mode = machine.storage().records_dir_mode().map_err(io_error)?;
     if mode != 0o700 {
         return Err(format!("the created directory has mode {mode:o}"));
     }
@@ -1990,8 +2064,6 @@ pub(crate) fn peer_record_creates_a_private_directory() -> Result<(), String> {
 /// search but not write still opens and reads what it holds.
 #[cfg(unix)]
 pub(crate) fn peer_record_opens_a_read_only_directory() -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-
     let sim = Sim::new().map_err(io_error)?;
     let machine = sim.machine().map_err(io_error)?;
     let peer = sim.machine().map_err(io_error)?;
@@ -1999,15 +2071,11 @@ pub(crate) fn peer_record_opens_a_read_only_directory() -> Result<(), String> {
     store
         .record_pairing(&peer.peer_id(), NOW)
         .map_err(|error| error.to_string())?;
-    let dir = store
-        .path_for(&peer.peer_id())
-        .parent()
-        .ok_or("a record path has a directory")?
-        .to_owned();
     drop(store);
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).map_err(io_error)?;
+    let storage = machine.storage();
+    storage.set_records_dir_mode(0o500).map_err(io_error)?;
     let reopened = machine.reopen_records();
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).map_err(io_error)?;
+    storage.set_records_dir_mode(0o700).map_err(io_error)?;
     let reopened = reopened?;
     if !reopened.is_paired(&peer.peer_id()) {
         return Err("a read-only records directory lost its pairing".to_owned());
@@ -2048,15 +2116,20 @@ pub(crate) fn peer_record_drops_expired_attempts() -> Result<(), String> {
         store
             .record_failure(&paired.peer_id())
             .map_err(|error| error.to_string())?;
-        let expired_path = store.path_for(&expired.peer_id());
-        if !expired_path.exists() {
+        let expired_exists = || {
+            machine
+                .storage()
+                .record_exists(&expired.peer_id())
+                .map_err(io_error)
+        };
+        if !expired_exists()? {
             return Err("the attempt wrote no record".to_owned());
         }
 
         store
             .prune_expired(NOW.plus(Duration::from_secs(2)))
             .map_err(|error| error.to_string())?;
-        if store.get(&expired.peer_id()).is_some() || expired_path.exists() {
+        if store.get(&expired.peer_id()).is_some() || expired_exists()? {
             return Err("an expired attempt-only record survived the prune".to_owned());
         }
         if store
@@ -2123,15 +2196,20 @@ pub(crate) fn peer_record_drops_expired_attempts() -> Result<(), String> {
         short
             .begin_attempt(&doomed.peer_id(), NOW)
             .map_err(|error| error.to_string())?;
-        let bad_path = short.path_for(&unreadable.peer_id());
-        write_private(&bad_path, b"not a record")?;
+        let storage = machine.storage();
+        storage
+            .write_record(&unreadable.peer_id(), b"not a record")
+            .map_err(io_error)?;
+        let bad_name = storage
+            .record_name(&unreadable.peer_id())
+            .map_err(io_error)?;
         let Err(error) = short.prune_expired(NOW.plus(Duration::from_secs(2))) else {
             return Err("the prune read a garbage record as a record".to_owned());
         };
-        if !error.to_string().contains(&bad_path.display().to_string()) {
+        if !error.to_string().contains(&bad_name) {
             return Err(format!("the refusal does not name the file: {error}"));
         }
-        if short.path_for(&doomed.peer_id()).exists() {
+        if storage.record_exists(&doomed.peer_id()).map_err(io_error)? {
             return Err("the sweep stopped at the unreadable record".to_owned());
         }
         Ok(())

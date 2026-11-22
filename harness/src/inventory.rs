@@ -373,6 +373,59 @@ fn platform_capabilities() -> Vec<Capability> {
             PEER_RECORD_SYMLINK_HOW,
         )
     };
+    let audit_before_effect = if cfg!(unix) {
+        Capability::witnessed(
+            "library.peer.audit.before_effect",
+            AUDIT_BEFORE_EFFECT_CLAIM,
+        )
+        .with_procedure(AUDIT_BEFORE_EFFECT_HOW)
+    } else {
+        Capability::unproducible(
+            "library.peer.audit.before_effect",
+            AUDIT_BEFORE_EFFECT_CLAIM,
+            "the case makes the record write fail by closing a directory to writes with a unix mode: this host has no mode bits, and the access-list state it would need instead has its own entry (`library.peer.record.windows_dacl`)",
+            AUDIT_BEFORE_EFFECT_HOW,
+        )
+    };
+    let audit_private = if cfg!(unix) {
+        Capability::witnessed("library.peer.audit.private", AUDIT_PRIVATE_CLAIM)
+            .with_procedure(AUDIT_PRIVATE_HOW)
+    } else {
+        Capability::unproducible(
+            "library.peer.audit.private",
+            AUDIT_PRIVATE_CLAIM,
+            "the case sets a unix mode on the log: this host has no mode bits, and the access-list state it would need instead has its own entry (`library.peer.audit.windows_dacl`)",
+            AUDIT_PRIVATE_HOW,
+        )
+    };
+    let audit_private_on_write = if cfg!(unix) {
+        Capability::witnessed(
+            "library.peer.audit.private_on_write",
+            AUDIT_PRIVATE_ON_WRITE_CLAIM,
+        )
+        .with_procedure(AUDIT_PRIVATE_ON_WRITE_HOW)
+    } else {
+        Capability::unproducible(
+            "library.peer.audit.private_on_write",
+            AUDIT_PRIVATE_ON_WRITE_CLAIM,
+            "the case sets a unix mode on the log between two appends: this host has no mode bits, and the access-list state it would need instead has its own entry (`library.peer.audit.windows_dacl`)",
+            AUDIT_PRIVATE_ON_WRITE_HOW,
+        )
+    };
+    let unreadable_record = if cfg!(unix) {
+        Capability::witnessed(
+            "library.peer.connect.unreadable_record",
+            UNREADABLE_RECORD_CLAIM,
+        )
+        .with_procedure(UNREADABLE_RECORD_HOW)
+    } else {
+        Capability::unproducible(
+            "library.peer.connect.unreadable_record",
+            UNREADABLE_RECORD_CLAIM,
+            "the case makes a record unreadable by loosening its unix mode: this host has no mode bits, and the access-list state it would need instead has its own entry (`library.peer.record.windows_dacl`)",
+            UNREADABLE_RECORD_HOW,
+        )
+    };
     vec![
         insecure_file,
         extended_acl,
@@ -380,6 +433,10 @@ fn platform_capabilities() -> Vec<Capability> {
         unix_names,
         peer_record_insecure,
         peer_record_insecure_dir,
+        audit_before_effect,
+        audit_private,
+        audit_private_on_write,
+        unreadable_record,
         peer_record_private_dir,
         peer_record_read_only,
         peer_record_symlink,
@@ -428,6 +485,30 @@ const EXTENDED_ACL_CLAIM: &str = "the macOS reader refuses a 0600 key file that 
 
 /// The claim about a storage root whose access list a new key file inherits.
 const ROOT_ACCESS_LIST_CLAIM: &str = "a storage root whose access list a new key file inherits is refused before a key is minted, with the root named and nothing left behind, and clearing that list gives the root an identity";
+
+/// The claim about the order of an act's two writes.
+const AUDIT_BEFORE_EFFECT_CLAIM: &str = "a grant is appended to the log before the record changes, so a record write that fails leaves the act recorded and the right unwritten, never the reverse";
+
+/// What a host that can produce [`AUDIT_BEFORE_EFFECT_CLAIM`] does.
+const AUDIT_BEFORE_EFFECT_HOW: &str = "In a scratch root, run the case `the_audit_is_written_before_the_record_changes` (`cargo test -p mahbot-peers-harness` on a unix host runs it): it closes the record's directory to writes with `chmod 555`, grants a right, sees the record write fail, and reads the log — the grant is there and the right is not; `chmod 700` on the same directory restores it.";
+
+/// The claim about an audit log another account can read.
+const AUDIT_PRIVATE_CLAIM: &str = "an audit log whose mode lets group or other read it is refused as insecure, with a message naming the file, and never trusted";
+
+/// What a host that can produce [`AUDIT_PRIVATE_CLAIM`] does.
+const AUDIT_PRIVATE_HOW: &str = "In a scratch root, run the case `the_audit_is_private_to_the_account` (`cargo test -p mahbot-peers-harness` on a unix host runs it): it writes one entry, `chmod 644` on `audit.log` in the scratch root, and opens the log again, which refuses with `is not private`. `chmod 600` on the same file in the same scratch root makes the same log open and the entry readable.";
+
+/// The claim about the audit's privacy being re-checked on every append.
+const AUDIT_PRIVATE_ON_WRITE_CLAIM: &str = "the audit log re-checks its privacy on every append, on the descriptor it writes through, so a log another account can read refuses the next append naming the file, and restoring its owner-only mode lets the one after it land";
+
+/// What a host that can produce [`AUDIT_PRIVATE_ON_WRITE_CLAIM`] does.
+const AUDIT_PRIVATE_ON_WRITE_HOW: &str = "In a scratch root, run the case `the_audit_rechecks_privacy_on_every_append` (`cargo test -p mahbot-peers-harness` on a unix host runs it): it opens the log and appends one entry, `chmod 644` on `audit.log` in the scratch root, and appends again, which refuses with `is not private` and names the file. `chmod 600` on the same file in the same scratch root makes the next append land and the entry readable.";
+
+/// The claim about a record that is there and cannot be read.
+const UNREADABLE_RECORD_CLAIM: &str = "a peer record that is present and cannot be read is refused as its own cause, naming the file, and is never reported as a machine this one never paired; the handshake fails closed over it too";
+
+/// What a host that can produce [`UNREADABLE_RECORD_CLAIM`] does.
+const UNREADABLE_RECORD_HOW: &str = "In a scratch root, run the case `an_unreadable_record_is_not_an_unpaired_machine` (`cargo test -p mahbot-peers-harness` on a unix host runs it): it pairs two machines, `chmod 644` on the peer's record file in the scratch root, and dials, which refuses with `not trusted: its record cannot be read` and names the record. `chmod 600` on the same file in the same scratch root makes the same dial connect.";
 
 /// The claim about the login names a unix ownership refusal adds to the numbers.
 const UNIX_NAMES_CLAIM: &str = "a unix ownership refusal names both accounts by login name and number, and reports the number alone when the platform has no name for it";
@@ -902,6 +983,196 @@ const CAPABILITIES: &[Capability] = &[
         "two machines that ran a real ceremony reconnect after one restarts over its own root: the pairing survives, no new ceremony runs, and the beacon's answer supplies the fresh address",
     ),
     Capability::witnessed(
+        "library.peer.access.binding",
+        "the machine that decides the connection level records which account on which instance and which assistant it bound the peer to, durably across a restart, and the other side is shown that fact as a claim over the direct connection",
+    ),
+    Capability::witnessed(
+        "library.peer.access.claim_not_authority",
+        "a claim names the pair for the other machine's person and allows nothing on its strength: the decision on that pair refuses for want of a right",
+    ),
+    Capability::witnessed(
+        "library.peer.rights.default_write",
+        "a pair's acquaintance issues exactly one right, `write to me` by the default, and the audit's last entry records that grant as created",
+    ),
+    Capability::witnessed(
+        "library.peer.rights.default_once",
+        "the default acts once per pair: a second acquaintance issues nothing, and neither a right a person withdrew nor one whose term passed is re-created by it",
+    ),
+    Capability::witnessed(
+        "library.peer.rights.guest_widened",
+        "the default is one right for every assistant — the plan's guest floor, so a guest is never defaulted `work to me` or `see the screen` — and a person may widen it with a right the log records as issued by that person; the crate stores the assistant's name and not the product's guest declaration, which changes no decision it makes",
+    ),
+    Capability::witnessed(
+        "library.peer.rights.withdrawn",
+        "a right a person withdrew refuses the next question with the withdrawal's exact moment at the right step, stays on file as withdrawn, and is recorded with the person's name",
+    ),
+    Capability::witnessed(
+        "library.peer.rights.ended",
+        "a right whose term passed refuses with the term's moment at the right step however often it is asked, the ending is recorded once by the question and not again by the sweep, and a person's later grant restores it as a restore",
+    ),
+    Capability::witnessed(
+        "library.peer.rights.floor",
+        "the host's floor refuses a right that exists without withdrawing it, is recorded as a refusal rather than a withdrawal, keeps a right it does not name, and cannot add a right the pair never held",
+    ),
+    Capability::witnessed(
+        "library.peer.rights.remote_write",
+        "a write attributed to a peer is refused as a remote authority before it changes anything, leaves no right on file, and is recorded as a refused write naming the peer",
+    ),
+    Capability::witnessed(
+        "library.peer.rights.untrusted",
+        "a machine the store holds no record for is refused at the authenticate step, and so is a paired machine whose trust was withdrawn, whose record says so",
+    ),
+    Capability::witnessed(
+        "library.peer.rights.unauthenticated",
+        "a question with no completed handshake behind it is refused at the authenticate step, and so is a question whose key is not the pair's machine",
+    ),
+    Capability::witnessed(
+        "library.peer.rights.survive_restart",
+        "rights granted on both machines of a pair are still allowed after both stores and logs are reopened from their roots, so the decision reads the files and not a process's memory",
+    ),
+    Capability::witnessed(
+        "library.peer.rights.trust_withdrawn",
+        "withdrawing trust removes every right the machine held, answers how many, leaves no default marker, refuses the next question as untrusted, and is recorded with the count and the person",
+    ),
+    Capability::witnessed(
+        "library.peer.rights.trust_restored",
+        "restoring trust reissues only the default `write to me` right, issued for the pair the binding names whatever pair the caller passed, leaves a person's earlier right gone, and is recorded with the return and the default's grant",
+    ),
+    Capability::witnessed(
+        "library.peer.rights.restore_binding",
+        "restoring trust and a new acquaintance issue the default for the pair the record's binding names, so a caller that passes a claim-derived pair after a rebind cannot write a right for a pair this machine never bound the machine to",
+    ),
+    Capability::witnessed(
+        "library.peer.rights.moved_pair",
+        "a machine bound to a new assistant starts from the new pair's default and inherits nothing, while the pair it left keeps the right a person granted it",
+    ),
+    Capability::witnessed(
+        "library.peer.rights.bound_pair_only",
+        "a question naming a pair this machine did not bind the machine to is refused for want of a right and recorded against that pair, while the pair it left keeps its row as a record and the new pair's default allows `write to me`",
+    ),
+    Capability::witnessed(
+        "library.peer.rights.attempt_lock",
+        "clearing a closed pair's attempt lock reopens it and is recorded with the person and the moment",
+    ),
+    Capability::witnessed(
+        "library.peer.rights.attempt_lock_open",
+        "clearing an attempt lock that holds nothing changes nothing and records nothing, while a machine this one never paired is refused as unpaired",
+    ),
+    Capability::witnessed(
+        "library.peer.rights.return_idempotent",
+        "a call that finds the trust back and the default not yet issued finishes the act instead of reporting that it is over, and only a return whose default has acted answers that there is nothing to restore; the state a return that failed after clearing the trust is in has the same record shape",
+    ),
+    Capability::witnessed(
+        "library.peer.rights.return_closed",
+        "a return from a withdrawal on a machine whose pairing attempt lock is also closed issues the default and reports the lock it left standing, rather than answering a right the machine cannot use; the second, separate act reopens it",
+    ),
+    Capability::witnessed(
+        "library.peer.audit.torn_tail",
+        "opening a log whose last entry was cut short keeps every complete entry, cuts the file back to the last one, and leaves a real entry's bytes untouched",
+    ),
+    Capability::witnessed(
+        "library.peer.audit.torn_tail_on_append",
+        "an append finds a torn tail another process left — a length word and part of a body, with nothing after them — cuts it before writing past it, and leaves the log whole and readable",
+    ),
+    Capability::witnessed(
+        "library.peer.audit.person_room",
+        "the bytes below the log's cap that are kept for a person's acts are not available to a peer's refusals: with the part a peer may fill full, a refusal is answered without an entry and the log stays under its cap, while a person's withdrawal is written and takes effect",
+    ),
+    Capability::witnessed(
+        "library.peer.audit.torn_tail_past_cap",
+        "a half-written entry that pushes a log just past its cap is cut before the cap is judged, so the log opens and comes back under the cap instead of becoming unopenable for ever",
+    ),
+    Capability::witnessed(
+        "library.peer.audit.ending_room",
+        "a question that notices an ending when the log has no room left for the entries a peer causes answers the ending at the right step, writes no entry, and leaves the row unmarked, so the record never claims an ending nobody recorded",
+    ),
+    Capability::unproducible(
+        "library.peer.audit.private_on_create",
+        "the log carries the privacy rule before its first byte lands: it is created as a private temporary file and published without replacing, so no instant exists in which another account can open it",
+        "no case can observe an instant that does not exist: the window was a race between creating the file and tightening its mode, and the suite holds one account, so it cannot watch a second one open the file between the two; what a case can show is the final rule, which `library.peer.audit.private` does",
+        "on a host with a second account, run the process that opens the log on an empty root in a loop, and from the second account loop opening the same path: every open either fails with `ENOENT` before the publish or with `EACCES` after it, never succeeds, and `ls -l` on the file shows `-rw-------` from the instant it exists",
+    ),
+    Capability::witnessed(
+        "library.peer.audit.torn_header",
+        "opening a log whose first write was cut inside the header completes the header rather than refusing it, and a file whose bytes are not that header's prefix is refused as malformed",
+    ),
+    Capability::witnessed(
+        "library.peer.audit.label_rule",
+        "a known act whose label field carries bytes after its value is kept as its code rather than read as that value's prefix",
+    ),
+    Capability::witnessed(
+        "library.peer.rights.steps",
+        "the six refusals each report the step they belong to — authenticate, right, or the host's floor — and no two refusals are the same",
+    ),
+    Capability::witnessed(
+        "library.peer.audit.every_act",
+        "one run's grant, refusal, ending, withdrawal, trust withdrawal, trust return and attempt-lock clearing each appear in the log at the caller's moment, with the person's name where a person acted",
+    ),
+    Capability::witnessed(
+        "library.peer.audit.already_held",
+        "a default that finds the pair already holds the capability a person granted records the grant as already held, naming that person and that person's term, and leaves the row on file unchanged",
+    ),
+    Capability::witnessed(
+        "library.peer.record.ending_without_term",
+        "a right field that names an ending and no term is refused as that field, naming the missing term, so no row the decision reads is without the moment its refusal reports",
+    ),
+    Capability::witnessed(
+        "library.peer.record.unknown_capability",
+        "a right for a capability this build does not know is kept out of the pair's rights and satisfies no question, and a later rewrite of the record writes the field back untouched",
+    ),
+    Capability::witnessed(
+        "library.peer.access.claim_newest",
+        "a claim keeps the deciding machine's newer decision: a re-delivered older fact changes nothing, and a newer fact replaces the claim on file",
+    ),
+    Capability::witnessed(
+        "library.peer.access.fact_version",
+        "a fact of a newer version is read as this build's prefix with its unknown fields ignored, while a version of zero, bytes that are not a fact and a fact naming no assistant are each refused by their own error",
+    ),
+    Capability::witnessed(
+        "library.peer.access.label_rules",
+        "a label that says nothing, runs too long or carries a control character or a direction mark is refused with its own error, and a fact field with bytes after its label is refused as that field rather than read as the value's prefix",
+    ),
+    Capability::witnessed(
+        "library.peer.access.fact_malformed",
+        "a fact this build cannot read is refused as `RecordError::Claim` naming the machine that sent the bytes, not this machine's record, and the claim already on file is unchanged",
+    ),
+    Capability::witnessed(
+        "library.peer.binding.no_fact",
+        "a peer with no binding writes nothing: the empty body is kept as no fact, no claim is written, the pairing's record stays as it was, the connection stands, and an empty body handed to the store is answered `Ok` with nothing written rather than refused",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.binding_not_traffic",
+        "a connection that only exchanged its binding carried nothing: the keeper counts it as a dial that carried nothing and stops as unstable instead of re-dialling, and the exchange left the claim it sent",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.withdrawn_stops",
+        "a machine whose trust was withdrawn is closed by the manager on its next round, refused by the keeper with the withdrawal as its cause, and its next handshake is refused as untrusted because resumption is off and the pin runs",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.withdrawn_any_store",
+        "a withdrawal written through one store over a root stops a manager built over another store of it — the live connection closed and the keeper stopped naming the withdrawal — with nothing asked of the caller, the manager will not dial the machine again, and the handshake's own trust question, asked of a handle opened before the withdrawal, refuses the key it trusted a moment before",
+    ),
+    Capability::witnessed(
+        "library.tls.resumption_off",
+        "neither TLS configuration offers resumption and the server sends no tickets, so a session cannot be resumed past the raw-key pin; the handshake after a withdrawal is the case beside this one",
+    ),
+    Capability::witnessed(
+        "library.peer.access.rebind",
+        "a binding changed while the connection is up takes effect at the next connection, whose claim names the new assistant while still allowing nothing on its strength",
+    ),
+    Capability::witnessed(
+        "library.peer.rights.withdrawn_while_connected",
+        "a right withdrawn while the connection is up refuses the next question with the withdrawal's own step and moment, and the connection stays live",
+    ),
+    Capability::witnessed(
+        "library.peer.rights.ended_while_connected",
+        "a right whose term passes while the connection is up refuses the next question naming the term's end, and the connection stays live",
+    ),
+    Capability::witnessed(
+        "library.peer.rights.fresh_view",
+        "a decision reads the record afresh, so a right withdrawn through another store over the same root refuses the next question on this one",
+    ),
+    Capability::witnessed(
         "library.peer.presence.refresh",
         "a registration that is never refreshed is forgotten on the beacon's own lifetime while its session stays open, and a registration refreshed by `Presence` outlives that lifetime",
     ),
@@ -922,6 +1193,18 @@ const CAPABILITIES: &[Capability] = &[
         "a peer record or the `peers/` directory reachable by an account other than the product's, SYSTEM and Administrators is refused loudly on Windows",
         "no case builds the access-list state the Windows reader refuses: granting a second account read access needs an elevated prompt and a second account, and the suite spawns no process and holds one account; the rule is type-checked for both Windows targets and witnessed as data (`library.identity.access.dacl_rule`), and the first run on Windows is the operator's. The first open on an empty root is not a refusal: the store gives the `peers/` directory it creates the explicit three-account list, with inheritance switched off, before it reads it",
         "in a scratch root on Windows, open the store once on an empty root — it creates `peers/`, and `icacls \"%peers%\"` shows the owner, SYSTEM and Administrators with no `(I)` entries — then run `icacls` to grant a second account read access to one `*.record` file and reopen the store: the refusal names the file and the account; repeat on the `peers/` directory itself, which the store checks on every open; `icacls \"%record%\" /inheritance:r /grant:r \"%USERNAME%\":F` restores it and the same store opens",
+    ),
+    Capability::unproducible(
+        "library.peer.audit.crash_mid_append",
+        "a crash between appending an entry and the act it describes leaves the entry on file and never an act nobody recorded, and a half-written entry is cut back on the next open",
+        "the suite starts no process, so it cannot kill one between the append's flush and the record's write; the order is what the case can prove — the entry is flushed before the record changes — and what a crash can still leave is a recorded act that did not happen",
+        "in a scratch root, run a process that grants and withdraws one right in a loop and kill it with SIGKILL at a random instant; reopen the log — every complete entry is there, at most the last is cut back, and every grant on file has either the right it names or a later refusal of it",
+    ),
+    Capability::unproducible(
+        "library.peer.audit.windows_dacl",
+        "an audit log reachable by an account other than the product's, SYSTEM and Administrators is refused loudly on Windows",
+        "no case builds the access-list state the Windows reader refuses: granting a second account read access needs an elevated prompt and a second account, and the suite spawns no process and holds one account; the rule is type-checked for both Windows targets and witnessed as data (`library.identity.access.dacl_rule`)",
+        "in a scratch root on Windows, open the log once on an empty root — it creates `audit.log`, and `icacls \"%audit%\"` shows the owner, SYSTEM and Administrators with no `(I)` entries — then run `icacls` to grant a second account read access and reopen: the refusal names the file and the account; `icacls \"%audit%\" /inheritance:r /grant:r \"%USERNAME%\":F` restores it and the same log opens",
     ),
     // The harness: machines, the link, the clock, the beacon rig, the raw
     // client, the connect helper and the checks themselves.

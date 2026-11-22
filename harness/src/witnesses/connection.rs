@@ -9,8 +9,9 @@ use std::time::Duration;
 use mahbot_peers::identity::PeerId;
 use mahbot_peers::peer::{
     ConnectFailure, Connections, KEEPER_SETTLE, KEEPER_UNSTABLE_LIMIT, Keeper, ManagerError,
-    NotTrustedCause, Presence, RecordStore, Started,
+    NotTrustedCause, Presence, RecordStore, Rights, Started,
 };
+use mahbot_peers::tls::PeerPolicy;
 
 use crate::beacon::TestBeacon;
 use crate::clock::block_on;
@@ -18,20 +19,21 @@ use crate::machine::Machine;
 use crate::sim::Sim;
 
 use super::peer::{NOW, Shown, pair_together, paired, session};
+use super::rights::person;
 use super::support::{io_error, within};
 
 /// A machine's manager, its endpoint and the accept loops the case spawned.
 ///
 /// The loops are the case's own tasks: the library returns the future and the
 /// caller keeps the handle, which is what lets this case stop them.
-struct Managed {
-    connections: Arc<Connections>,
-    endpoint: quinn::Endpoint,
+pub(super) struct Managed {
+    pub(super) connections: Arc<Connections>,
+    pub(super) endpoint: quinn::Endpoint,
     lanes: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl Managed {
-    fn start(
+    pub(super) fn start(
         sim: &Sim,
         beacon: &TestBeacon,
         machine: &Machine,
@@ -1210,11 +1212,11 @@ pub(crate) fn closed_pair_is_not_trusted() -> Result<(), String> {
         if crate::connect::connect(&right, &left).await.is_ok() {
             return Err("the transport completed a handshake with a closed pair".to_owned());
         }
-        // A person's clear on this machine reopens it.
-        left_store
-            .clear(&right.peer_id())
+        // A person's clear on this machine reopens it, through the audited act.
+        Rights::new(left_store.clone(), left.audit()?)
+            .clear_attempt_lock(&right.peer_id(), person("egor")?, NOW)
             .map_err(|error| error.to_string())?;
-        if !left_store.trusts(&right.peer_id()) {
+        if !left_store.trusts(&right.fingerprint()) {
             return Err("a person's clear did not reopen the pair".to_owned());
         }
         within(
@@ -1224,6 +1226,66 @@ pub(crate) fn closed_pair_is_not_trusted() -> Result<(), String> {
         )
         .await?
         .map_err(|error| error.to_string())?;
+        Ok(())
+    })
+}
+
+/// A record that is there and cannot be read is not a machine this one never paired:
+/// the manager fails closed and names the record, so a person looks at the file that
+/// exists rather than for a pairing that was never made.
+#[cfg(unix)]
+pub(crate) fn an_unreadable_record_is_not_an_unpaired_machine() -> Result<(), String> {
+    block_on(async {
+        let sim = Sim::new().map_err(io_error)?;
+        let (left, right, left_store, _right_store) = paired_machines(&sim)?;
+        let record = left
+            .storage()
+            .record_name(&right.peer_id())
+            .map_err(io_error)?;
+        left.storage()
+            .set_record_mode(&right.peer_id(), 0o644)
+            .map_err(io_error)?;
+        let endpoint = left.endpoint().map_err(|error| error.to_string())?;
+        let manager = Connections::new(
+            &left.identity,
+            left_store.clone(),
+            None,
+            sim.clock().runtime(),
+            &left.transport,
+        )
+        .map_err(|error| error.to_string())?;
+        match within(
+            &sim,
+            Duration::from_secs(60),
+            manager.connect(&endpoint, &right.fingerprint()),
+        )
+        .await?
+        {
+            Err(ConnectFailure::NotTrusted {
+                cause: NotTrustedCause::Unreadable { detail },
+                ..
+            }) => {
+                if !detail.contains(&record) {
+                    return Err(format!("the refusal does not name the record: {detail}"));
+                }
+            }
+            other => {
+                return Err(format!(
+                    "an unreadable record was reported as {other:?}, not as unreadable"
+                ));
+            }
+        }
+        // The handshake reads the same predicate, and fails closed the same way.
+        if within(
+            &sim,
+            Duration::from_secs(60),
+            crate::connect::connect(&right, &left),
+        )
+        .await?
+        .is_ok()
+        {
+            return Err("the transport completed a handshake over an unreadable record".to_owned());
+        }
         Ok(())
     })
 }

@@ -19,6 +19,40 @@
 //! it stopped: [`Keeper`], and what counts is stated on
 //! [`Connections::keep_connected`].
 //!
+//! # The connection level travels with the connection
+//!
+//! Every kept connection runs one small exchange after it is adopted: each side sends
+//! the binding it holds for the other — a [`crate::peer::access::Fact`], or nothing —
+//! and keeps what it is sent as a claim. It is the manager's own handshake, not the
+//! pair's traffic: a connection that only exchanged its binding and then died carried
+//! nothing, which is why the keeper measures the exchange's frames and does not count
+//! them. The exchange never delays adoption, never fails a connection and never closes
+//! one; a peer that does not answer costs its own budget and is tried again on the
+//! next connection.
+//!
+//! A machine whose trust was withdrawn is not one to keep: the keeper closes what is
+//! live and stops with [`NotTrustedCause::Withdrawn`], and the handshake refuses the
+//! key before the manager sees it. A binding changed while the connection is up is a
+//! reconnection — [`Connections::disconnect`] is how a caller makes it one — and the
+//! next connection carries the new fact.
+//!
+//! # Whose record the manager reads
+//!
+//! Every reach — a dial, an accepted connection, a keeper's round — asks the record on
+//! disk, not the copy this process loaded. The store is a handle, and a product holds
+//! more than one over one root: the manager one, the rights layer another, a restart a
+//! third. A withdrawal written through any of them, or by the other process the
+//! self-update window keeps on this root, is therefore seen before the next dial,
+//! before the next handshake and — within one keeper round — while a connection is up,
+//! and the manager closes it. The round is [`TRUST_POLL`] while a connection is
+//! watched and [`KEEPER_SETTLE`] while a fresh dial is still being judged, so the bound
+//! is the larger of the two. Nothing here depends on the caller reloading, and nothing
+//! depends on the manager and the rights layer sharing a handle.
+//!
+//! The price is one small read per round per peer: a record is at most
+//! [`crate::peer::record::MAX_RECORD_BYTES`], usually under a kilobyte, and a keeper
+//! round is seconds apart.
+//!
 //! # A quiet pair
 //!
 //! A keep-alive on either machine holds a silent pair: QUIC's idle timeout is the
@@ -37,13 +71,6 @@
 //! refuses one. The check reads this machine's transport only: over the wire the
 //! effective timeout is the smaller of the two machines', so a peer built with a
 //! shorter one can still close a quiet connection inside this machine's window.
-//!
-//! The manager reads the record store as it is loaded. A process that shares a
-//! storage root with another — the self-update window — calls
-//! [`RecordStore::reload`] before it dials or starts a keeper, so a pairing the
-//! other process completed is seen. A running keeper does not reload on its own: its
-//! next dial reads the store as the caller last loaded it, so another process's later
-//! write is picked up by a caller's reload or by the next start.
 //!
 //! # One connection per pair
 //!
@@ -100,6 +127,7 @@ use rustls::pki_types::CertificateDer;
 use crate::beacon::{Beacon, timeout};
 use crate::identity::{Fingerprint, Identity, PeerId};
 use crate::net::{SERVER_NAME, Transport};
+use crate::peer::binding;
 use crate::peer::record::RecordStore;
 
 /// How long one dial or one handshake may take before it is reported as no path.
@@ -125,6 +153,17 @@ pub const KEEPER_SETTLE: Duration = Duration::from_secs(10);
 /// deciding what to do after a [`Keeper::Unstable`] stop may want it.
 pub const KEEPER_UNSTABLE_LIMIT: u8 = 3;
 
+/// How often a keeper re-reads the pair's trust while a connection is up.
+///
+/// A live connection is watched by waiting on it, and a withdrawal leaves no trace on
+/// the wire: it is a file. So the wait is cut into rounds of this length, and each
+/// round asks the record again. Five seconds is short enough that a withdrawn machine
+/// stops being reachable promptly and long enough that a quiet pair costs one small
+/// file read per peer per round. It is public because a caller deciding how soon a
+/// withdrawal must take effect needs the bound — the larger of this and
+/// [`KEEPER_SETTLE`], which is the round while a fresh dial is still being judged.
+pub const TRUST_POLL: Duration = Duration::from_secs(5);
+
 /// How many accept loops a machine should run at once.
 ///
 /// One loop awaiting a stalled peer's handshake would block every other peer for
@@ -146,10 +185,79 @@ pub enum Started {
     There,
 }
 
-/// One live connection and who started it.
+/// One live connection, who started it, and what the keeper judges its use by.
 struct Live {
     connection: Connection,
     started_by: Started,
+    watch: Watch,
+}
+
+/// What the keeper reads to tell the pair's use from the manager's own exchange.
+///
+/// The frame counters at adoption, and the frames written since then that belong to
+/// the binding exchange — the manager's handshake and not the pair's use: a connection
+/// that only exchanged its binding and then died carried nothing.
+#[derive(Clone, Debug, Default)]
+struct Watch {
+    carried_from: Frames,
+    /// The frames the exchange wrote, once it has finished; `None` while it is still
+    /// in flight.
+    exchanged: Arc<Mutex<Option<Frames>>>,
+}
+
+impl Live {
+    /// Adopt `connection`, taking the frame counters the keeper judges it from now.
+    fn new(connection: Connection, started_by: Started) -> Self {
+        Self {
+            watch: Watch {
+                carried_from: Frames::of(&connection),
+                exchanged: Arc::new(Mutex::new(None)),
+            },
+            connection,
+            started_by,
+        }
+    }
+}
+
+/// The four QUIC frame counters the keeper's "carried anything" test reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Frames {
+    datagrams_out: u64,
+    datagrams_in: u64,
+    streams_out: u64,
+    streams_in: u64,
+}
+
+impl Frames {
+    /// The counters as they stand on `connection`.
+    fn of(connection: &Connection) -> Self {
+        let stats = connection.stats();
+        Self {
+            datagrams_out: stats.frame_tx.datagram,
+            datagrams_in: stats.frame_rx.datagram,
+            streams_out: stats.frame_tx.stream,
+            streams_in: stats.frame_rx.stream,
+        }
+    }
+
+    /// What `later` added to `self`, saturating rather than wrapping.
+    fn delta(self, later: Self) -> Self {
+        Self {
+            datagrams_out: later.datagrams_out.saturating_sub(self.datagrams_out),
+            datagrams_in: later.datagrams_in.saturating_sub(self.datagrams_in),
+            streams_out: later.streams_out.saturating_sub(self.streams_out),
+            streams_in: later.streams_in.saturating_sub(self.streams_in),
+        }
+    }
+
+    /// Whether the connection carried anything the pair used: a datagram or stream
+    /// frame either way beyond `from`, less the stream frames `quiet` names.
+    fn beyond(self, from: Self, quiet: Self) -> bool {
+        self.datagrams_out > from.datagrams_out
+            || self.datagrams_in > from.datagrams_in
+            || self.streams_out > from.streams_out.saturating_add(quiet.streams_out)
+            || self.streams_in > from.streams_in.saturating_add(quiet.streams_in)
+    }
 }
 
 /// What one attempt to reach a peer produced, before it is folded into the four
@@ -162,6 +270,7 @@ enum Attempt {
     Kept {
         connection: Connection,
         kept_this: bool,
+        watch: Watch,
     },
     /// A handshake completed at `address`, but the tie-break dropped the connection
     /// and no other took its place: a dial that carried nothing, not a failed dial.
@@ -194,17 +303,23 @@ impl fmt::Debug for Connections {
 }
 
 impl Connections {
-    /// Build the manager for `me`, trusting exactly what `store` remembers, over the
+    /// Build the manager for `me`, trusting what `store`'s root records, over the
     /// transport the endpoint will be built from.
     ///
     /// The endpoint the caller passes to [`Self::connect`] and runs
-    /// [`Self::serve`] over must be built over the same store as its
-    /// [`crate::tls::PeerPolicy`] and from this same `transport`: the handshake would
-    /// otherwise trust a peer this manager does not, and the keeper would judge
-    /// connections by a window the endpoint's own transport was never checked
-    /// against. quinn exposes no way to read an endpoint's transport back, so this is
-    /// a contract the caller keeps, not something the manager can check. The store is
-    /// read as it is loaded; see the module docs on the self-update window.
+    /// [`Self::serve`] over must be built from this same `transport`: the keeper
+    /// judges connections by a window the endpoint's own transport was never checked
+    /// against, and quinn exposes no way to read an endpoint's transport back, so this
+    /// is a contract the caller keeps, not something the manager can check. Which
+    /// handle of the root either side holds does not matter — every reach asks the
+    /// record on disk; see the module docs.
+    ///
+    /// The endpoint's [`crate::tls::PeerPolicy`] should be this store, or one over the
+    /// same root: the handshake asks the record file, so a withdrawal refuses the next
+    /// handshake. That read takes the store's write guard for the length of one small
+    /// file read, so a handshake can wait behind a record publish's `fsync`, and a
+    /// refused accept costs the same one read. Both are the crate's ordinary blocking
+    /// file work; see the module's *Accepting* note.
     ///
     /// # Errors
     ///
@@ -335,12 +450,7 @@ impl Connections {
         hint: Option<SocketAddr>,
     ) -> Attempt {
         let peer_id = peer.peer_id();
-        if !self.store.trusts(&peer_id) {
-            let cause = if self.store.is_closed(&peer_id) {
-                NotTrustedCause::Closed
-            } else {
-                NotTrustedCause::NoRecord
-            };
+        if let Err(cause) = self.standing_now(&peer_id) {
             return Attempt::Failed(ConnectFailure::NotTrusted { peer: *peer, cause });
         }
         let remembered = self
@@ -410,10 +520,16 @@ impl Connections {
     /// keeper treats it as a dial that carried nothing rather than giving up.
     fn here(&self, peer: &Fingerprint, address: SocketAddr, connection: Connection) -> Attempt {
         match self.adopt(peer.peer_id(), connection, Started::Here) {
-            Ok((connection, kept_this)) => Attempt::Kept {
-                connection,
-                kept_this,
-            },
+            Ok((connection, kept_this, watch)) => {
+                if kept_this {
+                    self.start_exchange(peer.peer_id(), &connection, &watch, Started::Here);
+                }
+                Attempt::Kept {
+                    connection,
+                    kept_this,
+                    watch,
+                }
+            }
             Err(cause) => Attempt::Dropped { address, cause },
         }
     }
@@ -438,13 +554,8 @@ impl Connections {
             return;
         };
         let peer = presented.peer_id();
-        if !self.store.trusts(&peer) {
-            let reason: &[u8] = if self.store.is_closed(&peer) {
-                b"the pair is closed on this machine until a person clears it"
-            } else {
-                b"not a paired peer"
-            };
-            connection.close(0u32.into(), reason);
+        if let Err(cause) = self.standing_now(&peer) {
+            connection.close(0u32.into(), refusal_text(&cause));
             return;
         }
         // The tie-break runs before the address write: the write is a hint that
@@ -454,10 +565,11 @@ impl Connections {
         // one the pair already held, that connection may be this machine's own
         // outbound one, whose remote address is the address this machine dialled —
         // never a fact the record may hold.
-        if let Ok((kept, kept_this)) = self.adopt(peer, connection, Started::There)
+        if let Ok((kept, kept_this, watch)) = self.adopt(peer, connection, Started::There)
             && kept_this
         {
             self.note_address(&peer, kept.remote_address());
+            self.start_exchange(peer, &kept, &watch, Started::There);
         }
     }
 
@@ -484,14 +596,22 @@ impl Connections {
     /// holding no connection, or a run of dials carries nothing.
     ///
     /// The manager owns recovery: the caller runs this once per paired peer and does
-    /// not dial. It waits on the pair's connection, so a quiet pair costs nothing and
-    /// a pair that stays up is never re-dialled; when the connection is gone it dials
-    /// again in [`Self::connect`]'s order.
+    /// not dial. A pair that stays up is never re-dialled: the keeper watches the
+    /// connection in rounds of [`TRUST_POLL`], asking the record each round whether
+    /// this machine still trusts the peer, and dials again in [`Self::connect`]'s order
+    /// once the connection is gone.
     ///
     /// A connection that carried anything — a QUIC datagram or stream frame either
-    /// way — and then died is a link failure: the keeper re-dials it however many
-    /// times it happens and however long it lived, with no bound, because that is
-    /// recovery and not a loop. A connection that outlives [`KEEPER_SETTLE`] is
+    /// way, beyond the manager's own binding exchange — and then died is a link
+    /// failure: the keeper re-dials it however many times it happens and however long
+    /// it lived, with no bound, because that is recovery and not a loop. A connection
+    /// that only exchanged its binding and then died carried nothing, because the
+    /// exchange is the manager's handshake and not the pair's use: the frames it wrote
+    /// are measured and subtracted, and a connection that dies before that measurement
+    /// lands is judged as carrying nothing too. That window is the whole
+    /// [`crate::peer::EXCHANGE_BUDGET`], so a pair's own traffic inside it is
+    /// discounted with the exchange's — the price of a bound the keeper can keep
+    /// without a second handshake. A connection that outlives [`KEEPER_SETTLE`] is
     /// settled the same way: the pair got to use it, so its loss is ordinary churn and
     /// clears the count.
     ///
@@ -507,16 +627,29 @@ impl Connections {
         let peer_id = peer.peer_id();
         let mut strikes = 0u8;
         loop {
-            // A connected pair is never stopped and never dialled over: watch it.
+            // A pair whose trust is withdrawn is not one to keep: close what is live
+            // and stop, naming the withdrawal rather than a lost path. The record is
+            // read from disk, so a withdrawal written through another handle — or by
+            // the other process on this root — stops the keeper too.
+            if let Err(cause) = self.standing_now(&peer_id) {
+                if let Some(live) = self.live(&peer_id) {
+                    live.close(0u32.into(), refusal_text(&cause));
+                }
+                return Keeper::Failed(ConnectFailure::NotTrusted { peer: *peer, cause });
+            }
+            // A connected pair is never stopped and never dialled over: watch it, and
+            // come back to the record each round, because a withdrawal is a file and
+            // leaves no trace on the wire.
             if let Some(live) = self.live(&peer_id) {
                 strikes = 0;
-                live.closed().await;
+                let _ = timeout(&*self.runtime, TRUST_POLL, live.closed()).await;
                 continue;
             }
             let (counted, cause) = match self.attempt(endpoint, peer, None).await {
                 Attempt::Kept {
                     connection,
                     kept_this,
+                    watch,
                 } => {
                     // A dial that lost the tie-break to a connection the pair already
                     // holds carried nothing; the pair is connected and is watched
@@ -533,7 +666,7 @@ impl Connections {
                         }
                         // A connection that carried anything is a link failure, however
                         // briefly it lived.
-                        Some(error) => (!carried(&connection), close_cause(&error)),
+                        Some(error) => (!carried(&connection, &watch), close_cause(&error)),
                     }
                 }
                 Attempt::Dropped { cause, .. } => (true, cause.to_owned()),
@@ -566,6 +699,33 @@ impl Connections {
         }
     }
 
+    /// Whether this machine trusts `peer` now, and why not, from one read of the
+    /// record on disk.
+    ///
+    /// The one place the manager's reaches ask the question, so a dial, an accepted
+    /// connection and a keeper's round cannot disagree about it. It reads the file once:
+    /// a reach that trusts the peer and one that refuses it both cost one small read.
+    /// A record that cannot be read is not trusted, and it says so with the read's own
+    /// refusal: the manager fails closed, and the cause points a person at the record
+    /// rather than at a pairing that was never made.
+    fn standing_now(&self, peer: &PeerId) -> Result<(), NotTrustedCause> {
+        let limits = self.store.limits();
+        let record = match self.store.reread(peer) {
+            Ok(record) => record,
+            Err(error) => {
+                return Err(NotTrustedCause::Unreadable {
+                    detail: error.to_string(),
+                });
+            }
+        };
+        match record {
+            Some(record) if record.trusted(&limits) => Ok(()),
+            Some(record) if record.is_withdrawn() => Err(NotTrustedCause::Withdrawn),
+            Some(record) if record.is_closed(&limits) => Err(NotTrustedCause::Closed),
+            _ => Err(NotTrustedCause::NoRecord),
+        }
+    }
+
     /// Remember the peer's authenticated source address.
     ///
     /// Best effort on purpose: the address is a hint that saves a beacon trip, not
@@ -574,6 +734,70 @@ impl Connections {
     /// the write, and the task it runs on, are the module's "Accepting" note.
     fn note_address(&self, peer: &PeerId, address: SocketAddr) {
         let _ = self.store.record_address(peer, address);
+    }
+
+    /// Run this machine's half of the binding exchange on a kept connection, on its
+    /// own task.
+    ///
+    /// The exchange is the manager's handshake, not the pair's traffic: it never
+    /// delays adoption, never fails a connection and never closes one. What it writes
+    /// is measured and kept in the connection's [`Watch`], so a connection that only
+    /// exchanged its binding and then died is judged as one that carried nothing. The
+    /// measurement starts from the frames the connection had when it was adopted — the
+    /// exchange's own stream is opened at that moment — so nothing the exchange writes
+    /// is counted as the pair's. The local fact is read from the store this manager
+    /// holds, which the reach that adopted the connection has just re-read from disk: a
+    /// binding written before the connection is what travels. A binding changed while
+    /// the connection is up is a reconnection, and [`Self::disconnect`] is how the
+    /// caller makes it one.
+    fn start_exchange(
+        &self,
+        peer: PeerId,
+        connection: &Connection,
+        watch: &Watch,
+        started: Started,
+    ) {
+        let local = self
+            .store
+            .get(&peer)
+            .and_then(|record| record.binding().map(|binding| binding.fact().clone()));
+        let connection = connection.clone();
+        let from = watch.carried_from;
+        let store = self.store.clone();
+        let runtime = Arc::clone(&self.runtime);
+        let watch = watch.clone();
+        let spawned = Arc::clone(&runtime);
+        runtime.spawn(Box::pin(async move {
+            let fact = binding::exchange(&connection, local, started, &*spawned).await;
+            // Measured before the claim is kept, so a case that waits for the claim
+            // waits for the measurement too.
+            let written = from.delta(Frames::of(&connection));
+            *watch
+                .exchanged
+                .lock()
+                .expect("the exchange count is not poisoned") = Some(written);
+            if let Some(fact) = fact {
+                let _ = store.record_claim(&peer, &fact);
+            }
+        }));
+    }
+
+    /// Close the pair's live connection so the keeper dials again.
+    ///
+    /// A binding changed while a connection is up takes effect at the next one — the
+    /// plan's reconnection, not a new acquaintance — and a withdrawn trust closes what
+    /// is live as well as refusing what comes next. Answers whether there was a live
+    /// connection to close.
+    pub fn disconnect(&self, peer: &PeerId) -> bool {
+        let mut pairs = self.pairs();
+        match pairs.remove(peer) {
+            Some(live) => {
+                live.connection
+                    .close(0u32.into(), RECONNECT_CAUSE.as_bytes());
+                true
+            }
+            None => false,
+        }
     }
 
     /// Dial one address and prove the handshake is the peer this machine asked
@@ -612,7 +836,7 @@ impl Connections {
         peer: PeerId,
         connection: Connection,
         started_by: Started,
-    ) -> Result<(Connection, bool), &'static str> {
+    ) -> Result<(Connection, bool, Watch), &'static str> {
         let preferred = if self.me < peer {
             Started::Here
         } else {
@@ -620,14 +844,10 @@ impl Connections {
         };
         let mut pairs = self.pairs();
         let Some(existing) = pairs.remove(&peer) else {
-            pairs.insert(
-                peer,
-                Live {
-                    connection: connection.clone(),
-                    started_by,
-                },
-            );
-            return Ok((connection, true));
+            let live = Live::new(connection, started_by);
+            let answer = (live.connection.clone(), true, live.watch.clone());
+            pairs.insert(peer, live);
+            return Ok(answer);
         };
         let keep_new = if existing.connection.close_reason().is_some() {
             true
@@ -643,28 +863,19 @@ impl Connections {
             return Err(TIE_BREAK_CAUSE);
         };
         let (kept, dropped) = if keep_new {
-            (
-                Live {
-                    connection,
-                    started_by,
-                },
-                existing.connection,
-            )
+            (Live::new(connection, started_by), existing)
         } else {
-            (existing, connection)
+            (existing, Live::new(connection, started_by))
         };
-        dropped.close(0u32.into(), SUPERSEDED_CAUSE.as_bytes());
+        dropped
+            .connection
+            .close(0u32.into(), SUPERSEDED_CAUSE.as_bytes());
         if kept.connection.close_reason().is_some() {
             return Err(ADOPTION_LOST_CAUSE);
         }
-        pairs.insert(
-            peer,
-            Live {
-                connection: kept.connection.clone(),
-                started_by: kept.started_by,
-            },
-        );
-        Ok((kept.connection, keep_new))
+        let answer = (kept.connection.clone(), keep_new, kept.watch.clone());
+        pairs.insert(peer, kept);
+        Ok(answer)
     }
 
     fn pairs(&self) -> MutexGuard<'_, BTreeMap<PeerId, Live>> {
@@ -681,17 +892,40 @@ fn presented(connection: &Connection) -> Option<Fingerprint> {
     Fingerprint::from_spki(certificates.first()?.as_ref())
 }
 
-/// Whether a connection carried anything: one QUIC datagram or stream frame either
-/// way.
+/// Whether a connection carried anything the pair used: one QUIC datagram or stream
+/// frame either way, beyond what the connection had when it was adopted, less the
+/// stream frames the binding exchange wrote.
 ///
 /// Keep-alives, handshake frames and acknowledgements are not traffic, so they do
-/// not turn a peer that drops a fresh connection into a link failure.
-fn carried(connection: &Connection) -> bool {
-    let stats = connection.stats();
-    stats.frame_tx.datagram > 0
-        || stats.frame_rx.datagram > 0
-        || stats.frame_tx.stream > 0
-        || stats.frame_rx.stream > 0
+/// not turn a peer that drops a fresh connection into a link failure. Neither is the
+/// manager's own binding exchange: it is the manager's handshake, and a connection
+/// that only exchanged its binding and then died carried nothing. The exchange is
+/// measured as it runs; a connection that died before the measurement landed is
+/// judged as one that carried nothing, which bounds the keeper instead of letting it
+/// re-dial. That window is the exchange's whole budget, [`EXCHANGE_BUDGET`], and not
+/// only the handshake: traffic the pair sends inside it is discounted too, which is
+/// the price of the bound.
+fn carried(connection: &Connection, watch: &Watch) -> bool {
+    let quiet = *watch
+        .exchanged
+        .lock()
+        .expect("the exchange count is not poisoned");
+    quiet.is_some_and(|quiet| Frames::of(connection).beyond(watch.carried_from, quiet))
+}
+
+/// What a connection is closed with when the record does not vouch for the pair.
+///
+/// One text per cause, and the same text wherever the manager closes: an accepted
+/// connection and a live one the keeper stops both say why they are closed. The texts
+/// are generic because they travel to the peer — which file, and which fault, is this
+/// machine's business and is in the [`NotTrustedCause`] the caller is given.
+fn refusal_text(cause: &NotTrustedCause) -> &'static [u8] {
+    match cause {
+        NotTrustedCause::Withdrawn => NOT_TRUSTED_CAUSE.as_bytes(),
+        NotTrustedCause::Closed => b"the pair is closed on this machine until a person clears it",
+        NotTrustedCause::NoRecord => b"not a paired peer",
+        NotTrustedCause::Unreadable { .. } => b"the pair's record cannot be read on this machine",
+    }
 }
 
 /// What ended a connection, in words a person reads.
@@ -743,6 +977,14 @@ const SUPERSEDED_CAUSE: &str = "superseded by the pair's tie-break";
 /// connection it kept had already closed.
 const ADOPTION_LOST_CAUSE: &str = "the connection closed before the pair adopted it";
 
+/// What [`Connections::disconnect`] closes the pair's connection with: the connection
+/// level changed, and the next connection carries it.
+const RECONNECT_CAUSE: &str = "the pair is reconnecting";
+
+/// What a connection is closed with when a person withdrew this machine's trust in the
+/// pair.
+const NOT_TRUSTED_CAUSE: &str = "this machine's trust in the pair is withdrawn";
+
 /// The cause of a failed beacon leg, naming the addresses tried before it.
 ///
 /// The four failures are classes; this is the detail a reader acts on, so a
@@ -781,21 +1023,30 @@ pub enum ConnectFailure {
         cause: String,
     },
     /// This machine does not trust the peer. Decided locally and only locally;
-    /// `cause` says which of the two local states it is.
+    /// `cause` names the local state it is.
     NotTrusted {
         peer: Fingerprint,
         cause: NotTrustedCause,
     },
 }
 
-/// Why this machine does not trust a peer: no record at all, or a pair its person
-/// closed after repeated failed comparisons.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Why this machine does not trust a peer: no record at all, a pair its person closed
+/// after repeated failed comparisons, a trust its person withdrew, or a record that is
+/// there and cannot be read.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NotTrustedCause {
     /// No record says a person paired this machine with the peer.
     NoRecord,
     /// The pair is closed on this machine until a person clears it.
     Closed,
+    /// A person withdrew this machine's trust in the peer; a person must restore it.
+    Withdrawn,
+    /// The peer's record is there and could not be read: unreadable, reachable by
+    /// another account, or not a record this build can read. Distinct from
+    /// [`Self::NoRecord`], because the file a person must look at is the one that is
+    /// there and not a pairing that was never made. `detail` is the record's own
+    /// refusal, which names the file and, where one command repairs it, the command.
+    Unreadable { detail: String },
 }
 
 /// Why a connection manager could not be built.
@@ -915,6 +1166,14 @@ impl fmt::Display for ConnectFailure {
                 NotTrustedCause::Closed => write!(
                     f,
                     "{peer} is not trusted: the pair is closed on this machine until a person clears it"
+                ),
+                NotTrustedCause::Withdrawn => write!(
+                    f,
+                    "{peer} is not trusted: a person withdrew this machine's trust in it"
+                ),
+                NotTrustedCause::Unreadable { detail } => write!(
+                    f,
+                    "{peer} is not trusted: its record cannot be read — {detail}"
                 ),
             },
         }

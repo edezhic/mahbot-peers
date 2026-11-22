@@ -12,13 +12,10 @@ use std::path::Path;
 
 use super::{Insecurity, Object, Opening, unix_refusal};
 
-pub(super) fn open(path: &Path) -> io::Result<Opening> {
-    let mut options = OpenOptions::new();
+pub(super) fn open(path: &Path, options: &mut OpenOptions) -> io::Result<Opening> {
     // `O_NOFOLLOW` refuses a link outright, `O_NONBLOCK` keeps a FIFO from
     // waiting for a writer before it is refused as not a regular file.
-    options
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     match options.open(path) {
         Ok(file) => Ok(Opening::File(file)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Opening::Absent),

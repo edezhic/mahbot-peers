@@ -8,9 +8,9 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-use mahbot_peers::identity::Identity;
 use mahbot_peers::identity::keyfile;
-use mahbot_peers::peer::{Limits, RecordStore};
+use mahbot_peers::identity::{Identity, PeerId};
+use mahbot_peers::peer::{AuditError, AuditLog, Limits, RecordError, RecordStore};
 use tempfile::TempDir;
 
 use crate::machine::RootId;
@@ -62,13 +62,137 @@ impl Root {
         RecordStore::open(self.dir.path(), limits).map_err(|error| error.to_string())
     }
 
+    /// This root's records, answering the store's own refusal: the typed error a case
+    /// that asserts *why* an open failed needs.
+    pub(crate) fn records_typed(&self) -> Result<RecordStore, RecordError> {
+        self.ensure_alive().map_err(|_| RecordError::RootMissing {
+            path: self.dir.path().to_owned(),
+        })?;
+        RecordStore::open(self.dir.path(), Limits::default())
+    }
+
+    /// This root's audit log, opened over the real file.
+    pub(crate) fn audit(&self) -> Result<AuditLog, String> {
+        self.audit_typed().map_err(|error| error.to_string())
+    }
+
+    /// This root's audit log, answering the log's own refusal: the typed error a case
+    /// that asserts *why* an open failed needs.
+    pub(crate) fn audit_typed(&self) -> Result<AuditLog, AuditError> {
+        self.ensure_alive().map_err(|_| AuditError::RootMissing {
+            path: self.dir.path().to_owned(),
+        })?;
+        AuditLog::open(self.dir.path())
+    }
+
+    /// Give `peer`'s record a mode, as an installation whose root was never hardened
+    /// leaves it reachable by another account. The record's own module names the file,
+    /// so this works on a record the store itself would refuse.
+    #[cfg(unix)]
+    pub(crate) fn set_record_mode(&self, peer: &PeerId, mode: u32) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let path = self.resolve(&self.record_name(peer)?)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+    }
+
+    /// `peer`'s record, read as this root's bytes.
+    pub(crate) fn read_record(&self, peer: &PeerId) -> io::Result<Vec<u8>> {
+        self.read(&self.record_name(peer)?)
+    }
+
+    /// `peer`'s record, replaced as this root's bytes.
+    pub(crate) fn write_record(&self, peer: &PeerId, bytes: &[u8]) -> io::Result<()> {
+        self.write(&self.record_name(peer)?, bytes)
+    }
+
+    /// `peer`'s record, removed as a restored backup or a deleted file removes it.
+    pub(crate) fn remove_record(&self, peer: &PeerId) -> io::Result<()> {
+        self.ensure_alive()?;
+        fs::remove_file(self.resolve(&self.record_name(peer)?)?)
+    }
+
+    /// Whether `peer`'s record is a file under this root, for a case that asserts a file
+    /// was created or removed without reading it.
+    pub(crate) fn record_exists(&self, peer: &PeerId) -> io::Result<bool> {
+        self.ensure_alive()?;
+        Ok(self.resolve(&self.record_name(peer)?)?.is_file())
+    }
+
+    /// The directory holding this root's records, as the record module spells it.
+    fn records_dir(&self) -> io::Result<PathBuf> {
+        self.ensure_alive()?;
+        Ok(RecordStore::dir_in(self.dir.path()))
+    }
+
+    /// The mode of the records directory.
+    #[cfg(unix)]
+    pub(crate) fn records_dir_mode(&self) -> io::Result<u32> {
+        use std::os::unix::fs::PermissionsExt;
+        Ok(fs::metadata(self.records_dir()?)?.permissions().mode() & 0o777)
+    }
+
+    /// Give the records directory a mode, as a root that was never hardened leaves it.
+    #[cfg(unix)]
+    pub(crate) fn set_records_dir_mode(&self, mode: u32) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(self.records_dir()?, fs::Permissions::from_mode(mode))
+    }
+
+    /// Turn the records directory into a symbolic link to a directory beside it, as a
+    /// backup tool that moved it leaves it.
+    #[cfg(unix)]
+    pub(crate) fn replace_records_dir_with_a_link(&self) -> io::Result<()> {
+        let dir = self.records_dir()?;
+        let elsewhere = dir.with_file_name("peers-elsewhere");
+        fs::rename(&dir, &elsewhere)?;
+        std::os::unix::fs::symlink(&elsewhere, &dir)
+    }
+
+    /// The name `peer`'s record has under this root, as the record module spells it, so
+    /// a case never writes a record's name itself.
+    pub(crate) fn record_name(&self, peer: &PeerId) -> io::Result<String> {
+        self.ensure_alive()?;
+        self.relative(&RecordStore::path_for(self.dir.path(), peer))
+    }
+
+    /// The audit log's bytes, as this root's file.
+    pub(crate) fn read_audit(&self) -> io::Result<Vec<u8>> {
+        self.read(&self.audit_name()?)
+    }
+
+    /// Replace the audit log's bytes, as a torn write or a damaged file leaves them.
+    pub(crate) fn write_audit(&self, bytes: &[u8]) -> io::Result<()> {
+        self.write(&self.audit_name()?, bytes)
+    }
+
+    /// The name the audit log has under this root, as the audit module spells it.
+    fn audit_name(&self) -> io::Result<String> {
+        self.ensure_alive()?;
+        self.relative(&AuditLog::path_in(self.dir.path()))
+    }
+
+    /// A path the crate named under this root, as the storage name `resolve` takes.
+    fn relative(&self, path: &Path) -> io::Result<String> {
+        path.strip_prefix(self.dir.path())
+            .ok()
+            .and_then(Path::to_str)
+            .map(str::to_owned)
+            .ok_or_else(|| invalid("a crate-named path is not a name under this root"))
+    }
+
+    /// Write `bytes` to `name`, privately: the file is a temporary one carrying the
+    /// crate's rule and is published by one rename, so a record a case crafts by hand is
+    /// judged by its bytes and not refused for the mode this rig left it with.
     pub(crate) fn write(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
         let path = self.resolve(name)?;
         self.ensure_alive()?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+        if let Some(dir) = path.parent()
+            && !dir.is_dir()
+        {
+            fs::create_dir_all(dir)?;
+            make_private(dir)?;
         }
-        fs::write(path, bytes)
+        write_private(&path, bytes)
     }
 
     pub(crate) fn read(&self, name: &str) -> io::Result<Vec<u8>> {
@@ -117,6 +241,35 @@ impl Root {
 
 fn invalid(detail: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, detail.to_owned())
+}
+
+/// Write `bytes` to `path` through a private temporary file beside it and one rename: a
+/// file a case creates carries the crate's rule before its first byte, and a record a
+/// case crafts is judged by its bytes rather than refused for the mode a plain write
+/// would leave.
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+
+    let dir = path
+        .parent()
+        .ok_or_else(|| invalid("a written file has a directory"))?;
+    let mut temp = tempfile::Builder::new().prefix(".case.").tempfile_in(dir)?;
+    temp.write_all(bytes)?;
+    temp.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+/// Give a directory this rig created the rule the crate gives one it creates: another
+/// account must not be able to write into it.
+fn make_private(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 /// A throwaway storage root: the directory a case that needs an identity and no

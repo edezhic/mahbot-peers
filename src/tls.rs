@@ -108,6 +108,16 @@ pub fn client_config(
 /// present a key it holds elsewhere — or, in a test, present none at all. `me` is
 /// still needed: it names the machine whose own key must never be accepted back
 /// from the network.
+///
+/// # Why resumption is off
+///
+/// The pin is [`ServerCertVerifier::verify_server_cert`], and rustls does not call it
+/// on a resumed session: a resumed handshake carries a ticket, not a certificate. A
+/// machine that completed a handshake before its trust was withdrawn could then
+/// resume that session afterwards and never reach the pin, which is exactly what a
+/// withdrawal must prevent. Resumption buys nothing here — a pair is long-lived and
+/// connects rarely — so it is disabled rather than special-cased, and the server
+/// sends no tickets either ([`server_config`]).
 pub fn client_config_with_resolver(
     me: &Identity,
     resolver: Arc<dyn rustls::client::ResolvesClientCert>,
@@ -125,10 +135,15 @@ pub fn client_config_with_resolver(
         }))
         .with_client_cert_resolver(resolver);
     config.alpn_protocols = vec![alpn.to_vec()];
+    config.resumption = rustls::client::Resumption::disabled();
     Ok(config)
 }
 
 /// A server configuration that pins the client's fingerprint and refuses our own.
+///
+/// It sends no session tickets, for the reason [`client_config_with_resolver`]
+/// states: the pin is the client-certificate verifier, and a resumed session never
+/// reaches it.
 pub fn server_config(
     me: &Identity,
     policy: Arc<dyn PeerPolicy>,
@@ -146,6 +161,7 @@ pub fn server_config(
             rustls::server::AlwaysResolvesServerRawPublicKeys::new(me.certified_key()),
         ));
     config.alpn_protocols = vec![alpn.to_vec()];
+    config.send_tls13_tickets = 0;
     Ok(config)
 }
 

@@ -3,15 +3,16 @@
 //! The seams the rest of the layer is built on — identity and its key file, the
 //! QUIC transport over raw public keys, the beacon as its protocol and client —
 //! and the peer layer above them: what a machine remembers about another, how two
-//! machines become acquainted, and how they stay connected. Delivery and rights
-//! are not here yet.
+//! machines become acquainted, how they stay connected, and what a connected machine
+//! may do. Delivery is not here yet.
 //!
 //! The library reads no ambient state: a caller hands it a storage root, a socket,
-//! an identity and a clock, and it uses nothing else. Two things under the root are
-//! the crate's: the identity's key file (`identity::keyfile`) and the peer records
-//! (`peer::record`), both private to the account the product runs as and both
-//! permanent formats. That is what lets the test harness run the real transport over
-//! an in-memory link and an injected clock.
+//! an identity and a clock, and it uses nothing else. Three things under the root are
+//! the crate's: the identity's key file (`identity::keyfile`), the peer records
+//! (`peer::record`, which hold both the machine's level and the connection's), and
+//! the audit log (`peer::audit`). All three are private to the account the product
+//! runs as and all three are permanent formats. That is what lets the test harness
+//! run the real transport over an in-memory link and an injected clock.
 #![warn(clippy::pedantic)]
 #![allow(
     clippy::missing_errors_doc,
@@ -31,8 +32,9 @@ pub mod identity;
 pub mod net;
 // The one write and read path the crate's private files share.
 mod private;
-// The peer layer: the durable peer record, the acquaintance ceremony, the
-// connection manager and the beacon registration that keeps a machine findable.
+// The peer layer: the durable peer record and its two levels, the acquaintance
+// ceremony, the connection manager, the binding exchange, the rights and the record
+// of what happened.
 pub mod peer;
 // TLS 1.3 with raw public keys, pinned to the peer's fingerprint.
 pub mod tls;

@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use mahbot_peers::beacon::{Beacon, Session};
 use mahbot_peers::identity::{Fingerprint, Identity, PeerId};
-use mahbot_peers::peer::pair::{Ceremony, Comparison, Outcome, PAIR_FLIGHT_TIMEOUT, Step};
+use mahbot_peers::peer::pair::{Ceremony, Comparison, Outcome, PAIR_FLIGHT_TIMEOUT, Turn};
 use quinn::{AsyncUdpSocket, Endpoint, EndpointConfig};
 
 use crate::beacon::TestBeacon;
@@ -113,13 +113,13 @@ impl Mediator {
                 .ok_or("the mediator waited out a ceremony flight")?;
             let from = introduction.from();
             if from == left {
-                let step = match left_ceremony.as_mut() {
+                let turn = match left_ceremony.as_mut() {
                     None => {
-                        let (ceremony, step) =
+                        let (ceremony, turn) =
                             Ceremony::respond(me, &introduction, Some(address), false)
                                 .map_err(|error| error.to_string())?;
                         left_ceremony = Some(ceremony);
-                        step
+                        turn
                     }
                     Some(ceremony) => ceremony
                         .receive(introduction.payload())
@@ -129,17 +129,17 @@ impl Mediator {
                     .as_mut()
                     .expect("the left ceremony is set before it is answered");
                 if let Some(outcome) = self
-                    .answer(left, step, ceremony, &mut left_comparison)
+                    .answer(left, turn, ceremony, &mut left_comparison)
                     .await?
                 {
                     left_outcome = Some(outcome);
                 }
             } else if from == right {
-                let step = right_ceremony
+                let turn = right_ceremony
                     .receive(introduction.payload())
                     .map_err(|error| error.to_string())?;
                 if let Some(outcome) = self
-                    .answer(right, step, &mut right_ceremony, &mut right_comparison)
+                    .answer(right, turn, &mut right_ceremony, &mut right_comparison)
                     .await?
                 {
                     right_outcome = Some(outcome);
@@ -154,22 +154,22 @@ impl Mediator {
         })
     }
 
-    /// Send what a step asks for and confirm its comparison, as a party that
+    /// Send what a turn asks for and confirm its comparison, as a party that
     /// plays along does.
     async fn answer(
         &self,
         to: PeerId,
-        step: Step,
+        turn: Turn,
         ceremony: &mut Ceremony,
         comparison: &mut Option<Comparison>,
     ) -> Result<Option<Outcome>, String> {
-        if let Some(bytes) = step.send {
+        if let Some(bytes) = turn.send {
             self.session
                 .introduce(to, &bytes)
                 .await
                 .map_err(|error| error.to_string())?;
         }
-        if let Some(shown) = step.show {
+        if let Some(shown) = turn.show {
             *comparison = Some(shown);
             let answer = ceremony.confirm(true).map_err(|error| error.to_string())?;
             if let Some(bytes) = answer.send {
@@ -180,6 +180,6 @@ impl Mediator {
             }
             return Ok(answer.outcome);
         }
-        Ok(step.outcome)
+        Ok(turn.outcome)
     }
 }

@@ -73,8 +73,11 @@ pub struct Policy {
 }
 
 impl PeerPolicy for Policy {
+    /// The in-memory set the transport cases fill, and otherwise the crate's own
+    /// policy over the record store — which asks the file, not a loaded copy, so a
+    /// handshake sees a withdrawal written through another handle.
     fn trusts(&self, peer: &Fingerprint) -> bool {
-        self.trust.contains(peer) || self.records.trusts(&peer.peer_id())
+        self.trust.contains(peer) || self.records.trusts(peer)
     }
 }
 

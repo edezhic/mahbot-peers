@@ -402,16 +402,17 @@ pub(crate) enum Opening {
     Refused(Insecurity),
 }
 
-/// Open the key file for reading without following a link and without waiting on
-/// anything that is not a regular file.
-pub(crate) fn open(path: &Path) -> std::io::Result<Opening> {
+/// Open a private file through the rule's descriptor: the caller says what the
+/// descriptor is for, the rule says how it is opened — never through a link, and
+/// never waiting on something that is not a regular file.
+pub(crate) fn open(path: &Path, options: &mut std::fs::OpenOptions) -> std::io::Result<Opening> {
     #[cfg(unix)]
     {
-        unix::open(path)
+        unix::open(path, options)
     }
     #[cfg(windows)]
     {
-        windows::open(path)
+        windows::open(path, options)
     }
 }
 

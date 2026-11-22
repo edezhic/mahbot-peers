@@ -3,9 +3,13 @@
 //! # What a record is
 //!
 //! One file per peer, named by the 64 hex characters of the peer's key, in a
-//! `peers/` directory beside the key file. It holds the peer's key, when a person
-//! made the comparison, the last address authenticated data arrived from, the
-//! failures counted so far and any unfinished attempt with its expiry. The key is
+//! `peers/` directory beside the key file. It has two levels. The machine's is the
+//! peer's key, when a person made the comparison, the last address authenticated data
+//! arrived from, the failures counted so far, any unfinished attempt with its expiry,
+//! and whether a person withdrew this machine's trust. The connection's, whose
+//! vocabulary is [`crate::peer::access`], is the account on the instance and the
+//! assistant the peer is bound to, the claim the other side's decision left here, the
+//! pairs the default has acted for, and one right per pair and capability. The key is
 //! the whole identity: the fingerprint is derived from it, never stored beside it
 //! as a second fact, so a record cannot claim a key and a fingerprint that
 //! disagree.
@@ -15,10 +19,15 @@
 //! `mahbot-peer-record`, one version byte, then fields: `[tag][len u16 big-endian]
 //! [body]`. Version 1's tags are `0x01` the key (32 bytes), `0x02` the pairing
 //! moment (8, seconds), `0x03` the address (family, address, port, and for IPv6 the
-//! flow info and scope id), `0x04` the failures (1) and `0x05` the attempt (8 expiry,
-//! 4 lifetime seconds). A field this build does not know is kept and written back,
-//! after the fields it knows: a rewrite may move it, which changes no meaning. The
-//! file is named by the 64 lowercase hex characters of the key.
+//! flow info and scope id), `0x04` the failures (1), `0x05` the attempt (8 expiry,
+//! 4 lifetime seconds), `0x06` the trust withdrawal's moment (8), `0x07` the binding
+//! (`peer::access`'s body), `0x08` the claim (the other side's fact, byte for byte),
+//! `0x09` one pair's default marker (the assistant's label and 8 seconds), and `0x0a`
+//! one right (`peer::access`'s body). A field this build does not know is kept and
+//! written back, after the fields it knows: a rewrite may move it, which changes no
+//! meaning. A right naming a capability this build does not know is kept the same way
+//! and satisfies nothing. The file is named by the 64 lowercase hex characters of the
+//! key.
 //!
 //! # The format is a compatibility surface
 //!
@@ -45,13 +54,18 @@
 //!   never decreases, and a writer never overwrites a peer it did not touch — one
 //!   file per peer is what makes that structural. The merge has no cross-process
 //!   lock, so it holds when a writer's publish lands before the other's re-read;
-//!   that is the order the self-update window's contract asks for, where the caller
-//!   calls [`RecordStore::reload`] before it decides to trust a peer. A record that
+//!   that is the order the self-update window's contract asks for, and the decision
+//!   and the connection manager re-read the one record they are about to act on, so
+//!   neither answers from a view another process has moved past. A record that
 //!   cannot be read is a typed refusal; the store does not open over it.
 //! - **A write never produces a file this build cannot read.** A record that would
-//!   grow past `MAX_BYTES` is refused before anything is written, so an additive
+//!   grow past `MAX_RECORD_BYTES` is refused before anything is written, so an additive
 //!   rewrite of a record a newer build left near the cap cannot turn into a file the
-//!   next open refuses.
+//!   next open refuses. The cap is not part of the format, so a build that raised it
+//!   reads what an older one wrote, but not the reverse: a record that grew past the
+//!   older build's cap is a record that build refuses, and with it the store. The two
+//!   processes a self-update window keeps on one root are the only place that can meet,
+//!   and there the older one is on its way out.
 //! - **A ceremony with a stranger leaves nothing behind.** An unfinished attempt is
 //!   recorded on the peer's record so it can expire; when the attempt ends and the
 //!   record holds nothing else — no pairing, no failure, no address, no field a
@@ -79,6 +93,32 @@
 //!   expiry a record carries is the one it was made with, not one recomputed from a
 //!   configuration that may have changed since.
 //!
+//! # The connection level's own rules
+//!
+//! - **The binding is the deciding machine's, the claim is a claim.** [`Binding`] is
+//!   written only by the machine that decided which assistant the peer is connected
+//!   to. The other side keeps the fact it was shown as a claim, byte for byte, and
+//!   nothing reads it to decide: it names the pair for a person, and a right is this
+//!   machine's own.
+//! - **A claim keeps the newer decision.** A fact whose moment is older than the one
+//!   on file is ignored, so a re-delivered stale fact cannot undo a rebind.
+//! - **The default acts once per pair.** Its marker is written with its one grant, and
+//!   a right a person withdrew or one that ended stays on file — its presence is what
+//!   stops the default re-creating it. A trust withdrawal removes the rights and the
+//!   markers, which is what lets a return issue the default again.
+//! - **A withdrawal is not a right's withdrawal.** A trust withdrawal makes the peer
+//!   untrusted, which refuses its next handshake and stops the connection manager
+//!   reaching for it; the removal of the rights it held is the same act's other half,
+//!   and [`crate::peer::rights::Rights::withdraw_trust`] is the only caller of both.
+//!   The rights layer is the only writer of rights and of the binding, so no right
+//!   changes without its entry in `peer::audit`. The received claim is the connection
+//!   manager's write — [`RecordStore::record_claim`] — and it is never a right.
+//! - **A decision re-reads.** [`RecordStore::reread`] is what
+//!   [`crate::peer::rights::Rights`] calls before every question and every write, so a
+//!   right withdrawn by another process on this root refuses the next question on this
+//!   one. The merge above is conservative for facts that only grow; a right can stop,
+//!   so the read is what keeps the answer fresh.
+//!
 //! The store's writes are small blocking file operations, like the key file's one
 //! create: a caller runs them where blocking is allowed. The manager's one write per
 //! changed accepted address is the case to look at; `peer::connect` says where it
@@ -99,7 +139,9 @@ use std::time::Duration;
 use crate::hex;
 use crate::identity::access::{self, Insecurity};
 use crate::identity::{Fingerprint, PEER_ID_LEN, PeerId};
+use crate::peer::access::{Binding, Capability, Claim, Fact, Label, Pair, Right, Standing};
 use crate::peer::address;
+use crate::peer::tlv;
 use crate::private;
 use crate::tls::PeerPolicy;
 
@@ -120,10 +162,13 @@ const MAGIC: &[u8] = b"mahbot-peer-record";
 /// this version's prefix and its unknown fields are preserved; see the module docs.
 const VERSION: u8 = 1;
 
-/// The most bytes a record may have. A record is under a hundred bytes; the cap
-/// keeps a hostile file from being read into memory, and a write that would pass
-/// it is refused rather than producing a file the next open cannot read.
-const MAX_BYTES: u64 = 4096;
+/// The most bytes a record may have. The machine level alone is under a hundred
+/// bytes; the connection level adds a binding, a claim, one default marker per pair
+/// and four rights per pair, and a machine moved between assistants keeps the pairs
+/// it left. The cap keeps a hostile file from being read into memory, and a write
+/// that would pass it is refused rather than producing a file the next open cannot
+/// read.
+pub const MAX_RECORD_BYTES: u64 = 16 * 1024;
 
 /// The field tags of version 1. Unknown tags are preserved, not refused.
 mod tag {
@@ -132,6 +177,14 @@ mod tag {
     pub const LAST_ADDRESS: u8 = 0x03;
     pub const FAILURES: u8 = 0x04;
     pub const ATTEMPT: u8 = 0x05;
+    // The connection level, `peer::access`: trust withdrawn, the binding this
+    // machine decided, the claim the other side's decision left here, one default
+    // marker per pair, and one right per pair and capability.
+    pub const WITHDRAWN: u8 = 0x06;
+    pub const BINDING: u8 = 0x07;
+    pub const CLAIM: u8 = 0x08;
+    pub const DEFAULT: u8 = 0x09;
+    pub const RIGHT: u8 = 0x0a;
 }
 
 /// A moment the caller supplies. The library never reads a clock.
@@ -228,6 +281,23 @@ pub struct PeerRecord {
     last_address: Option<SocketAddr>,
     failures: u8,
     attempt: Option<Attempt>,
+    /// When this machine withdrew its trust in the peer. The rights the peer held
+    /// are removed by the same act; the binding is kept, because a return restores
+    /// the acquaintance without a new comparison.
+    withdrawn_at: Option<Timestamp>,
+    /// The connection level this machine decided: which account on which instance,
+    /// and to which assistant.
+    binding: Option<Binding>,
+    /// The other side's fact as it arrived, kept byte for byte so a newer build's
+    /// fact survives an older build's rewrite. Decoded by [`Self::claim`].
+    claim: Option<Vec<u8>>,
+    /// The pairs the default has acted for, with the moment it did. The marker is
+    /// what makes "the default never acts again" structural: a right a person
+    /// withdrew stays on file and its marker with it, so no default re-creates it.
+    defaults: Vec<(Label, Timestamp)>,
+    /// One right per pair and capability, the pair being the record's key and the
+    /// right's assistant.
+    rights: Vec<Right>,
     /// Fields this build does not know, kept in file order and written back
     /// untouched. This is what makes the format additive in both directions.
     unknown: Vec<(u8, Vec<u8>)>,
@@ -243,6 +313,11 @@ impl PeerRecord {
             last_address: None,
             failures: 0,
             attempt: None,
+            withdrawn_at: None,
+            binding: None,
+            claim: None,
+            defaults: Vec::new(),
+            rights: Vec::new(),
             unknown: Vec::new(),
         }
     }
@@ -291,6 +366,85 @@ impl PeerRecord {
         self.attempt
     }
 
+    /// When this machine withdrew its trust in the peer, if it did.
+    ///
+    /// A withdrawn machine is not trusted: its next handshake is refused, the
+    /// connection manager does not reach for it, and the rights it held are gone.
+    #[must_use]
+    pub const fn withdrawn_at(&self) -> Option<Timestamp> {
+        self.withdrawn_at
+    }
+
+    /// Whether this machine has withdrawn its trust in the peer.
+    #[must_use]
+    pub const fn is_withdrawn(&self) -> bool {
+        self.withdrawn_at.is_some()
+    }
+
+    /// The connection level this machine decided, if it decided one.
+    #[must_use]
+    pub const fn binding(&self) -> Option<&Binding> {
+        self.binding.as_ref()
+    }
+
+    /// The other side's fact, as this machine keeps it: a claim its person may be
+    /// shown, never authority.
+    ///
+    /// `None` when no claim arrived, or when the bytes are a fact this build cannot
+    /// read; the bytes are kept either way.
+    #[must_use]
+    pub fn claim(&self) -> Option<Claim> {
+        let bytes = self.claim.as_deref()?;
+        Fact::decode(bytes).ok().map(|fact| fact.claim(self.key))
+    }
+
+    /// Every right on file, for every pair.
+    #[must_use]
+    pub fn rights(&self) -> &[Right] {
+        &self.rights
+    }
+
+    /// The rights on file for one pair.
+    pub fn rights_of(&self, pair: &Pair) -> impl Iterator<Item = &Right> {
+        self.rights
+            .iter()
+            .filter(move |right| right.assistant() == pair.assistant())
+    }
+
+    /// The right for one pair and capability, if one is on file.
+    #[must_use]
+    pub fn right(&self, pair: &Pair, capability: Capability) -> Option<&Right> {
+        self.rights
+            .iter()
+            .find(|right| right.assistant() == pair.assistant() && right.capability() == capability)
+    }
+
+    /// When the default acted for the pair, if it did.
+    #[must_use]
+    pub fn default_spent(&self, pair: &Pair) -> Option<Timestamp> {
+        self.defaults
+            .iter()
+            .find(|(assistant, _)| assistant == pair.assistant())
+            .map(|(_, at)| *at)
+    }
+
+    /// Whether this machine trusts the peer at `limits`: a person paired it, the pair
+    /// is not closed, and its trust was not withdrawn.
+    ///
+    /// This is the one trust predicate. The handshake asks it of the record on disk
+    /// (`PeerPolicy` for [`RecordStore`]) and the decision asks it of the record it
+    /// just re-read, so the two cannot drift apart.
+    #[must_use]
+    pub fn trusted(&self, limits: &Limits) -> bool {
+        self.is_paired() && !self.is_withdrawn() && self.failures < limits.max_failures
+    }
+
+    /// Whether failed comparisons have closed the pair at `limits`.
+    #[must_use]
+    pub const fn is_closed(&self, limits: &Limits) -> bool {
+        self.failures >= limits.max_failures
+    }
+
     /// Whether the record says nothing worth keeping.
     ///
     /// A record that only ever held an unfinished attempt becomes this when the
@@ -301,6 +455,11 @@ impl PeerRecord {
             && self.last_address.is_none()
             && self.failures == 0
             && self.attempt.is_none()
+            && self.withdrawn_at.is_none()
+            && self.binding.is_none()
+            && self.claim.is_none()
+            && self.defaults.is_empty()
+            && self.rights.is_empty()
             && self.unknown.is_empty()
     }
 }
@@ -310,6 +469,13 @@ impl PeerRecord {
 /// Cheap to clone: every clone shares one map and one directory. The store is
 /// also the [`PeerPolicy`] the transport asks during a handshake, so a peer is
 /// trusted exactly when a record says a person paired it.
+///
+/// The map is a cache of the files. [`Self::get`], [`Self::is_paired`] and
+/// [`Self::is_closed`] answer from it; a caller that must
+/// see what another handle over the same root, or another process, wrote re-reads the
+/// record it is about with [`Self::reread`] — which is what the decision and the
+/// connection manager do before acting, and what [`PeerPolicy`] does for the
+/// handshake.
 #[derive(Clone)]
 pub struct RecordStore {
     inner: Arc<Inner>,
@@ -420,11 +586,22 @@ impl RecordStore {
         self.records().get(peer).cloned()
     }
 
+    /// Every peer this store has loaded.
+    ///
+    /// A sweep over the rights — a term that passed with no question asked — walks
+    /// this, then re-reads each record so the sweep sees what another process wrote.
+    /// A record another process created after this store opened is that process's to
+    /// sweep.
+    #[must_use]
+    pub fn peers(&self) -> Vec<PeerId> {
+        self.records().keys().copied().collect()
+    }
+
     /// Whether a person on this machine made the comparison for `peer`.
     ///
     /// This is this machine's half of the pair; whether the other machine holds it is
-    /// the ceremony's question. Trust is [`Self::trusts`], which also asks whether the
-    /// pair is closed.
+    /// the ceremony's question. Trust is [`PeerRecord::trusted`], which also asks
+    /// whether the pair is closed.
     #[must_use]
     pub fn is_paired(&self, peer: &PeerId) -> bool {
         self.records().get(peer).is_some_and(PeerRecord::is_paired)
@@ -438,27 +615,29 @@ impl RecordStore {
             .is_some_and(|record| record.failures >= self.inner.limits.max_failures)
     }
 
-    /// Whether this machine trusts `peer`: a person paired it and the pair is not
-    /// closed.
+    /// Whether this machine trusts `peer` now, read from the record on disk.
     ///
-    /// This is the one trust predicate, and it is local: the far side's refusal text
-    /// is diagnostic and may be forged, so nothing outward-facing reads it. A pair
-    /// that reached the failure limit is closed even if it was paired before, and a
-    /// closed pair is not trusted until a person clears it.
-    #[must_use]
-    pub fn trusts(&self, peer: &PeerId) -> bool {
-        self.records().get(peer).is_some_and(|record| {
-            record.is_paired() && record.failures < self.inner.limits.max_failures
-        })
+    /// The file is what answers it: a withdrawal written through any handle of the
+    /// root — or by the other process the self-update window keeps — refuses the next
+    /// handshake, the next dial and the next keeper round. A record that cannot be read
+    /// is not trusted: the caller fails closed. [`crate::peer::PeerRecord::trusted`] is
+    /// the rule, and [`crate::tls::PeerPolicy::trusts`] is the public question, so the
+    /// handshake and the manager ask one thing; the manager adds the cause on top.
+    pub(crate) fn trusted(&self, peer: &PeerId) -> bool {
+        self.reread(peer)
+            .ok()
+            .flatten()
+            .is_some_and(|record| record.trusted(&self.inner.limits))
     }
 
     /// Re-read every record from disk, replacing the loaded map.
     ///
-    /// The self-update window keeps two processes on one root for a few seconds; a
-    /// process that is about to decide whether to trust a peer calls this so it sees
-    /// what the other wrote. The caller owns the moment: nothing in this crate calls
-    /// it behind a caller's back. A record that has become unreadable is a typed
-    /// refusal like [`RecordStore::open`]'s.
+    /// A caller that wants the whole set as the files have it — a screen listing the
+    /// peers, a start-up sweep — calls this. The decision and the connection manager do
+    /// not need it: each re-reads the one record it is about to act on, so a write by
+    /// another process on the same root is seen at that reach. The caller owns the
+    /// moment: nothing in this crate calls it behind a caller's back. A record that has
+    /// become unreadable is a typed refusal like [`RecordStore::open`]'s.
     pub fn reload(&self) -> Result<(), RecordError> {
         let records = load(&self.inner.dir)?;
         *self.write_map() = records;
@@ -469,8 +648,11 @@ impl RecordStore {
     ///
     /// An existing pairing keeps the moment it was made: a re-comparison repairs a
     /// one-sided pair, it does not re-date the acquaintance. A closed pair is
-    /// refused; a person must [`RecordStore::clear`] it first.
-    pub fn record_pairing(&self, peer: &PeerId, at: Timestamp) -> Result<PeerRecord, RecordError> {
+    /// refused; a person must clear it first, through
+    /// [`crate::peer::rights::Rights::clear_attempt_lock`]. A pairing does not
+    /// restore a withdrawn trust either: the key never changed, and returning is the
+    /// separate act [`crate::peer::rights::Rights::restore_trust`] records.
+    pub fn record_pairing(&self, peer: &PeerId, at: Timestamp) -> Result<(), RecordError> {
         self.update(peer, |record, limits| {
             if record.failures >= limits.max_failures {
                 return Err(RecordError::Closed { peer: *peer });
@@ -486,7 +668,7 @@ impl RecordStore {
                 Change::Nothing
             })
         })
-        .map(|record| record.expect("a pairing creates the record"))
+        .map(drop)
     }
 
     /// Record `address` as the last address authenticated data arrived from.
@@ -494,11 +676,7 @@ impl RecordStore {
     /// The address is a hint that saves a beacon trip, not identity; it is
     /// published and flushed like any other write, and an address that did not
     /// change is not rewritten.
-    pub fn record_address(
-        &self,
-        peer: &PeerId,
-        address: SocketAddr,
-    ) -> Result<PeerRecord, RecordError> {
+    pub fn record_address(&self, peer: &PeerId, address: SocketAddr) -> Result<(), RecordError> {
         self.update(peer, |record, _| {
             if record.last_address == Some(address) {
                 return Ok(Change::Nothing);
@@ -506,32 +684,239 @@ impl RecordStore {
             record.last_address = Some(address);
             Ok(Change::Write)
         })
-        .map(|record| record.expect("an address hint creates the record"))
+        .map(drop)
     }
 
     /// Count one failed comparison for `peer`, saturating at the limit.
     ///
-    /// Returns the record, so a caller sees whether the pair is now closed.
-    pub fn record_failure(&self, peer: &PeerId) -> Result<PeerRecord, RecordError> {
+    /// [`RecordStore::get`] is how a caller sees whether the pair is now closed.
+    pub fn record_failure(&self, peer: &PeerId) -> Result<(), RecordError> {
         self.update(peer, |record, limits| {
             record.failures = record.failures.saturating_add(1).min(limits.max_failures);
             record.attempt = None;
             Ok(Change::Write)
         })
-        .map(|record| record.expect("a failure creates the record"))
+        .map(drop)
     }
 
     /// A person's reset on this machine: forget the failures and any unfinished
     /// attempt. It does not un-pair, a peer this machine remembers nothing about is
     /// left absent rather than given an empty record, and a record whose only facts
     /// were the failures and the attempt is removed rather than rewritten empty.
-    pub fn clear(&self, peer: &PeerId) -> Result<(), RecordError> {
+    ///
+    /// This is the pairing attempt lock's storage step. The act a product calls is
+    /// [`crate::peer::rights::Rights::clear_attempt_lock`], which writes the clearing
+    /// down first; this is the unaudited half of it, and it is not public for that
+    /// reason.
+    pub(crate) fn clear(&self, peer: &PeerId) -> Result<(), RecordError> {
         self.update_existing(peer, |record, _| {
             if record.failures == 0 && record.attempt.is_none() {
                 return Ok(Change::Nothing);
             }
             record.failures = 0;
             record.attempt = None;
+            Ok(kept(record))
+        })
+        .map(drop)
+    }
+
+    /// Re-read `peer`'s record from disk, so a decision sees what another process
+    /// wrote.
+    ///
+    /// The self-update window keeps two processes on one root, and a right withdrawn
+    /// by the other one must refuse the next question. A record that vanished is
+    /// removed from the map and answered as absent; a record that has become
+    /// unreadable is the typed refusal [`Self::open`] would give.
+    pub fn reread(&self, peer: &PeerId) -> Result<Option<PeerRecord>, RecordError> {
+        let mut map = self.write_map();
+        let record = read_file(&path_in(&self.inner.dir, peer), peer)?;
+        match &record {
+            Some(record) => {
+                map.insert(*peer, record.clone());
+            }
+            None => {
+                map.remove(peer);
+            }
+        }
+        Ok(record)
+    }
+
+    /// Record the connection level this machine decided: the account on the
+    /// instance, and the assistant the peer is bound to.
+    ///
+    /// A new binding replaces the old one. The old pair's rights stay on file — they
+    /// are the record of what was granted, and the pair they belong to is no longer
+    /// the pair the machine is bound to — so nothing is inherited and nothing is
+    /// unmade.
+    pub(crate) fn set_binding(&self, peer: &PeerId, binding: Binding) -> Result<(), RecordError> {
+        self.update(peer, |record, _| {
+            if record.binding.as_ref() == Some(&binding) {
+                return Ok(Change::Nothing);
+            }
+            record.binding = Some(binding);
+            Ok(Change::Write)
+        })
+        .map(drop)
+    }
+
+    /// Keep the other side's fact, as it arrived.
+    ///
+    /// This is the storage step of a received claim, and the connection manager is its
+    /// one caller in this crate: the bytes are kept verbatim, so a fact a newer build
+    /// wrote survives this build's rewrite and this build's decoder reads its known
+    /// fields. It is public because a claim is data a caller may receive by any
+    /// transport and keep here; it decides nothing, and nothing reads a claim to allow
+    /// anything. A fact older than the one already kept is ignored: the claim is the
+    /// deciding machine's latest decision, and a re-delivered stale one does not undo
+    /// it.
+    ///
+    /// An empty body is no fact at all — a peer with no binding writes nothing — and is
+    /// answered as kept with nothing written: a caller that received no bytes does not
+    /// have to special-case them, and an empty stream never becomes a refusal.
+    ///
+    /// # Errors
+    ///
+    /// [`RecordError::Claim`] when the bytes are not a fact at all. The refusal names
+    /// the peer that sent them, not this machine's record: nothing here is corrupt.
+    pub fn record_claim(&self, peer: &PeerId, fact: &[u8]) -> Result<(), RecordError> {
+        if fact.is_empty() {
+            return Ok(());
+        }
+        let decided_at = Fact::decode(fact)
+            .map_err(|error| RecordError::Claim {
+                peer: *peer,
+                detail: error.to_string(),
+            })?
+            .decided_at();
+        self.update(peer, |record, _| {
+            let stored = record
+                .claim
+                .as_deref()
+                .and_then(|bytes| Fact::decode(bytes).ok())
+                .map(|fact| fact.decided_at());
+            if stored.is_some_and(|stored| stored > decided_at) {
+                return Ok(Change::Nothing);
+            }
+            if record.claim.as_deref() == Some(fact) {
+                return Ok(Change::Nothing);
+            }
+            record.claim = Some(fact.to_vec());
+            Ok(Change::Write)
+        })
+        .map(drop)
+    }
+
+    /// Put one right on file, replacing the right for the same pair and capability.
+    ///
+    /// The store keeps one row per pair and capability: the four capabilities are
+    /// granted separately, and a grant, a widening and a restore all write the one
+    /// row the pair has for that capability.
+    pub(crate) fn put_right(&self, peer: &PeerId, right: Right) -> Result<(), RecordError> {
+        self.update(peer, |record, _| {
+            match record.rights.iter_mut().find(|stored| {
+                stored.assistant() == right.assistant() && stored.capability() == right.capability()
+            }) {
+                Some(stored) if *stored == right => return Ok(Change::Nothing),
+                Some(stored) => *stored = right,
+                None => record.rights.push(right),
+            }
+            Ok(Change::Write)
+        })
+        .map(drop)
+    }
+
+    /// Record that the default acted for `pair`, so it never acts for it again.
+    pub(crate) fn mark_default(
+        &self,
+        peer: &PeerId,
+        pair: &Pair,
+        at: Timestamp,
+    ) -> Result<(), RecordError> {
+        self.update(peer, |record, _| {
+            if record.default_spent(pair).is_some() {
+                return Ok(Change::Nothing);
+            }
+            record.defaults.push((pair.assistant().clone(), at));
+            Ok(Change::Write)
+        })
+        .map(drop)
+    }
+
+    /// Record that a right's term passed, so the ending is on file once.
+    ///
+    /// A right that is absent, or whose ending is already recorded, changes nothing.
+    pub(crate) fn mark_ended(
+        &self,
+        peer: &PeerId,
+        pair: &Pair,
+        capability: Capability,
+        at: Timestamp,
+    ) -> Result<(), RecordError> {
+        self.update_existing(peer, |record, _| {
+            let Some(right) = record.rights.iter_mut().find(|right| {
+                right.assistant() == pair.assistant() && right.capability() == capability
+            }) else {
+                return Ok(Change::Nothing);
+            };
+            // The row is read again here, so a grant that landed since the question was
+            // asked is not ended by it: only a row that still stands ended is stamped.
+            if right.ended_at().is_some() || !matches!(right.standing(at), Standing::Ended(_)) {
+                return Ok(Change::Nothing);
+            }
+            *right = right.clone().ended(at);
+            Ok(kept(record))
+        })
+        .map(drop)
+    }
+
+    /// Withdraw this machine's trust in `peer`: the flag, every right and every default
+    /// marker, in one publish.
+    ///
+    /// One publish is what makes the withdrawal one act. The flag without the removal
+    /// would be a withdrawal whose rights still stand, and a return from it would clear
+    /// the flag and find the default already spent — the person's rights back with
+    /// nobody's grant. So the two halves are one record change: either both land or
+    /// neither does, and a caller that fails here retries the whole act.
+    ///
+    /// A right a person withdrew stays on file, because its presence is what stops the
+    /// default re-creating it; a *withdrawal of trust* removes the rows, which is what
+    /// lets a return issue the default again — the plan's one exception. A right a newer
+    /// build wrote for a capability this build does not know is kept as an opaque field
+    /// and is removed too, or a newer build would resurrect what the person withdrew.
+    ///
+    /// The first withdrawal's moment is kept: a repeated one only finishes a removal an
+    /// older build left undone. Answers whether there was a record to withdraw: `false`
+    /// is a peer whose file is gone, which the rights layer reports rather than claiming
+    /// a withdrawal that changed nothing.
+    pub(crate) fn withdraw_trust(&self, peer: &PeerId, at: Timestamp) -> Result<bool, RecordError> {
+        let record = self.update_existing(peer, |record, _| {
+            let unknown_right = record.unknown.iter().any(|(tag, _)| *tag == tag::RIGHT);
+            if record.withdrawn_at.is_some()
+                && record.rights.is_empty()
+                && record.defaults.is_empty()
+                && !unknown_right
+            {
+                return Ok(Change::Nothing);
+            }
+            record.withdrawn_at = Some(record.withdrawn_at.unwrap_or(at));
+            record.rights.clear();
+            record.defaults.clear();
+            record.unknown.retain(|(tag, _)| *tag != tag::RIGHT);
+            Ok(kept(record))
+        })?;
+        Ok(record.is_some())
+    }
+
+    /// Restore this machine's trust in `peer`: the same key, no new comparison.
+    ///
+    /// Nothing else is restored here. The rights layer issues the default again for
+    /// the pair the machine is bound to, and writes the return down.
+    pub(crate) fn restore_trust(&self, peer: &PeerId) -> Result<(), RecordError> {
+        self.update_existing(peer, |record, _| {
+            if record.withdrawn_at.is_none() {
+                return Ok(Change::Nothing);
+            }
+            record.withdrawn_at = None;
             Ok(kept(record))
         })
         .map(drop)
@@ -594,10 +979,26 @@ impl RecordStore {
             .map(drop)
     }
 
-    /// The path of `peer`'s record under this root.
+    /// The directory under `root` that holds the records.
+    ///
+    /// Public for the same reason [`Self::path_for`] is: a caller that must name the
+    /// records without opening the store — a backup, a repair, a case that makes the
+    /// directory unreadable — asks here instead of spelling `peers`.
     #[must_use]
-    pub fn path_for(&self, peer: &PeerId) -> PathBuf {
-        path_in(&self.inner.dir, peer)
+    pub fn dir_in(root: &Path) -> PathBuf {
+        root.join(PEERS_DIR)
+    }
+
+    /// The path of `peer`'s record under `root`.
+    ///
+    /// A record's name is this module's, so a caller that must name one without
+    /// opening the store — a repair, a backup, a case that corrupts a record on
+    /// purpose — asks here instead of spelling the directory and the extension. Opening
+    /// a store would fail on exactly the record such a caller is about, and would
+    /// create `peers/` under a root that has none.
+    #[must_use]
+    pub fn path_for(root: &Path, peer: &PeerId) -> PathBuf {
+        path_in(&Self::dir_in(root), peer)
     }
 
     fn records(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<PeerId, PeerRecord>> {
@@ -658,7 +1059,7 @@ impl RecordStore {
         F: FnOnce(&mut PeerRecord, &Limits) -> Result<Change, RecordError>,
     {
         let mut map = self.write_map();
-        let (mut record, from_file) = match read_file(&self.path_for(peer), peer)? {
+        let (mut record, from_file) = match read_file(&path_in(&self.inner.dir, peer), peer)? {
             Some(record) => (record, true),
             None if create => (PeerRecord::empty(*peer), false),
             None => return Ok(None),
@@ -670,7 +1071,7 @@ impl RecordStore {
                 Ok(Some(record))
             }
             Change::Remove => {
-                let path = self.path_for(peer);
+                let path = path_in(&self.inner.dir, peer);
                 match fs::remove_file(&path) {
                     Ok(()) => {}
                     // Another process removed it first: the record it held is gone
@@ -718,8 +1119,15 @@ fn drop_attempt(record: &mut PeerRecord) -> Change {
 }
 
 impl PeerPolicy for RecordStore {
+    /// The handshake asks the record on disk, not this process's copy of it.
+    ///
+    /// A store is a handle, and a product may hold more than one over one root — the
+    /// connection manager one, the rights layer another. Asking the file is what makes
+    /// a withdrawal written through any of them refuse the next handshake, and what
+    /// makes the refusal the far side sees the same one the decision gives. A record
+    /// that cannot be read is not trusted: the handshake fails closed.
     fn trusts(&self, peer: &Fingerprint) -> bool {
-        self.trusts(&peer.peer_id())
+        self.trusted(&peer.peer_id())
     }
 }
 
@@ -742,7 +1150,7 @@ pub enum RecordError {
     /// The record could not be written, or the `peers/` directory could not be
     /// made or read.
     Io { path: PathBuf, source: io::Error },
-    /// The record would be larger than `MAX_BYTES`, so it was not written. The
+    /// The record would be larger than `MAX_RECORD_BYTES`, so it was not written. The
     /// file on disk is left as it was.
     TooLarge { path: PathBuf, bytes: u64 },
     /// An attempt that has not expired is already recorded for this peer.
@@ -750,6 +1158,13 @@ pub enum RecordError {
     /// Failed comparisons have closed the pair on this machine. A person must
     /// clear it here; a restart does not.
     Closed { peer: PeerId },
+    /// The other side's connection fact cannot be read. The peer's bytes are the
+    /// fault, not this machine's record, and the refusal says so.
+    Claim { peer: PeerId, detail: String },
+    /// The connection level this machine holds could not be written: a fact field is
+    /// longer than a record field can name. A value this machine produced, so it is
+    /// not [`Self::Malformed`], which is about a file that is there and cannot be read.
+    Binding { detail: String },
 }
 
 /// What is wrong with a file that is not a record.
@@ -757,7 +1172,7 @@ pub enum RecordError {
 pub enum Malformed {
     /// The file is empty: a write that never landed.
     Empty,
-    /// The file is larger than `MAX_BYTES`.
+    /// The file is larger than `MAX_RECORD_BYTES`.
     TooLarge { bytes: u64 },
     /// The file does not open with the record magic.
     Magic,
@@ -804,7 +1219,7 @@ impl fmt::Display for RecordError {
             Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
             Self::TooLarge { path, bytes } => write!(
                 f,
-                "{}: the record would be {bytes} bytes, more than {MAX_BYTES}; it was not written",
+                "{}: the record would be {bytes} bytes, more than {MAX_RECORD_BYTES}; it was not written",
                 path.display()
             ),
             Self::AttemptInProgress { peer, expires_at } => write!(
@@ -816,6 +1231,15 @@ impl fmt::Display for RecordError {
                 f,
                 "the pair with {} is closed on this machine until a person clears it",
                 peer.fingerprint()
+            ),
+            Self::Claim { peer, detail } => write!(
+                f,
+                "the connection fact {} sent cannot be read: {detail}",
+                peer.fingerprint()
+            ),
+            Self::Binding { detail } => write!(
+                f,
+                "the connection level this machine holds cannot be written: {detail}"
             ),
         }
     }
@@ -830,7 +1254,9 @@ impl std::error::Error for RecordError {
             | Self::Malformed { .. }
             | Self::TooLarge { .. }
             | Self::AttemptInProgress { .. }
-            | Self::Closed { .. } => None,
+            | Self::Closed { .. }
+            | Self::Claim { .. }
+            | Self::Binding { .. } => None,
         }
     }
 }
@@ -840,7 +1266,10 @@ impl fmt::Display for Malformed {
         match self {
             Self::Empty => f.write_str("the file is empty"),
             Self::TooLarge { bytes } => {
-                write!(f, "the file holds {bytes} bytes, more than {MAX_BYTES}")
+                write!(
+                    f,
+                    "the file holds {bytes} bytes, more than {MAX_RECORD_BYTES}"
+                )
             }
             Self::Magic => f.write_str("the file does not open with the record magic"),
             Self::Version { found } => {
@@ -980,13 +1409,14 @@ fn read_file(path: &Path, expected: &PeerId) -> Result<Option<PeerRecord>, Recor
             });
         }
     };
-    let (bytes, length) =
-        private::read_capped(file, MAX_BYTES + 1).map_err(|source| RecordError::Unreadable {
+    let (bytes, length) = private::read_capped(file, MAX_RECORD_BYTES + 1).map_err(|source| {
+        RecordError::Unreadable {
             path: path.to_owned(),
             source,
-        })?;
+        }
+    })?;
     if let Some(length) = length
-        && length > MAX_BYTES
+        && length > MAX_RECORD_BYTES
     {
         return Err(RecordError::Malformed {
             path: path.to_owned(),
@@ -999,7 +1429,7 @@ fn read_file(path: &Path, expected: &PeerId) -> Result<Option<PeerRecord>, Recor
             reason: Malformed::Empty,
         });
     }
-    if bytes.len() as u64 > MAX_BYTES {
+    if bytes.len() as u64 > MAX_RECORD_BYTES {
         return Err(RecordError::Malformed {
             path: path.to_owned(),
             reason: Malformed::TooLarge {
@@ -1020,12 +1450,12 @@ fn read_file(path: &Path, expected: &PeerId) -> Result<Option<PeerRecord>, Recor
 ///
 /// Every write is flushed, the address hint included: a rename of an unflushed
 /// file can leave an empty or torn record, which the next open refuses. A record
-/// that would pass `MAX_BYTES` is refused before the temporary file is written,
+/// that would pass `MAX_RECORD_BYTES` is refused before the temporary file is written,
 /// so this build never publishes a file it cannot read back.
 fn publish(dir: &Path, record: &PeerRecord) -> Result<(), RecordError> {
     let path = path_in(dir, &record.key);
     let bytes = encode(record, &path)?;
-    if bytes.len() as u64 > MAX_BYTES {
+    if bytes.len() as u64 > MAX_RECORD_BYTES {
         return Err(RecordError::TooLarge {
             path,
             bytes: bytes.len() as u64,
@@ -1089,6 +1519,32 @@ fn encode(record: &PeerRecord, path: &Path) -> Result<Vec<u8>, RecordError> {
         );
         field(&mut bytes, tag::ATTEMPT, &body, path)?;
     }
+    if let Some(at) = record.withdrawn_at {
+        field(
+            &mut bytes,
+            tag::WITHDRAWN,
+            &at.unix_seconds().to_be_bytes(),
+            path,
+        )?;
+    }
+    if let Some(binding) = &record.binding {
+        let body = binding
+            .encode_body()
+            .map_err(|detail| RecordError::Binding { detail })?;
+        field(&mut bytes, tag::BINDING, &body, path)?;
+    }
+    if let Some(claim) = &record.claim {
+        field(&mut bytes, tag::CLAIM, claim, path)?;
+    }
+    for (assistant, at) in &record.defaults {
+        let mut body = Vec::with_capacity(12);
+        assistant.encode_into(&mut body);
+        body.extend_from_slice(&at.unix_seconds().to_be_bytes());
+        field(&mut bytes, tag::DEFAULT, &body, path)?;
+    }
+    for right in &record.rights {
+        field(&mut bytes, tag::RIGHT, &right.encode_body(), path)?;
+    }
     for (tag, body) in &record.unknown {
         field(&mut bytes, *tag, body, path)?;
     }
@@ -1100,45 +1556,35 @@ fn encode(record: &PeerRecord, path: &Path) -> Result<Vec<u8>, RecordError> {
 /// A body over `u16::MAX` has no length it could write, and writing a truncated
 /// length would produce a file this build cannot read back; it is refused instead.
 fn field(bytes: &mut Vec<u8>, tag: u8, body: &[u8], path: &Path) -> Result<(), RecordError> {
-    let total = bytes.len() as u64 + 3 + body.len() as u64;
-    let length = u16::try_from(body.len()).map_err(|_| RecordError::TooLarge {
+    tlv::put(bytes, tag, body).map_err(|_| RecordError::TooLarge {
         path: path.to_owned(),
-        bytes: total,
-    })?;
-    bytes.push(tag);
-    bytes.extend_from_slice(&length.to_be_bytes());
-    bytes.extend_from_slice(body);
-    Ok(())
+        bytes: bytes.len() as u64 + 3 + body.len() as u64,
+    })
 }
 
 /// Read a record from its bytes. A version above [`VERSION`] is read as this
 /// version's prefix; its unknown fields are preserved in `unknown`.
 fn decode(bytes: &[u8], expected: &PeerId) -> Result<PeerRecord, Malformed> {
     let rest = bytes.strip_prefix(MAGIC).ok_or(Malformed::Magic)?;
-    let (&version, mut rest) = rest.split_first().ok_or(Malformed::Magic)?;
+    let (&version, rest) = rest.split_first().ok_or(Malformed::Magic)?;
     if version == 0 {
         return Err(Malformed::Version { found: version });
     }
     let mut record = PeerRecord::empty(*expected);
     record.version = version;
     let mut seen = Vec::new();
-    while !rest.is_empty() {
-        let (&tag, after_tag) = rest.split_first().ok_or(Malformed::Magic)?;
-        if after_tag.len() < 2 {
-            return Err(Malformed::Field {
-                tag,
-                detail: "has no length".to_owned(),
-            });
-        }
-        let length = usize::from(u16::from_be_bytes([after_tag[0], after_tag[1]]));
-        let body = after_tag.get(2..2 + length).ok_or(Malformed::Field {
-            tag,
-            detail: "runs past the end of the file".to_owned(),
-        })?;
-        rest = &after_tag[2 + length..];
+    for field in tlv::Fields::new(rest) {
+        let (tag, body) = field.map_err(|error| malformed(error.tag, error.detail))?;
         if matches!(
             tag,
-            tag::KEY | tag::PAIRED_AT | tag::LAST_ADDRESS | tag::FAILURES | tag::ATTEMPT
+            tag::KEY
+                | tag::PAIRED_AT
+                | tag::LAST_ADDRESS
+                | tag::FAILURES
+                | tag::ATTEMPT
+                | tag::WITHDRAWN
+                | tag::BINDING
+                | tag::CLAIM
         ) {
             if seen.contains(&tag) {
                 return Err(Malformed::Duplicate { tag });
@@ -1147,10 +1593,9 @@ fn decode(bytes: &[u8], expected: &PeerId) -> Result<PeerRecord, Malformed> {
         }
         match tag {
             tag::KEY => {
-                let key: [u8; PEER_ID_LEN] = body.try_into().map_err(|_| Malformed::Field {
-                    tag,
-                    detail: "is not a 32-byte key".to_owned(),
-                })?;
+                let key: [u8; PEER_ID_LEN] = body
+                    .try_into()
+                    .map_err(|_| malformed(tag, "is not a 32-byte key"))?;
                 record.key = PeerId::from_bytes(key);
             }
             tag::PAIRED_AT => {
@@ -1161,31 +1606,26 @@ fn decode(bytes: &[u8], expected: &PeerId) -> Result<PeerRecord, Malformed> {
             }
             tag::FAILURES => {
                 let [failures] = body else {
-                    return Err(Malformed::Field {
-                        tag,
-                        detail: "is not one byte".to_owned(),
-                    });
+                    return Err(malformed(tag, "is not one byte"));
                 };
                 record.failures = *failures;
             }
             tag::ATTEMPT => {
-                if body.len() != 12 {
-                    return Err(Malformed::Field {
-                        tag,
-                        detail: "is not twelve bytes".to_owned(),
-                    });
-                }
-                let expires = Timestamp::from_unix_seconds(u64::from_be_bytes(
-                    body[..8].try_into().expect("eight bytes"),
-                ));
-                let lifetime = Duration::from_secs(u64::from(u32::from_be_bytes(
-                    body[8..].try_into().expect("four bytes"),
-                )));
-                record.attempt = Some(Attempt {
-                    expires_at: expires,
-                    lifetime,
-                });
+                record.attempt = Some(read_attempt(tag, body)?);
             }
+            tag::WITHDRAWN => {
+                record.withdrawn_at = Some(Timestamp::from_unix_seconds(read_u64(tag, body)?));
+            }
+            tag::BINDING => {
+                record.binding =
+                    Some(Binding::decode_body(body).map_err(|detail| malformed(tag, detail))?);
+            }
+            tag::CLAIM => {
+                Fact::decode(body).map_err(|error| malformed(tag, error.to_string()))?;
+                record.claim = Some(body.to_vec());
+            }
+            tag::DEFAULT => read_default(&mut record, tag, body)?,
+            tag::RIGHT => read_right(&mut record, tag, body)?,
             other => record.unknown.push((other, body.to_vec())),
         }
     }
@@ -1201,11 +1641,78 @@ fn decode(bytes: &[u8], expected: &PeerId) -> Result<PeerRecord, Malformed> {
     Ok(record)
 }
 
-fn read_u64(tag: u8, body: &[u8]) -> Result<u64, Malformed> {
-    let bytes: [u8; 8] = body.try_into().map_err(|_| Malformed::Field {
+/// A malformed record field, naming the tag it was found under.
+fn malformed(tag: u8, detail: impl Into<String>) -> Malformed {
+    Malformed::Field {
         tag,
-        detail: "is not eight bytes".to_owned(),
-    })?;
+        detail: detail.into(),
+    }
+}
+
+/// Read one `ATTEMPT` field: a moment and the lifetime it was made with.
+fn read_attempt(tag: u8, body: &[u8]) -> Result<Attempt, Malformed> {
+    let not_twelve = || malformed(tag, "is not twelve bytes");
+    let (expires, rest) = body.split_first_chunk::<8>().ok_or_else(not_twelve)?;
+    let (lifetime, rest) = rest.split_first_chunk::<4>().ok_or_else(not_twelve)?;
+    if !rest.is_empty() {
+        return Err(not_twelve());
+    }
+    Ok(Attempt {
+        expires_at: Timestamp::from_unix_seconds(u64::from_be_bytes(*expires)),
+        lifetime: Duration::from_secs(u64::from(u32::from_be_bytes(*lifetime))),
+    })
+}
+
+/// Read one `DEFAULT` field: the pair's assistant and the moment the default acted.
+fn read_default(record: &mut PeerRecord, tag: u8, body: &[u8]) -> Result<(), Malformed> {
+    let (assistant, rest) = Label::decode_from(body).map_err(|detail| malformed(tag, detail))?;
+    let seconds: [u8; 8] = rest
+        .try_into()
+        .map_err(|_| malformed(tag, "does not end in a moment"))?;
+    if record
+        .defaults
+        .iter()
+        .any(|(stored, _)| *stored == assistant)
+    {
+        return Err(malformed(
+            tag,
+            format!("repeats the pair with `{assistant}`"),
+        ));
+    }
+    record.defaults.push((
+        assistant,
+        Timestamp::from_unix_seconds(u64::from_be_bytes(seconds)),
+    ));
+    Ok(())
+}
+
+/// Read one `RIGHT` field. A capability this build does not know is kept as it
+/// arrived, and no question this build can ask matches it.
+fn read_right(record: &mut PeerRecord, tag: u8, body: &[u8]) -> Result<(), Malformed> {
+    let Some(right) = Right::decode_body(body).map_err(|detail| malformed(tag, detail))? else {
+        record.unknown.push((tag, body.to_vec()));
+        return Ok(());
+    };
+    if record.rights.iter().any(|stored| {
+        stored.assistant() == right.assistant() && stored.capability() == right.capability()
+    }) {
+        return Err(malformed(
+            tag,
+            format!(
+                "repeats `{}` for `{}`",
+                right.capability(),
+                right.assistant()
+            ),
+        ));
+    }
+    record.rights.push(right);
+    Ok(())
+}
+
+fn read_u64(tag: u8, body: &[u8]) -> Result<u64, Malformed> {
+    let bytes: [u8; 8] = body
+        .try_into()
+        .map_err(|_| malformed(tag, "is not eight bytes"))?;
     Ok(u64::from_be_bytes(bytes))
 }
 

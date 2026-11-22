@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use mahbot_peers::identity::{Fingerprint, Identity, PeerId};
-use mahbot_peers::peer::RecordStore;
+use mahbot_peers::peer::{AuditError, AuditLog, RecordError, RecordStore};
 
 use crate::connect::Inbox;
 use crate::link::{Link, LinkedSocket};
@@ -192,6 +192,32 @@ impl Machine {
         self.root.records_with(limits)
     }
 
+    /// This machine's audit log.
+    ///
+    /// Opened over the root's own file, so a case reads exactly what a restart would:
+    /// nothing is held open between calls.
+    ///
+    /// # Errors
+    ///
+    /// The log's refusal, as text.
+    pub fn audit(&self) -> Result<mahbot_peers::peer::AuditLog, String> {
+        self.root.audit()
+    }
+
+    /// This machine's rights: its records and its audit log.
+    ///
+    /// The decision and the record of it therefore come from one root.
+    ///
+    /// # Errors
+    ///
+    /// The log's refusal, as text.
+    pub fn rights(&self) -> Result<mahbot_peers::peer::Rights, String> {
+        Ok(mahbot_peers::peer::Rights::new(
+            self.records.clone(),
+            self.audit()?,
+        ))
+    }
+
     /// Remember `peer` as a machine this one may talk to.
     pub fn trust(&self, peer: &Machine) {
         self.trust.insert(peer.fingerprint());
@@ -355,12 +381,153 @@ impl Storage<'_> {
         }
     }
 
+    /// Write `bytes` to `name` under this root, privately, creating the directories above
+    /// it if a case needs a file where the crate has not written one yet.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's refusal.
     pub fn write(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
         self.root.write(name, bytes)
     }
 
+    /// Read the file at `name` under this root.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's refusal.
     pub fn read(&self, name: &str) -> io::Result<Vec<u8>> {
         self.root.read(name)
+    }
+
+    /// Open this root's audit log, answering the log's own refusal.
+    ///
+    /// # Errors
+    ///
+    /// The log's refusal.
+    pub fn audit(&self) -> Result<AuditLog, AuditError> {
+        self.root.audit_typed()
+    }
+
+    /// This root's records, answering the store's own refusal: the typed error a case
+    /// that asserts *why* an open failed needs.
+    ///
+    /// # Errors
+    ///
+    /// The store's refusal.
+    pub fn records_typed(&self) -> Result<RecordStore, RecordError> {
+        self.root.records_typed()
+    }
+
+    /// The audit log's bytes, as this root's file.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's refusal.
+    pub fn read_audit(&self) -> io::Result<Vec<u8>> {
+        self.root.read_audit()
+    }
+
+    /// Replace the audit log's bytes, as a torn write or a damaged file leaves them.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's refusal.
+    pub fn write_audit(&self, bytes: &[u8]) -> io::Result<()> {
+        self.root.write_audit(bytes)
+    }
+
+    /// Give `peer`'s record a mode, as an installation whose root was never hardened
+    /// leaves it reachable by another account.
+    ///
+    /// The record's own module names the file, so a case never spells a record's path.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's refusal.
+    #[cfg(unix)]
+    pub fn set_record_mode(&self, peer: &PeerId, mode: u32) -> io::Result<()> {
+        self.root.set_record_mode(peer, mode)
+    }
+
+    /// `peer`'s record, read through this root's handle.
+    ///
+    /// A case that asserts on a record's bytes reads them here, the way it reads the
+    /// audit log, rather than through a path.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's refusal.
+    pub fn read_record(&self, peer: &PeerId) -> io::Result<Vec<u8>> {
+        self.root.read_record(peer)
+    }
+
+    /// `peer`'s record, replaced through this root's handle.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's refusal.
+    pub fn write_record(&self, peer: &PeerId, bytes: &[u8]) -> io::Result<()> {
+        self.root.write_record(peer, bytes)
+    }
+
+    /// Remove `peer`'s record, as a restored backup or a deleted file does.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's refusal.
+    pub fn remove_record(&self, peer: &PeerId) -> io::Result<()> {
+        self.root.remove_record(peer)
+    }
+
+    /// Whether `peer`'s record is a file under this root.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's refusal.
+    pub fn record_exists(&self, peer: &PeerId) -> io::Result<bool> {
+        self.root.record_exists(peer)
+    }
+
+    /// The mode of the records directory.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's refusal.
+    #[cfg(unix)]
+    pub fn records_dir_mode(&self) -> io::Result<u32> {
+        self.root.records_dir_mode()
+    }
+
+    /// Give the records directory a mode, as a root that was never hardened leaves it.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's refusal.
+    #[cfg(unix)]
+    pub fn set_records_dir_mode(&self, mode: u32) -> io::Result<()> {
+        self.root.set_records_dir_mode(mode)
+    }
+
+    /// Turn the records directory into a symbolic link to a directory beside it, as a
+    /// backup tool that moved it leaves it.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's refusal.
+    #[cfg(unix)]
+    pub fn replace_records_dir_with_a_link(&self) -> io::Result<()> {
+        self.root.replace_records_dir_with_a_link()
+    }
+
+    /// The name `peer`'s record has under this root, as the record module spells it: a
+    /// name, not a path, so a case can compare it with what a refusal says.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's refusal.
+    pub fn record_name(&self, peer: &PeerId) -> io::Result<String> {
+        self.root.record_name(peer)
     }
 }
 

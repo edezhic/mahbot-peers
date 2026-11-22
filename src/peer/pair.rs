@@ -332,9 +332,9 @@ fn array<const N: usize>(bytes: &[u8], detail: &'static str) -> Result<[u8; N], 
     bytes.try_into().map_err(|_| PairError::Malformed(detail))
 }
 
-/// What one step of the ceremony asks its caller to do.
+/// What one turn of the ceremony asks its caller to do.
 #[derive(Debug, Default)]
-pub struct Step {
+pub struct Turn {
     /// Bytes to hand to the peer.
     pub send: Option<Vec<u8>>,
     /// The string to show a person. The caller answers with
@@ -460,7 +460,7 @@ impl Ceremony {
         introduction: &Introduction,
         own_address: Option<SocketAddr>,
         already: bool,
-    ) -> Result<(Self, Step), PairError> {
+    ) -> Result<(Self, Turn), PairError> {
         Self::answer(
             me,
             introduction,
@@ -477,7 +477,7 @@ impl Ceremony {
         message: &Message,
         own_address: Option<SocketAddr>,
         already: bool,
-    ) -> Result<(Self, Step), PairError> {
+    ) -> Result<(Self, Turn), PairError> {
         if introduction.to() != me {
             return Err(PairError::WrongPeer {
                 expected: me,
@@ -520,7 +520,7 @@ impl Ceremony {
             let peer = ceremony.peer;
             return Ok((
                 ceremony,
-                Step {
+                Turn {
                     send: Some(paired.encode()),
                     show: None,
                     outcome: Some(Outcome::AlreadyPaired { peer }),
@@ -537,7 +537,7 @@ impl Ceremony {
         };
         Ok((
             ceremony,
-            Step {
+            Turn {
                 send: Some(answer.encode()),
                 show: None,
                 outcome: None,
@@ -546,12 +546,12 @@ impl Ceremony {
     }
 
     /// Feed one payload from the peer.
-    pub fn receive(&mut self, payload: &[u8]) -> Result<Step, PairError> {
+    pub fn receive(&mut self, payload: &[u8]) -> Result<Turn, PairError> {
         self.receive_message(Message::parse(payload)?)
     }
 
     /// Feed one flight whose bytes the caller already parsed.
-    fn receive_message(&mut self, message: Message) -> Result<Step, PairError> {
+    fn receive_message(&mut self, message: Message) -> Result<Turn, PairError> {
         match (self.state, message.body) {
             (State::AwaitAnswer, Body::Paired { binding }) => {
                 if !self.already_here {
@@ -561,9 +561,9 @@ impl Ceremony {
                     return Err(PairError::BindingMismatch);
                 }
                 self.state = State::Done;
-                Ok(Step {
+                Ok(Turn {
                     outcome: Some(Outcome::AlreadyPaired { peer: self.peer }),
-                    ..Step::default()
+                    ..Turn::default()
                 })
             }
             (State::AwaitAnswer, Body::Answer { nonce, binding }) => {
@@ -581,7 +581,7 @@ impl Ceremony {
                     address: None,
                     body: Body::Nonce(self.nonce),
                 };
-                Ok(Step {
+                Ok(Turn {
                     send: Some(reveal.encode()),
                     show: Some(comparison),
                     outcome: None,
@@ -597,7 +597,7 @@ impl Ceremony {
                 self.peer_nonce = Some(nonce);
                 self.state = State::AwaitConfirmation;
                 let comparison = self.transcript()?;
-                Ok(Step {
+                Ok(Turn {
                     send: None,
                     show: Some(comparison),
                     outcome: None,
@@ -609,9 +609,9 @@ impl Ceremony {
                 }
                 self.peer_accepted = Some(accepted);
                 let outcome = self.settle();
-                Ok(Step {
+                Ok(Turn {
                     outcome,
-                    ..Step::default()
+                    ..Turn::default()
                 })
             }
             // The peer's opening flight after the opening: a reordered or duplicated
@@ -619,7 +619,7 @@ impl Ceremony {
             // not this one, so it changes nothing and must not end the ceremony — a
             // link that delivers it late is not a failed comparison.
             (State::AwaitConfirmation | State::AwaitNonce | State::Done, Body::Commitment(_)) => {
-                Ok(Step::default())
+                Ok(Turn::default())
             }
             _ => Err(PairError::OutOfOrder),
         }
@@ -629,7 +629,7 @@ impl Ceremony {
     ///
     /// A rejection is terminal here: it counts one failure, and the other side
     /// counts nothing when it hears it. A confirmation waits for the other side's.
-    pub fn confirm(&mut self, accepted: bool) -> Result<Step, PairError> {
+    pub fn confirm(&mut self, accepted: bool) -> Result<Turn, PairError> {
         if self.state != State::AwaitConfirmation {
             return Err(PairError::OutOfOrder);
         }
@@ -643,7 +643,7 @@ impl Ceremony {
             },
         };
         let outcome = self.settle();
-        Ok(Step {
+        Ok(Turn {
             send: Some(message.encode()),
             show: None,
             outcome,
@@ -816,9 +816,9 @@ where
             (
                 peer_id,
                 ceremony,
-                Step {
+                Turn {
                     send: Some(first),
-                    ..Step::default()
+                    ..Turn::default()
                 },
             )
         }
@@ -847,9 +847,9 @@ where
             // Best effort, like the initiator's: the answer is a hint, and a beacon
             // that cannot give it has not ended this machine's wait.
             let address = session.observed_address().await.ok();
-            let (ceremony, step) =
+            let (ceremony, turn) =
                 Ceremony::answer(me_id, &introduction, &message, address, already)?;
-            break (peer_id, ceremony, step);
+            break (peer_id, ceremony, turn);
         },
     };
     // An opening that already decides the ceremony — both sides hold the pair —
@@ -881,7 +881,7 @@ where
     outcome
 }
 
-/// What the driver and the step applier share: the session, the record, the
+/// What the driver and the turn applier share: the session, the record, the
 /// caller's moment and the instant the attempt stops being one.
 struct Flight<'a, N> {
     session: &'a Session,
@@ -897,7 +897,7 @@ struct Flight<'a, N> {
 /// flights, cannot extend the attempt.
 async fn drive<N, P>(
     ceremony: &mut Ceremony,
-    first: Step,
+    first: Turn,
     peer: PeerId,
     person: &mut P,
     flight: &Flight<'_, N>,
@@ -948,7 +948,7 @@ where
                     .restart_attempt(&peer, now())
                     .map_err(PairError::Record)?;
                 let already = flight.store.is_paired(&peer);
-                let (responder, step) = Ceremony::answer(
+                let (responder, turn) = Ceremony::answer(
                     ceremony.me(),
                     &introduction,
                     &message,
@@ -956,7 +956,7 @@ where
                     already,
                 )?;
                 *ceremony = responder;
-                if let Some(outcome) = apply(step, ceremony, peer, person, flight).await? {
+                if let Some(outcome) = apply(turn, ceremony, peer, person, flight).await? {
                     return Ok(outcome);
                 }
             }
@@ -964,19 +964,19 @@ where
             // without counting against anybody, and ours keeps waiting.
             continue;
         }
-        let step = ceremony.receive_message(message)?;
-        if let Some(outcome) = apply(step, ceremony, peer, person, flight).await? {
+        let turn = ceremony.receive_message(message)?;
+        if let Some(outcome) = apply(turn, ceremony, peer, person, flight).await? {
             return Ok(outcome);
         }
     }
 }
 
-/// Send what a step asks for, show its comparison, and report an outcome.
+/// Send what a turn asks for, show its comparison, and report an outcome.
 ///
 /// The person's answer is awaited against what is left of the attempt, so a person
 /// who walks away expires the attempt instead of parking the ceremony for ever.
 async fn apply<N, P>(
-    step: Step,
+    turn: Turn,
     ceremony: &mut Ceremony,
     peer: PeerId,
     person: &mut P,
@@ -986,14 +986,14 @@ where
     N: Fn() -> Timestamp,
     P: Person,
 {
-    if let Some(bytes) = step.send {
+    if let Some(bytes) = turn.send {
         flight
             .session
             .introduce(peer, &bytes)
             .await
             .map_err(PairError::Beacon)?;
     }
-    if let Some(comparison) = step.show {
+    if let Some(comparison) = turn.show {
         let remaining = flight.expires_at.remaining((flight.now)());
         if remaining.is_zero() {
             return Err(PairError::AttemptExpired { peer });
@@ -1019,7 +1019,7 @@ where
             return finish(flight.store, flight.now, outcome).map(Some);
         }
     }
-    match step.outcome {
+    match turn.outcome {
         Some(outcome) => finish(flight.store, flight.now, outcome).map(Some),
         None => Ok(None),
     }

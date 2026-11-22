@@ -600,3 +600,51 @@ pub(crate) fn keep_alive_holds_a_quiet_connection() -> Result<(), String> {
         Ok(())
     })
 }
+
+/// Neither TLS configuration offers resumption, and the server sends no tickets: the
+/// pin is the certificate verifier, a resumed session never reaches it, and a machine
+/// whose trust was withdrawn must reach it on its next handshake.
+///
+/// This is the case that fails if either half is removed. rustls exposes no getter for
+/// the resumption setting, so the client half is compared with the value
+/// `Resumption::disabled()` itself renders as: any other resumption — the default
+/// in-memory store, or one built by hand — renders differently, and a rename inside the
+/// dependency changes both sides of the comparison equally. The withdrawal case beside
+/// this one proves the outcome over a real handshake; this one proves the two settings
+/// the outcome rests on, which a handshake cannot tell apart — a client with resumption
+/// off and a server that sends tickets, or the reverse, would each still refuse a
+/// resumption the other half never attempted.
+pub(crate) fn the_tls_configurations_offer_no_resumption() -> Result<(), String> {
+    block_on(async {
+        let sim = Sim::new().map_err(io_error)?;
+        let (client, server) = sim.trusting_pair().map_err(io_error)?;
+        let policy: Arc<dyn PeerPolicy> = Arc::new(TrustSet::default());
+        let client = mahbot_peers::tls::client_config(&client.identity, Arc::clone(&policy), ALPN)
+            .map_err(|error| error.to_string())?;
+        let disabled = format!("{:?}", rustls::client::Resumption::disabled());
+        // The comparison must be able to tell the two apart: if a future rustls rendered
+        // the setting opaquely, both sides would read alike and the check would pass
+        // without looking at anything.
+        if disabled == format!("{:?}", rustls::client::Resumption::default()) {
+            return Err(
+                "the resumption setting renders the same whatever it holds, so this case cannot tell resumption from its absence"
+                    .to_owned(),
+            );
+        }
+        if format!("{:?}", client.resumption) != disabled {
+            return Err(format!(
+                "the client configuration resumes sessions ({:?}), so a withdrawn machine could resume past the pin",
+                client.resumption
+            ));
+        }
+        let server = mahbot_peers::tls::server_config(&server.identity, policy, ALPN)
+            .map_err(|error| error.to_string())?;
+        if server.send_tls13_tickets != 0 {
+            return Err(format!(
+                "the server configuration sends {} tickets, so a client could resume past the pin",
+                server.send_tls13_tickets
+            ));
+        }
+        Ok(())
+    })
+}

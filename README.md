@@ -7,7 +7,7 @@ accounts, rights, authorship and queues.
 
 The crate holds the seams the rest of the layer is built on — identity and its key
 file, the QUIC transport over raw public keys, the beacon — and the peer layer above
-them. Delivery and rights are not here yet.
+them. Delivery is not here yet; the connection level and the rights are.
 
 ## What the crate provides
 
@@ -16,14 +16,16 @@ The library (`src/`) holds:
 | Module | What it fixes |
 | --- | --- |
 | `identity` | one ed25519 identity per storage root, in a key file the caller's root holds; the fingerprint is the 44-byte RFC 8410 SubjectPublicKeyInfo and the peer id is the key inside it. `identity::access` is who may reach that file, `identity::keyfile` is its name, its format and its one create |
-| `tls` | TLS 1.3 with raw public keys (RFC 7250), pinned to the peer's fingerprint instead of a certificate chain, with a per-service ALPN |
+| `tls` | TLS 1.3 with raw public keys (RFC 7250), pinned to the peer's fingerprint instead of a certificate chain, with a per-service ALPN and resumption off so the pin always runs |
 | `net` | endpoint construction over an injected datagram socket and an injected clock — no default for either |
 | `beacon` | the beacon: the closed message set (`wire`), the client half (`Beacon`, `Session`) — register, look an id up, learn the address observed on this path, hand a signed introduction over, take the ones pushed to a live session — and the one deadline combinator the client and the server share (`timeout`, whose documentation says why there is one copy and not two) |
-| `peer` | the peer layer: `record` is the durable memory of another machine, `pair` the acquaintance ceremony, `connect` the per-machine connection manager, `presence` the registration refresh. Each is documented where it is enforced |
+| `peer` | the peer layer: `record` is the durable memory of another machine, at both levels; `access` is the connection level's vocabulary — the account on the instance, the assistant, the pair, the four capabilities, the rights and the small versioned fact; `pair` the acquaintance ceremony, `connect` the per-machine connection manager, `presence` the registration refresh, `binding` the exchange that carries the connection level over a live connection, `rights` the decision, `audit` the record of what happened. Each is documented where it is enforced |
 
 The key-replacement invariant covers every shipped source: no `fs::rename`,
 `remove_dir` or `fs::copy` anywhere, and no write form in the identity module. The
-record publishes through `tempfile`, not a rename of its own.
+record and the audit log are both created through `tempfile`, not a rename of their own;
+the log is then the one private file appended in place, because an append-only record
+cannot be rewritten without losing a concurrent writer's entry.
 
 ## The identity
 
@@ -108,6 +110,103 @@ reported as dead; the recorded case `deadlines_are_ordered` pins that ordering a
 the idle timeout above it. `next_introduction`'s wait for the beacon to speak
 first is the caller's.
 
+## The connection level and the rights
+
+A peer record has two levels. The machine's is the key, the pairing, the address, the
+failures and the trust. The connection's is `peer::access`: which account on which
+instance the machine is connected to, which assistant it is bound to, the claim the
+other side's decision left here, and one right per pair and capability. The unit is the
+plan's: a machine together with the assistant it is connected to.
+
+The assistant a machine is connected to is decided by the machine it is connected to,
+and only there. `Rights::bind` writes that decision durably on the deciding machine and
+issues the default for the pair; a machine moved to another assistant is a new pair,
+which starts from the default and inherits nothing from the pair it left. The decision
+travels to the other side as a small versioned fact over the direct connection, on a
+task the connection manager runs after it adopts a connection, and is kept there as a
+claim. A claim names the pair for that machine's person and grants nothing: the
+decision never reads it, and the crate never allows anything because another machine
+said so. The account label in it is the deciding machine's word, shown and never used;
+the crate never invents one and never turns a peer's key into one.
+
+A right is `(peer, assistant, capability, term, issuer, withdrawn)`. The plan's scope
+field is deliberately not here: no capability yet names a resource it would narrow, and
+the format is additive, so it arrives as its own tag when one does. The four
+capabilities are write to me, take files from me, work on me and see the screen — one
+capability covering watching and acting. The list is closed: a right stored for a
+capability this build does not know is kept and written back untouched, and no question
+this build can ask matches it.
+
+Only this machine's own person, or its own default, can write a right. A write
+attributed to a peer is refused before it changes anything and the refusal is recorded.
+The default has one act per pair: exactly "write to me", once, when the pair comes into
+being, and again only when a person returns the machine from a withdrawn trust. It never
+re-creates a right a person withdrew or one that ended, and it renews nothing: the row
+stays on file, and its presence is what stops the default acting again. The default is
+one capability for every assistant — the plan's guest floor — so a guest is never
+defaulted `work on me` or `see the screen`, and a person may widen it explicitly, with
+the record naming that person. The product's declaration of which assistant is a guest
+is not stored: it changes no decision the crate makes, and the format is additive when a
+decision depends on it.
+
+`Rights::decide` answers the one question — may this connection, as this assistant,
+exercise this capability on this machine now — in the plan's order: authenticate, right,
+the host's own floor. The answer names either the right that allowed it or the step and
+reason that refused: not authenticated, the machine is not trusted, no right for this
+pair, the right was withdrawn, the right ended, or the host's floor refused it. Each
+refusal belongs to exactly one step. A question naming a pair this machine did not bind
+the machine to is refused for want of a right. The floor is the product's — the crate
+never says what it allows — and it can only refuse what a right already gives, never
+add; a refusal at the floor is not a withdrawal, and the right stays on file. Nothing
+executes here.
+
+A right a person withdraws refuses the next question with no new connection needed. A
+right given a term ends by itself, the ending is recorded once, and nothing renews it.
+Withdrawing trust in a whole machine is a separate act: it removes the rights that
+machine held, makes it untrusted — its next handshake is refused, the manager closes
+what is live and stops reaching for it — and keeps the binding, so a return needs no new
+comparison and issues again only the default. `restore_trust` issues the default for the
+pair the binding names, whatever pair the caller passed, and it is one act: a call that
+finds the trust back and the default not yet issued finishes it rather than reporting
+that it is over, and only a return whose default has acted answers that there is nothing
+to restore. The pairing attempt lock is a separate person act, so a return on a machine
+whose comparisons closed the pair answers the lock it left standing (`Restored::closed`)
+instead of a right the machine cannot use.
+
+Nothing on that path depends on who holds which handle. The manager asks the record on
+disk before every dial, before every handshake and once per keeper round while a
+connection is up — `TRUST_POLL` while a connection is watched, `KEEPER_SETTLE` while a
+fresh dial is still being judged — so a withdrawal written through the rights layer's
+store, another store over the same root, or the other process the self-update window
+keeps on it stops the manager: the live connection is closed and the keeper stops naming
+the withdrawal, with no reload asked of the caller. A record that is there and cannot be
+read is its own cause, not an unpaired machine: the manager fails closed and names the
+file. `Connections::disconnect` remains the immediate way to close it in the same act.
+
+Every grant, refusal, ending, withdrawal, return and attempt-lock clearing is appended
+to `peer::audit`, a private append-only log under the storage root, before the record
+changes: a crash may leave a recorded act that did not happen and never an act nobody
+recorded. The log is created as a private temporary file and published without
+replacing, so it carries the rule before its first byte lands. Every append re-checks the
+log's privacy on the descriptor it writes through, so a log another account can read
+refuses the next append, and every append cuts a torn tail another process left before
+writing past it. A half-written last entry is cut back, and a half-written header is
+completed rather than refused. The log keeps the bytes below its cap minus
+`RESERVED_FOR_PERSON_BYTES` for a person: the entries a peer causes by asking — a
+refusal, a refused write, an ending a question notices — stop there and are answered
+without an entry, while a grant, a withdrawal, a trust withdrawal, a return and an
+attempt-lock clearing may use the whole file, so a peer cannot fill the log and take
+away the acts that stop it. A person's act that would pass the cap is refused until the
+product makes room, and an ending that finds no room is answered and left unmarked: the
+log is never compacted, so what a peer's part loses stays lost. The record is re-read
+before every question, so a withdrawal by another process on the same root refuses the
+next question on this one. Every moment is the caller's; the crate reads no clock.
+
+The connection manager's rule for a fresh connection now reads the binding exchange as
+what it is: the manager's own handshake, not the pair's use. A connection that only
+exchanged its binding and then died carried nothing, and the keeper's strike rule
+applies to it.
+
 ## The server
 
 `beacon/` is the server library (`mahbot-beacon`, `publish = false`) and
@@ -164,6 +263,10 @@ The harness (`harness/`, never published) is the test rig:
   waits — on the virtual clock — for the transport to let go of the socket, and
   brings the machine back over the same root at a new address, with the identity and
   the records read from disk again: everything a process restart keeps is the root.
+  `Machine::audit` and `Machine::rights` open the machine's log and its decision over
+  the same root, so a case reads exactly what a restart would; the binding exchange
+  runs on its own task, so a case that asserts on a claim waits for it while the
+  clock is driven.
 - **Mediator.** `pair::Mediator` is a party with its own key, its own address and a
   live beacon session. It answers one machine's ceremony and starts another with a
   second machine, confirming both, so a case can show that the two strings differ and

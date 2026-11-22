@@ -23,6 +23,7 @@
 use crate::inventory::Witness;
 
 mod beacon;
+mod binding;
 mod checks;
 mod clock;
 mod connection;
@@ -30,6 +31,7 @@ mod identity;
 mod link;
 mod machines;
 mod peer;
+mod rights;
 mod server;
 mod support;
 mod transport;
@@ -50,6 +52,11 @@ pub const UNIX_WITNESSES: &[Witness] = &[
         id: "key_file_refuses_other_readers",
         capabilities: &["library.identity.key_file.insecure_file"],
         case: identity::key_file_refuses_other_readers,
+    },
+    Witness {
+        id: "the_audit_is_written_before_the_record_changes",
+        capabilities: &["library.peer.audit.before_effect"],
+        case: rights::the_audit_is_written_before_the_record_changes,
     },
     Witness {
         id: "unix_account_names_are_exact",
@@ -80,6 +87,21 @@ pub const UNIX_WITNESSES: &[Witness] = &[
         id: "peer_record_refuses_a_symlinked_directory",
         capabilities: &["library.peer.record.symlinked_directory"],
         case: peer::peer_record_refuses_a_symlinked_directory,
+    },
+    Witness {
+        id: "the_audit_is_private_to_the_account",
+        capabilities: &["library.peer.audit.private"],
+        case: rights::the_audit_is_private_to_the_account,
+    },
+    Witness {
+        id: "the_audit_rechecks_privacy_on_every_append",
+        capabilities: &["library.peer.audit.private_on_write"],
+        case: rights::the_audit_rechecks_privacy_on_every_append,
+    },
+    Witness {
+        id: "an_unreadable_record_is_not_an_unpaired_machine",
+        capabilities: &["library.peer.connect.unreadable_record"],
+        case: connection::an_unreadable_record_is_not_an_unpaired_machine,
     },
 ];
 
@@ -501,6 +523,11 @@ const WITNESSES: &[Witness] = &[
         case: peer::peer_record_reload_sees_another_process,
     },
     Witness {
+        id: "an_ending_without_a_term_is_not_a_record",
+        capabilities: &["library.peer.record.ending_without_term"],
+        case: peer::an_ending_without_a_term_is_not_a_record,
+    },
+    Witness {
         id: "peer_record_refuses_an_oversized_write",
         capabilities: &["library.peer.record.oversized_write"],
         case: peer::peer_record_refuses_an_oversized_write,
@@ -729,6 +756,227 @@ const WITNESSES: &[Witness] = &[
         id: "quiet_pair_stays_connected",
         capabilities: &["library.net.quiet_pair_default"],
         case: connection::quiet_pair_stays_connected,
+    },
+    Witness {
+        id: "connection_binding_is_decided_by_one_machine",
+        capabilities: &[
+            "library.peer.access.binding",
+            "library.peer.access.claim_not_authority",
+        ],
+        case: rights::connection_binding_is_decided_by_one_machine,
+    },
+    Witness {
+        id: "default_issues_write_to_me_and_nothing_else",
+        capabilities: &["library.peer.rights.default_write"],
+        case: rights::default_issues_write_to_me_and_nothing_else,
+    },
+    Witness {
+        id: "the_default_never_acts_again",
+        capabilities: &["library.peer.rights.default_once"],
+        case: rights::the_default_never_acts_again,
+    },
+    Witness {
+        id: "a_guest_assistant_gets_the_default_and_a_person_may_widen_it",
+        capabilities: &["library.peer.rights.guest_widened"],
+        case: rights::a_guest_assistant_gets_the_default_and_a_person_may_widen_it,
+    },
+    Witness {
+        id: "a_right_withdrawn_refuses_the_next_question",
+        capabilities: &["library.peer.rights.withdrawn"],
+        case: rights::a_right_withdrawn_refuses_the_next_question,
+    },
+    Witness {
+        id: "a_right_that_ends_refuses_and_is_recorded_once",
+        capabilities: &["library.peer.rights.ended"],
+        case: rights::a_right_that_ends_refuses_and_is_recorded_once,
+    },
+    Witness {
+        id: "the_hosts_floor_refuses_a_granted_right_and_the_grant_stays",
+        capabilities: &["library.peer.rights.floor"],
+        case: rights::the_hosts_floor_refuses_a_granted_right_and_the_grant_stays,
+    },
+    Witness {
+        id: "a_peer_attributed_write_is_refused_and_recorded",
+        capabilities: &["library.peer.rights.remote_write"],
+        case: rights::a_peer_attributed_write_is_refused_and_recorded,
+    },
+    Witness {
+        id: "an_untrusted_machine_is_refused_before_any_right",
+        capabilities: &["library.peer.rights.untrusted"],
+        case: rights::an_untrusted_machine_is_refused_before_any_right,
+    },
+    Witness {
+        id: "an_unauthenticated_question_is_refused",
+        capabilities: &["library.peer.rights.unauthenticated"],
+        case: rights::an_unauthenticated_question_is_refused,
+    },
+    Witness {
+        id: "rights_survive_a_restart_of_both_machines",
+        capabilities: &["library.peer.rights.survive_restart"],
+        case: rights::rights_survive_a_restart_of_both_machines,
+    },
+    Witness {
+        id: "withdrawing_trust_removes_the_rights",
+        capabilities: &["library.peer.rights.trust_withdrawn"],
+        case: rights::withdrawing_trust_removes_the_rights,
+    },
+    Witness {
+        id: "restoring_trust_reissues_only_the_default",
+        capabilities: &["library.peer.rights.trust_restored"],
+        case: rights::restoring_trust_reissues_only_the_default,
+    },
+    Witness {
+        id: "restoring_trust_issues_the_default_for_the_binding_pair",
+        capabilities: &["library.peer.rights.restore_binding"],
+        case: rights::restoring_trust_issues_the_default_for_the_binding_pair,
+    },
+    Witness {
+        id: "a_moved_machine_starts_from_the_new_pairs_default",
+        capabilities: &["library.peer.rights.moved_pair"],
+        case: rights::a_moved_machine_starts_from_the_new_pairs_default,
+    },
+    Witness {
+        id: "a_question_for_a_pair_the_machine_left_is_refused",
+        capabilities: &["library.peer.rights.bound_pair_only"],
+        case: rights::a_question_for_a_pair_the_machine_left_is_refused,
+    },
+    Witness {
+        id: "clearing_the_attempt_lock_is_recorded",
+        capabilities: &["library.peer.rights.attempt_lock"],
+        case: rights::clearing_the_attempt_lock_is_recorded,
+    },
+    Witness {
+        id: "clearing_an_open_lock_records_nothing",
+        capabilities: &["library.peer.rights.attempt_lock_open"],
+        case: rights::clearing_an_open_lock_records_nothing,
+    },
+    Witness {
+        id: "a_return_finishes_what_it_started",
+        capabilities: &["library.peer.rights.return_idempotent"],
+        case: rights::a_return_finishes_what_it_started,
+    },
+    Witness {
+        id: "a_return_reports_a_still_closed_pair",
+        capabilities: &["library.peer.rights.return_closed"],
+        case: rights::a_return_reports_a_still_closed_pair,
+    },
+    Witness {
+        id: "the_audit_discards_a_torn_tail",
+        capabilities: &["library.peer.audit.torn_tail"],
+        case: rights::the_audit_discards_a_torn_tail,
+    },
+    Witness {
+        id: "an_append_cuts_a_torn_tail_left_by_another_process",
+        capabilities: &["library.peer.audit.torn_tail_on_append"],
+        case: rights::an_append_cuts_a_torn_tail_left_by_another_process,
+    },
+    Witness {
+        id: "a_torn_tail_past_the_cap_is_cut_before_the_cap_is_judged",
+        capabilities: &["library.peer.audit.torn_tail_past_cap"],
+        case: rights::a_torn_tail_past_the_cap_is_cut_before_the_cap_is_judged,
+    },
+    Witness {
+        id: "a_full_log_keeps_room_for_a_person",
+        capabilities: &["library.peer.audit.person_room"],
+        case: rights::a_full_log_keeps_room_for_a_person,
+    },
+    Witness {
+        id: "an_ending_with_no_room_is_answered_without_marking_the_row",
+        capabilities: &["library.peer.audit.ending_room"],
+        case: rights::an_ending_with_no_room_is_answered_without_marking_the_row,
+    },
+    Witness {
+        id: "the_audit_repairs_a_torn_header",
+        capabilities: &["library.peer.audit.torn_header"],
+        case: rights::the_audit_repairs_a_torn_header,
+    },
+    Witness {
+        id: "an_audit_field_with_bytes_after_its_label_keeps_its_code",
+        capabilities: &["library.peer.audit.label_rule"],
+        case: rights::an_audit_field_with_bytes_after_its_label_keeps_its_code,
+    },
+    Witness {
+        id: "every_refusal_names_its_own_step",
+        capabilities: &["library.peer.rights.steps"],
+        case: rights::every_refusal_names_its_own_step,
+    },
+    Witness {
+        id: "the_audit_records_every_act",
+        capabilities: &["library.peer.audit.every_act"],
+        case: rights::the_audit_records_every_act,
+    },
+    Witness {
+        id: "the_defaults_already_held_entry_names_the_person",
+        capabilities: &["library.peer.audit.already_held"],
+        case: rights::the_defaults_already_held_entry_names_the_person,
+    },
+    Witness {
+        id: "a_right_for_an_unknown_capability_is_never_satisfied",
+        capabilities: &["library.peer.record.unknown_capability"],
+        case: rights::a_right_for_an_unknown_capability_is_never_satisfied,
+    },
+    Witness {
+        id: "a_claim_keeps_the_newer_decision",
+        capabilities: &["library.peer.access.claim_newest"],
+        case: binding::a_claim_keeps_the_newer_decision,
+    },
+    Witness {
+        id: "a_fact_of_a_newer_version_is_read_as_this_versions_prefix",
+        capabilities: &["library.peer.access.fact_version"],
+        case: binding::a_fact_of_a_newer_version_is_read_as_this_versions_prefix,
+    },
+    Witness {
+        id: "a_label_is_a_name_a_person_can_be_shown",
+        capabilities: &["library.peer.access.label_rules"],
+        case: binding::a_label_is_a_name_a_person_can_be_shown,
+    },
+    Witness {
+        id: "a_malformed_fact_changes_nothing",
+        capabilities: &["library.peer.access.fact_malformed"],
+        case: binding::a_malformed_fact_changes_nothing,
+    },
+    Witness {
+        id: "a_peer_without_a_binding_leaves_no_claim",
+        capabilities: &["library.peer.binding.no_fact"],
+        case: binding::a_peer_without_a_binding_leaves_no_claim,
+    },
+    Witness {
+        id: "a_binding_only_connection_carried_nothing",
+        capabilities: &["library.peer.connect.binding_not_traffic"],
+        case: binding::a_binding_only_connection_carried_nothing,
+    },
+    Witness {
+        id: "a_withdrawn_machine_is_not_reached",
+        capabilities: &["library.peer.connect.withdrawn_stops"],
+        case: binding::a_withdrawn_machine_is_not_reached,
+    },
+    Witness {
+        id: "a_withdrawal_is_seen_by_another_store",
+        capabilities: &["library.peer.connect.withdrawn_any_store"],
+        case: binding::a_withdrawal_is_seen_by_another_store,
+    },
+    Witness {
+        id: "the_tls_configurations_offer_no_resumption",
+        capabilities: &["library.tls.resumption_off"],
+        case: transport::the_tls_configurations_offer_no_resumption,
+    },
+    Witness {
+        id: "a_rebind_takes_effect_at_the_next_connection",
+        capabilities: &["library.peer.access.rebind"],
+        case: binding::a_rebind_takes_effect_at_the_next_connection,
+    },
+    Witness {
+        id: "a_right_withdrawn_or_ended_while_connected_refuses",
+        capabilities: &[
+            "library.peer.rights.withdrawn_while_connected",
+            "library.peer.rights.ended_while_connected",
+        ],
+        case: binding::a_right_withdrawn_or_ended_while_connected_refuses,
+    },
+    Witness {
+        id: "a_withdrawal_by_another_store_refuses_the_next_question",
+        capabilities: &["library.peer.rights.fresh_view"],
+        case: binding::a_withdrawal_by_another_store_refuses_the_next_question,
     },
     Witness {
         id: "presence_keeps_registration_alive",

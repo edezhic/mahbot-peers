@@ -26,7 +26,7 @@
 //! turns SIDs into accounts.
 
 use std::ffi::c_void;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
@@ -61,15 +61,14 @@ use super::{Account, Dacl, DaclEntry, Insecurity, Opening};
 /// that holds one.
 const SID_BUFFER: usize = SECURITY_MAX_SID_SIZE as usize;
 
-/// Open the key file for reading, refusing a link or something that is not a
-/// regular file.
+/// Open a private file, refusing a link or something that is not a regular file.
 ///
 /// The link check is by path: `symlink_metadata` is the only place a reparse point
 /// can be seen, because the handle a later open returns does not report one. The
 /// refusal is still sound against a swap between the two calls, since what the
 /// handle leads to carries a DACL that [`check`] reads on that handle: a link is
 /// followed only to a file that is private in its own right.
-pub(super) fn open(path: &Path) -> io::Result<Opening> {
+pub(super) fn open(path: &Path, options: &mut OpenOptions) -> io::Result<Opening> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Opening::Absent),
@@ -82,7 +81,7 @@ pub(super) fn open(path: &Path) -> io::Result<Opening> {
     if !file_type.is_file() {
         return Ok(Opening::Refused(Insecurity::NotRegular));
     }
-    Ok(Opening::File(File::open(path)?))
+    Ok(Opening::File(options.open(path)?))
 }
 
 /// Check a directory that holds records: its access list and owner, read from a
