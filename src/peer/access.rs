@@ -483,8 +483,11 @@ impl Right {
 
     /// When the right's term passes, if it was given one.
     #[must_use]
-    pub fn expires_at(&self) -> Option<Timestamp> {
-        self.term.map(|term| term.end)
+    pub const fn expires_at(&self) -> Option<Timestamp> {
+        match self.term {
+            Some(term) => Some(term.end),
+            None => None,
+        }
     }
 
     /// Who issued the right.
@@ -501,8 +504,11 @@ impl Right {
 
     /// When the ending was recorded, if it was. Only a right with a term has one.
     #[must_use]
-    pub fn ended_at(&self) -> Option<Timestamp> {
-        self.term.and_then(|term| term.ended_at)
+    pub const fn ended_at(&self) -> Option<Timestamp> {
+        match self.term {
+            Some(term) => term.ended_at,
+            None => None,
+        }
     }
 
     /// How the right stands at `now`, with the moment that decided it. A withdrawal is
@@ -526,8 +532,7 @@ impl Right {
         self
     }
 
-    /// The same right, with its ending recorded at `at`. A right with no term has no
-    /// ending to record, so it is answered unchanged.
+    /// The same right, with its term's ending recorded at `at`.
     pub(crate) fn ended(mut self, at: Timestamp) -> Self {
         self.term = self.term.map(|term| Term {
             ended_at: Some(at),

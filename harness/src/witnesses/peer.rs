@@ -10,8 +10,8 @@ use std::time::Duration;
 use mahbot_peers::beacon::{Introduction, Session};
 use mahbot_peers::peer::pair::{self, Ceremony, Opening, Outcome};
 use mahbot_peers::peer::{
-    ConnectFailure, Connections, Limits, Malformed, NotTrustedCause, RecordError, RecordStore,
-    Rights, Timestamp,
+    COMPARISON_SYMBOLS, ConnectFailure, Connections, Limits, Malformed, NotTrustedCause,
+    RecordError, RecordStore, Rights, Timestamp,
 };
 
 use crate::beacon::TestBeacon;
@@ -599,7 +599,7 @@ pub(crate) fn pairing_computes_one_string() -> Result<(), String> {
             ));
         }
         let string = &left_seen[0];
-        if string.len() != mahbot_peers::peer::pair::COMPARISON_SYMBOLS
+        if string.len() != COMPARISON_SYMBOLS
             || !string
                 .bytes()
                 .all(|byte| byte.is_ascii_uppercase() || (b'2'..=b'7').contains(&byte))

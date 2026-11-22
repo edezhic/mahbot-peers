@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use mahbot_peers::beacon::{Beacon, Session};
 use mahbot_peers::identity::{Fingerprint, Identity, PeerId};
-use mahbot_peers::peer::pair::{Ceremony, Comparison, Outcome, PAIR_FLIGHT_TIMEOUT, Turn};
+use mahbot_peers::peer::PAIR_FLIGHT_TIMEOUT;
+use mahbot_peers::peer::pair::{Ceremony, Comparison, Outcome, Turn};
 use quinn::{AsyncUdpSocket, Endpoint, EndpointConfig};
 
 use crate::beacon::TestBeacon;

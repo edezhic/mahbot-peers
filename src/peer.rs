@@ -38,16 +38,14 @@
 //!
 //! Every type is re-exported here, so a caller names one path. A constant is too when
 //! a caller acts on it — how many accept loops to run, how long the keeper's windows
-//! are, how long an exchange or a machine-to-machine flight may take — while a storage
-//! format's own sizes stay on the module that owns the format: a caller never sizes a
-//! record, a log or a label by hand.
+//! are, how long an exchange or a machine-to-machine flight may take, how many symbols
+//! a person is shown — while a storage format's own sizes stay on the module that owns
+//! the format: a caller never sizes a record, a log or a label by hand.
 //!
-//! One exception to "a public item needs a caller that is not the rig": the functions
-//! that name a file on a root without opening or creating it —
-//! [`record::RecordStore::path_for`], [`record::RecordStore::dir_in`] and
-//! [`audit::AuditLog::path_in`] — stay public, because a person's backup or repair has
-//! to be able to name what this crate owns on a root where opening would fail or
-//! create it, and the rig uses them for the same reason.
+//! The functions that name what this crate owns on a root without opening or creating
+//! it — [`record::RecordStore::path_for`], [`record::RecordStore::dir_in`] and
+//! [`audit::AuditLog::path_in`] — are public because a person's backup or repair must
+//! be able to name it on a root where opening would fail or create it.
 
 pub mod access;
 pub mod audit;
@@ -72,7 +70,8 @@ pub use connect::{
     ManagerError, NotTrustedCause, Started, TRUST_POLL,
 };
 pub use pair::{
-    Ceremony, Comparison, Opening, Outcome, PAIR_FLIGHT_TIMEOUT, PairError, Person, Role, Turn,
+    COMPARISON_SYMBOLS, Ceremony, Comparison, Opening, Outcome, PAIR_FLIGHT_TIMEOUT, PairError,
+    Person, Role, Turn,
 };
 pub use presence::Presence;
 pub use record::{Attempt, Limits, Malformed, PeerRecord, RecordError, RecordStore, Timestamp};

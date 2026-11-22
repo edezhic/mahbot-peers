@@ -902,9 +902,9 @@ fn presented(connection: &Connection) -> Option<Fingerprint> {
 /// that only exchanged its binding and then died carried nothing. The exchange is
 /// measured as it runs; a connection that died before the measurement landed is
 /// judged as one that carried nothing, which bounds the keeper instead of letting it
-/// re-dial. That window is the exchange's whole budget, [`EXCHANGE_BUDGET`], and not
-/// only the handshake: traffic the pair sends inside it is discounted too, which is
-/// the price of the bound.
+/// re-dial. That window is the exchange's whole budget, [`crate::peer::EXCHANGE_BUDGET`],
+/// and not only the handshake: traffic the pair sends inside it is discounted too,
+/// which is the price of the bound.
 fn carried(connection: &Connection, watch: &Watch) -> bool {
     let quiet = *watch
         .exchanged

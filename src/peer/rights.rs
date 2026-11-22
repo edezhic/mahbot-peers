@@ -364,7 +364,7 @@ impl Rights {
         refusal: Refusal,
         now: Timestamp,
     ) -> Result<Decision, RightsError> {
-        let _ = self.record_softly(&Entry {
+        self.record_softly(&Entry {
             at: now,
             act: Act::Refused {
                 pair: question.pair.clone(),
@@ -661,11 +661,11 @@ impl Rights {
     /// The same finish applies to a pair whose trust was never withdrawn: a call for a
     /// machine this one trusts, whose default is still owed, issues the default and
     /// answers [`Restored`] with a `Granted` entry and no `TrustRestored` — the right is
-    /// owed, and the return is the act that owes it. That entry names the default as the
-    /// issuer, because the default is what issued: nothing was withdrawn, so there is no
-    /// return to name the person for. That is not a way to grant a right to the wrong
-    /// peer: the pair is the binding's, so a caller passing a claim-derived pair after a
-    /// rebind still issues for the pair this machine is bound to.
+    /// owed, and the return is the act that owes it. That entry names the row's own
+    /// issuer: the default when the default created the right, the person when a row
+    /// that person already wrote is reused. That is not a way to grant a right to the
+    /// wrong peer: the pair is the binding's, so a caller passing a claim-derived pair
+    /// after a rebind still issues for the pair this machine is bound to.
     ///
     /// # What still stands
     ///
@@ -814,7 +814,7 @@ impl Rights {
         reason: WriteRefusal,
         now: Timestamp,
     ) -> Result<(), RightsError> {
-        let _ = self.record_softly(&Entry {
+        self.record_softly(&Entry {
             at: now,
             act: Act::WriteRefused {
                 pair: pair.clone(),
