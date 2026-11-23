@@ -922,7 +922,7 @@ impl Actions {
     /// Decide one decoded action and run it if it may be run, answering the sender.
     ///
     /// Two steps return before an answer, because there is nothing yet to say: the decision —
-    /// whose record, log or memory may fail — and the journal's own read and write. Every later
+    /// whose record or log may fail — and the journal's own read and write. Every later
     /// fault is answered first: the log's as [`ActionAnswer::NotRecorded`], a decline's release
     /// as [`ActionAnswer::NotRun`].
     async fn decide_and_run(

@@ -14,19 +14,27 @@
 //!
 //! # Guards
 //!
+//! A guard may be pinned by more than one case, and a case may pin more than one guard; the guard
+//! lists below name the cases that pin each guard, not a census of everything a change would
+//! break. Two behaviours have no case at all and are described after them.
+//!
 //! Removing the journal's `Already` arm fails
-//! `an_action_runs_once_when_the_operation_is_offered_three_times` and
-//! `a_repeat_while_the_first_runs_is_already_executed`; remembering after instead of before the
-//! run fails the second of those; removing the decline's release fails
-//! `a_declined_action_is_not_remembered_and_answered_as_not_run`; answering it after a hard fault
-//! fails `a_decline_is_answered_before_a_memory_fault_ends_the_service`; and removing the log's
-//! full-log answer fails `an_action_that_cannot_be_recorded_does_not_run`, while removing its
-//! hard-fault answer fails `a_log_that_cannot_be_written_is_a_fault_the_sender_hears`.
+//! `an_action_runs_once_when_the_operation_is_offered_three_times`,
+//! `a_reused_identifier_is_a_repeat_whatever_the_body` and
+//! `a_repeat_while_the_first_runs_is_already_executed`, the last of which also pins remembering
+//! before the run; removing the decline's release fails
+//! `a_declined_action_is_not_remembered_and_answered_as_not_run`, and answering it after a hard
+//! fault fails `a_decline_is_answered_before_a_memory_fault_ends_the_service`; and removing the
+//! log's full-log answer fails `an_action_that_cannot_be_recorded_does_not_run`, while removing
+//! its hard-fault answer fails `a_log_that_cannot_be_written_is_a_fault_the_sender_hears`.
 //!
 //! Removing the durable unknown mark fails
-//! `an_unanswered_action_is_unknown_and_never_offered_again`, the not-sent classification fails
-//! `a_request_that_never_left_is_not_spent`, and the single total budget fails
-//! `one_request_has_one_total_budget`.
+//! `an_unanswered_action_is_unknown_and_never_offered_again`,
+//! `a_slow_execution_is_unknown_and_another_pair_is_unaffected`,
+//! `an_untraceable_unknown_names_both_outcomes`,
+//! `a_panicking_executor_ends_the_service` and `an_eagerly_panicking_executor_ends_the_service`;
+//! the not-sent classification fails `a_request_that_never_left_is_not_spent`, and the single
+//! total budget fails `one_request_has_one_total_budget`.
 //!
 //! Removing the inbox's dispatch fails `a_message_and_an_action_share_one_connection` and
 //! `a_malformed_action_is_answered_unreadable`, the throttle fails
@@ -34,13 +42,14 @@
 //! `a_retry_after_is_clamped_to_one_window`, the busy answer fails
 //! `a_second_process_on_the_root_is_busy`, the traffic rule fails
 //! `an_answered_action_is_the_pairs_traffic`,
-//! `a_repeat_while_the_first_runs_is_already_executed` and
-//! `a_result_too_large_to_carry_is_answered_and_remembered`, and the panic guard fails
+//! `a_repeat_while_the_first_runs_is_already_executed`,
+//! `a_result_too_large_to_carry_is_answered_and_remembered` and
+//! `a_flood_of_actions_is_throttled_and_messages_are_unaffected`, and the panic guard fails
 //! `a_panicking_executor_ends_the_service` and `an_eagerly_panicking_executor_ends_the_service`.
 //!
-//! The remaining cases assert a positive path or a structural absence — a body carried verbatim,
-//! the identifier's hex round-trip, the additive file, the privacy mode, the beacon's silence —
-//! where the guard is the copy, the mode or the constant, not a branch that can be removed.
+//! The cases about the body carried verbatim, the identifier's hex round-trip, the additive file,
+//! the privacy mode and the beacon's silence are the only ones here whose guard is a copy, a mode
+//! or a constant.
 //!
 //! The release-before-answer order has no case: the window between the release and the answer is
 //! one the rig has no hook into, so the order is held structurally instead — the two answers that
