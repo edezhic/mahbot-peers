@@ -18,7 +18,7 @@
 //! A message carries no author. The author is the peer the handshake proved, taken from
 //! the connection and never from the bytes: [`Delivery::sender`] is the transport's
 //! attested peer, and a frame cannot claim to be from someone else because nothing in it
-//! names anyone. The receiver checks once, when the receiving task starts, that the
+//! names anyone. The inbox checks once, when a connection's reader starts, that the
 //! connection's presented key is the peer it was started for, and a connection that does not
 //! present it ends the service rather than receiving nothing under the pair's name.
 //!
@@ -27,8 +27,9 @@
 //! [`Messages::send`] writes the message into this machine's queue for that peer before
 //! it returns, so a crash between composing and sending loses nothing. The offer is made
 //! over the pair's live direct connection, one bidirectional stream per offer, bounded by
-//! [`MESSAGE_BUDGET`], and repeated by [`Messages::serve`] until the receiver answers or
-//! the message expires: a connection that drops mid-offer costs a retry, not the message.
+//! [`MESSAGE_BUDGET`], and repeated by `Messages::offer_loop` — run inside
+//! [`crate::peer::inbox::Inbox::serve`] — until the receiver answers or the message expires:
+//! a connection that drops mid-offer costs a retry, not the message.
 //!
 //! # At least once, and what "already taken" means
 //!
@@ -94,8 +95,10 @@
 //!
 //! # What it is not
 //!
-//! There is no product layer here: no actions, no files, no screen. A message is bytes a
-//! product composes and bytes a product is handed; what it means is the product's.
+//! There is no product layer here: no files and no screen. A message is bytes a
+//! product composes and bytes a product is handed; what it means is the product's. The
+//! at-most-once command is [`crate::peer::actions`], and the one reader that tells a message
+//! from an action on the pair's connection is [`crate::peer::inbox`].
 //!
 //! # The files
 //!
@@ -104,12 +107,12 @@
 //! publish as the record. The private `store` module states the format. A
 //! read-modify-publish holds this process's writer and that peer's lock file for the whole
 //! of itself, so the self-update window's second process on a root cannot lose a message
-//! this one just queued: the record merges and the log appends, and a queue is the one file
-//! that needs the lock. The lock file is per peer, so two processes writing two peers never
-//! wait for each other; this process writes one queue at a time. The delivery sink runs with
-//! no lock held, so a slow caller delays that peer's later messages and nothing else. All
-//! file work is blocking, like the rest of this crate's storage: a caller runs it where
-//! blocking is allowed.
+//! this one just queued: the record merges, the log appends, and a queue and an action
+//! memory are the files that need the lock. The lock file is per peer, so two processes
+//! writing two peers never wait for each other; this process writes one queue at a time. The
+//! delivery sink runs with no lock held, so a slow caller delays that peer's later messages
+//! and nothing else. All file work is blocking, like the rest of this crate's storage: a
+//! caller runs it where blocking is allowed.
 
 mod store;
 mod wire;
@@ -120,21 +123,24 @@ use std::fmt;
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use quinn::{Connection, ReadToEndError, Runtime, SendStream};
+use quinn::{Connection, RecvStream, Runtime, SendStream};
 
 use crate::beacon::{sleep, timeout};
 use crate::hex;
+use crate::identity::PeerId;
 use crate::identity::access::Insecurity;
-use crate::identity::{Fingerprint, PeerId};
 use crate::peer::audit::{Act, AuditError, AuditLog, DropReason, Dropped, Entry, RefusedReason};
-use crate::peer::connect::{Connections, Traffic, presented};
+use crate::peer::connect::{Connections, Traffic};
 use crate::peer::messages::store::{MessageStore, Outcome};
-use crate::peer::record::{Limits, PeerRecord, RecordError, RecordStore, Timestamp};
-use crate::peer::rights::{Floor, Refusal, Rights, RightsError, Taking, Writing};
+use crate::peer::moment::Moment;
+use crate::peer::record::{RecordError, RecordStore, Timestamp, Untrusted};
+use crate::peer::rights::{Admission, Floor, Refusal, Rights, RightsError, Writing};
+use crate::peer::stream::{self, ReadFault};
+use crate::peer::sweep::Due;
+use crate::peer::window::Windows;
 
 /// The most bytes one message body may have.
 pub const MAX_BODY_BYTES: usize = 4096;
@@ -172,15 +178,6 @@ pub const MAX_OFFERS_PER_WINDOW: u32 = 30;
 
 /// How long the service waits between rounds when there is nothing to offer.
 pub(crate) const MESSAGE_POLL: Duration = Duration::from_secs(1);
-
-/// How often the service sweeps the queue it is serving: retention, the taken identifiers
-/// and a withdrawn trust. The offer's own gate is read every round, so a withdrawal stops
-/// the offering at once and only the drop waits for the sweep.
-pub(crate) const SWEEP_EVERY: Duration = Duration::from_secs(30);
-
-/// How often a receiving task wakes with nothing to read, so it can notice that the service
-/// that started it has stopped.
-pub(crate) const RECEIVER_IDLE: Duration = Duration::from_secs(10);
 
 /// How long one offer and its answer may take, measured by the injected runtime.
 pub const MESSAGE_BUDGET: Duration = Duration::from_secs(10);
@@ -425,15 +422,6 @@ pub trait Deliveries: Send + Sync {
     fn deliver(&self, delivery: Delivery) -> bool;
 }
 
-/// The caller's clock for the moments this layer records.
-///
-/// The crate never reads a clock: the moment a message was queued, the moment one was taken
-/// and the moment a sweep runs are all the caller's.
-pub trait Moment: Send + Sync {
-    /// The moment now.
-    fn now(&self) -> Timestamp;
-}
-
 /// Why a queue is not offering.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum QueueState {
@@ -470,9 +458,10 @@ pub struct Sweep {
 ///
 /// Built once per storage root, like the records and the log: the store it holds names the
 /// root's queues, and a second layer over one root shares them rather than copying them. A
-/// product runs [`Messages::serve`] once per paired peer, calls [`Messages::send`] when it
-/// has something to say, and calls [`Messages::sweep`] at start-up and periodically; the
-/// receiver's deliveries arrive through the [`Deliveries`] it was built with.
+/// product runs [`crate::peer::inbox::Inbox::serve`] once per paired peer — which offers this
+/// layer's queue and answers both services — calls [`Messages::send`] when it has something
+/// to say, and calls [`Messages::sweep`] at start-up and periodically; the receiver's
+/// deliveries arrive through the [`Deliveries`] it was built with.
 pub struct Messages {
     rights: Rights,
     floor: Arc<dyn Floor + Send + Sync>,
@@ -483,7 +472,7 @@ pub struct Messages {
     /// The sender's view of each receiver's throttle: when it may offer again.
     throttled: Mutex<BTreeMap<PeerId, Timestamp>>,
     /// The receiver's token buckets, one per peer, in memory only.
-    windows: Mutex<BTreeMap<PeerId, Window>>,
+    windows: Windows,
 }
 
 impl fmt::Debug for Messages {
@@ -492,13 +481,6 @@ impl fmt::Debug for Messages {
             .field("store", &self.store)
             .finish_non_exhaustive()
     }
-}
-
-/// One peer's offer window, as the receiver counts it.
-#[derive(Clone, Copy, Debug)]
-struct Window {
-    start: Timestamp,
-    count: u32,
 }
 
 impl Messages {
@@ -510,8 +492,8 @@ impl Messages {
     ///
     /// The records and the log are the caller's handles — build them over the same root —
     /// and the decision is built from them here. The floor, the clock, the delivery sink and
-    /// the runtime are injected: this crate has no runtime of its own, and the message layer
-    /// needs one to spawn its receiving task and measure its waits.
+    /// the runtime are injected: this crate has no runtime of its own, and the layer needs one
+    /// to measure its waits and to answer a peer through the inbox.
     ///
     /// # Errors
     ///
@@ -536,7 +518,7 @@ impl Messages {
             runtime,
             store,
             throttled: Mutex::new(BTreeMap::new()),
-            windows: Mutex::new(BTreeMap::new()),
+            windows: Windows::new(),
         })
     }
 
@@ -564,8 +546,8 @@ impl Messages {
         let Some(record) = self.rights.records().reread(peer)? else {
             return Err(MessageError::NotPaired { peer: *peer });
         };
-        if !record.trusted(&limits) {
-            return Err(untrusted(*peer, &record, &limits));
+        if let Some(why) = record.untrusted(&limits) {
+            return Err(why.into());
         }
         if body.len() > MAX_BODY_BYTES {
             return Err(MessageError::Body {
@@ -615,7 +597,7 @@ impl Messages {
     ///
     /// Every peer with a queue is visited; a queue that cannot be swept does not stop the
     /// rest, and the first failure is returned at the end — the same shape as the record
-    /// store's own start-up sweep. [`Messages::serve`] sweeps its own peer every
+    /// store's own start-up sweep. `Messages::offer_loop` sweeps its own peer every
     /// `SWEEP_EVERY` as well, so a product that runs only the services still expires its
     /// queues and still drops a withdrawn pair's; this call is for start-up, and for the
     /// peers no service is running for.
@@ -646,15 +628,14 @@ impl Messages {
 
     /// Offer `peer`'s queue over the pair's live connection, one message at a time.
     ///
-    /// An infinite loop, one per paired peer, run by the caller. Each round notices whether
-    /// the pair's connection changed, starts a receiving task for the new one, and offers
-    /// the head of the queue if the record allows it and the receiver has not asked this
-    /// machine to wait. A round that did not take the head off the queue — nothing to offer,
-    /// an offer nobody answered, another writer holding the queue — waits `MESSAGE_POLL`
-    /// before the next: a peer that accepts each stream and resets it costs one round a
-    /// second, not a spin. The queue is swept every `SWEEP_EVERY`, not every round, because
-    /// the offer's own gate is re-read each time and only the drop of an expired message
-    /// waits for the sweep.
+    /// An infinite loop, one per paired peer, run by [`crate::peer::inbox::Inbox::serve`] in
+    /// the same task as the receiving half. Each round offers the head of the queue if the
+    /// record allows it and the receiver has not asked this machine to wait. A round that did
+    /// not take the head off the queue — nothing to offer, an offer nobody answered, another
+    /// writer holding the queue — waits `MESSAGE_POLL` before the next: a peer that accepts
+    /// each stream and resets it costs one round a second, not a spin. The queue is swept every
+    /// `SWEEP_EVERY`, not every round, because the offer's own gate is re-read each time and
+    /// only the drop of an expired message waits for the sweep.
     ///
     /// The first stream a kept connection carries belongs to the binding exchange, so no
     /// offer is made until that exchange has finished: the receiving side would otherwise
@@ -663,39 +644,18 @@ impl Messages {
     /// # Errors
     ///
     /// A queue that cannot be read or written is not a queue with nothing in it: a refusal
-    /// this loop's own queue meets, one its gate's record or log meets, and one the receiving
-    /// task it started meets, all end the service and are returned to whoever started it. A
-    /// queue another writer holds this instant is not a fault: the round waits and tries
-    /// again.
-    ///
-    /// Dropping this future stops the receiving task it started: every wait the crate makes
-    /// in it is bounded, so it reaches the top of its loop within `RECEIVER_IDLE` or
-    /// `MESSAGE_BUDGET` and finds the service gone. Two waits are not the crate's: the
-    /// caller's own [`Deliveries::deliver`], which runs inside that task and holds this
-    /// pair's receiving for as long as it takes, and the audit log's cross-process lock,
-    /// which every append on this root takes — a blocked log delays every pair's entry, and
-    /// no queue is held while it is waited for.
-    pub async fn serve(
+    /// this loop's own queue meets, and one its gate's record or log meets, end the service and
+    /// are returned to whoever started it. A queue another writer holds this instant is not a
+    /// fault: the round waits and tries again.
+    pub(crate) async fn offer_loop(
         self: Arc<Self>,
         connections: Arc<Connections>,
         peer: PeerId,
     ) -> Result<(), MessageError> {
-        let running = Arc::new(AtomicBool::new(true));
-        let _stop = Stopping(Arc::clone(&running));
-        let fault: Fault = Arc::new(Mutex::new(None));
-        let mut watched: Option<Traffic> = None;
-        let mut swept: Option<Timestamp> = None;
+        let mut swept = Due::default();
         loop {
-            if let Some(error) = fault
-                .lock()
-                .expect("the service's fault is not poisoned")
-                .take()
-            {
-                return Err(error);
-            }
             let now = self.moment.now();
-            if swept.is_none_or(|last| now >= last.plus(SWEEP_EVERY)) {
-                swept = Some(now);
+            if swept.due(now) {
                 match self.sweep_peer(&peer) {
                     Ok(_) | Err(MessageError::Busy { .. }) => {}
                     Err(error) => return Err(error),
@@ -708,17 +668,6 @@ impl Messages {
             if !traffic.exchange_done() {
                 sleep(&*self.runtime, MESSAGE_POLL).await;
                 continue;
-            }
-            if !watched.as_ref().is_some_and(|seen| seen.same(&traffic)) {
-                watched = Some(traffic.clone());
-                self.runtime.spawn(Box::pin(receiver(
-                    Arc::clone(&self),
-                    Arc::clone(&connections),
-                    peer,
-                    traffic.clone(),
-                    Arc::clone(&running),
-                    Arc::clone(&fault),
-                )));
             }
             // The gate before the queue: a pair that may not be spoken to must not pay for
             // reading and decoding its head every round. A gate that cannot be answered is
@@ -733,7 +682,7 @@ impl Messages {
                 && until > now
             {
                 // One round at a time: the throttle is re-checked every round like everything
-                // else, so a refusal a receiving task meets is surfaced within a round rather
+                // else, so a refusal a stream task meets is surfaced within a round rather
                 // than up to a whole window later.
                 sleep(&*self.runtime, MESSAGE_POLL).await;
                 continue;
@@ -901,8 +850,8 @@ impl Messages {
 
     /// Answer one offer.
     ///
-    /// The offer was counted against the peer's window before its body was read
-    /// ([`Self::admit`]), so a peer cannot make this machine decode by flooding it. The body
+    /// The offer was counted against the peer's window before the rest of its frame was read
+    /// ([`Self::receive`]), so a peer cannot make this machine decode by flooding it. The body
     /// is decoded only to hand it over; the decision is about the peer. `Ok(None)` is no
     /// answer at all: the sender keeps its copy and offers again. `Err` is a record, a queue
     /// or a log this machine cannot read or write, which ends the service that started the
@@ -913,7 +862,7 @@ impl Messages {
             return Ok(Some(Answer::Unreadable));
         };
         match self.rights.may_take_message(peer, &*self.floor, now) {
-            Ok(Taking::Allowed(_)) => {
+            Ok(Admission::Allowed { .. }) => {
                 // A caller's panic is caught here and nowhere else: unwinding through this
                 // task would leave the pair receiving nothing while the service went on
                 // looking healthy, which is the one thing this layer must not do silently.
@@ -946,38 +895,13 @@ impl Messages {
                 }
             }
             // A refusal is of this message. The sender is told the class, not the words.
-            Ok(Taking::Refused(_)) => Ok(Some(Answer::Refused)),
+            Ok(Admission::Refused(_)) => Ok(Some(Answer::Refused)),
             // No pair to name yet: nothing to say, and the sender offers again rather than
             // losing the message to a state that is about to change.
-            Ok(Taking::Unbound) => Ok(None),
+            Ok(Admission::Unbound) => Ok(None),
             // The record or the log cannot be read: permanent, like any other such refusal.
             Err(error) => Err(error.into()),
         }
-    }
-
-    /// Count one offer against `peer`'s window, answering the delay when it is over the
-    /// limit.
-    ///
-    /// Counted when the stream is accepted and before its body is read, so a peer that opens
-    /// an offer stream and never writes still spends one offer of its window: the one "too
-    /// much" a read-time count could not see.
-    fn admit(&self, peer: &PeerId, now: Timestamp) -> Option<Duration> {
-        let mut windows = self.windows();
-        let window = windows.entry(*peer).or_insert(Window {
-            start: now,
-            count: 0,
-        });
-        if now >= window.start.plus(MESSAGE_WINDOW) {
-            *window = Window {
-                start: now,
-                count: 0,
-            };
-        }
-        if window.count >= MAX_OFFERS_PER_WINDOW {
-            return Some(window.start.plus(MESSAGE_WINDOW).remaining(now));
-        }
-        window.count += 1;
-        None
     }
 
     /// When the receiver last asked this machine to wait until.
@@ -990,133 +914,67 @@ impl Messages {
             .lock()
             .expect("the throttle map is not poisoned")
     }
-
-    fn windows(&self) -> MutexGuard<'_, BTreeMap<PeerId, Window>> {
-        self.windows
-            .lock()
-            .expect("the message windows are not poisoned")
-    }
 }
 
-/// The receiving half of one connection: read an offer, answer it, repeat.
-///
-/// One task per connection, started by [`Messages::serve`] when the pair's connection
-/// changes, and stopped when the service that started it is dropped: the task wakes every
-/// `RECEIVER_IDLE` and finds `running` false. The connection's presented key must be the
-/// peer the task was started for; the sender of every delivery is that peer and never a
-/// field in a frame. A queue or record this task cannot read or write, or a connection that
-/// does not present the peer's key, is left in `fault`, and the service that started it ends
-/// with that refusal instead of answering nothing forever.
-///
-/// This half does not begin a message round: the keeper's "an offer in flight is not the
-/// pair's traffic" rule is about this machine's own offers, and a peer that opens a stream
-/// is the peer acting. The offer's frames are on the wire beyond the binding exchange, so a
-/// message it takes is the pair's use by the counters alone; the sender's side, whose round
-/// ends after the answer, is the one that needs the take recorded, and does it in
-/// [`Messages::settle`].
-///
-/// Every wait the crate makes here is bounded: `RECEIVER_IDLE` for the next stream,
-/// `MESSAGE_BUDGET` for its body and `MESSAGE_BUDGET` for writing the answer back. A peer
-/// that stops reading — or advertises a window of one byte — ends that stream and costs the
-/// task one budget, not the pair. Two waits are not the crate's: the caller's
-/// [`Deliveries::deliver`], which this task calls and may take as long as it must and which
-/// holds this pair's receiving, and the audit log's cross-process lock, which every append
-/// on the root takes and which holds no queue.
-async fn receiver(
-    messages: Arc<Messages>,
-    connections: Arc<Connections>,
-    peer: PeerId,
-    traffic: Traffic,
-    running: Arc<AtomicBool>,
-    fault: Fault,
-) {
-    let connection = traffic.connection().clone();
-    let presented = presented(&connection);
-    if presented != Some(peer.fingerprint()) {
-        // Nothing read on this connection could be attributed to the pair, so the service
-        // ends with that refusal rather than receiving nothing for the connection's life.
-        *fault.lock().expect("the service's fault is not poisoned") =
-            Some(MessageError::WrongPeer { peer, presented });
-        return;
-    }
-    while running.load(Ordering::SeqCst) {
-        let accepted = timeout(&*messages.runtime, RECEIVER_IDLE, connection.accept_bi()).await;
-        let (send, mut recv) = match accepted {
-            // The idle wait passed with nothing to read: check whether the service is
-            // still there and wait again.
-            None => continue,
-            Some(Ok(streams)) => streams,
-            // The connection is closed: there is nothing left to read on it.
-            Some(Err(_)) => return,
-        };
-        if !connections.is_live(&peer, &traffic) {
-            return;
+impl Messages {
+    /// Answer one offer on `send`/`recv`, whose first bytes are `prefix`.
+    ///
+    /// The connection's presented key was checked by the inbox that called this, so `peer` is
+    /// the transport's attested author. The offer is counted against the peer's window once the
+    /// frame's first bytes are read — the earliest a stream is visible — and before the rest of
+    /// the frame, so a peer that writes an offer's first bytes and stalls still spends one
+    /// offer; a stream that never completes its prefix is classified as a message by the bytes
+    /// it did carry and counted here too. A frame this build cannot read is answered unreadable,
+    /// so the sender drops it instead of keeping it for the retention.
+    ///
+    /// This half does not begin a message round: the keeper's "an offer in flight is not the
+    /// pair's traffic" rule is about this machine's own offers, and a peer that opens a stream
+    /// is the peer acting. The offer's frames are on the wire beyond the binding exchange, so a
+    /// message it takes is the pair's use by the counters alone; the sender's side, whose round
+    /// ends after the answer, is the one that needs the take recorded, and does it in
+    /// [`Self::settle`].
+    pub(crate) async fn receive(
+        &self,
+        peer: PeerId,
+        send: SendStream,
+        mut recv: RecvStream,
+        prefix: Vec<u8>,
+    ) -> Result<(), MessageError> {
+        let now = self.moment.now();
+        if let Some(retry_after) =
+            self.windows
+                .admit(&peer, now, MESSAGE_WINDOW, MAX_OFFERS_PER_WINDOW)
+        {
+            reply(&*self.runtime, send, &Answer::Throttled { retry_after }).await;
+            return Ok(());
         }
-        // Counted before the body is read: a peer that opens a stream and never writes
-        // spends one offer of its window, and is told to wait like any other.
-        if let Some(retry_after) = messages.admit(&peer, messages.moment.now()) {
-            reply(&*messages.runtime, send, &Answer::Throttled { retry_after }).await;
-            continue;
-        }
-        let bytes = timeout(
-            &*messages.runtime,
+        let bytes = match stream::read_rest(
+            &*self.runtime,
+            &mut recv,
+            prefix,
+            MAX_MESSAGE_BYTES,
             MESSAGE_BUDGET,
-            recv.read_to_end(MAX_MESSAGE_BYTES),
         )
-        .await;
-        let answer = match bytes {
-            Some(Ok(bytes)) => match messages.handle(&peer, &bytes) {
-                Ok(answer) => answer,
-                Err(error) => {
-                    *fault.lock().expect("the service's fault is not poisoned") = Some(error);
-                    return;
-                }
-            },
-            // A frame longer than any message this build writes: the sender is told the
-            // frame cannot be read, so it drops it instead of keeping it for the retention.
-            Some(Err(ReadToEndError::TooLong)) => Some(Answer::Unreadable),
-            // The stream was reset, or the budget passed with nothing whole to read: no
-            // answer, and the sender offers again.
-            Some(Err(ReadToEndError::Read(_))) | None => None,
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(ReadFault::TooLong) => {
+                reply(&*self.runtime, send, &Answer::Unreadable).await;
+                return Ok(());
+            }
+            Err(ReadFault::Stalled) => return Ok(()),
         };
-        if let Some(answer) = answer {
-            reply(&*messages.runtime, send, &answer).await;
+        if let Some(answer) = self.handle(&peer, &bytes)? {
+            reply(&*self.runtime, send, &answer).await;
         }
+        Ok(())
     }
 }
 
 /// Write one answer back, bounded like every other wait this crate makes.
-///
-/// A peer that stops reading — or advertises a stream window smaller than the answer —
-/// would otherwise park this task for the pair for good, while keep-alives keep the
-/// connection looking healthy and the sender retries into a receiver that will never answer.
-/// `MESSAGE_BUDGET` bounds it: on a timeout the stream is dropped, which ends it after
-/// whatever part of the answer the window took, so the sender reads a partial answer or an
-/// error and offers again rather than waiting for a stream this machine never finishes.
-async fn reply(runtime: &dyn Runtime, mut send: SendStream, answer: &Answer) {
-    let bytes = answer.encode();
-    let _ = timeout(runtime, MESSAGE_BUDGET, async {
-        if send.write_all(&bytes).await.is_ok() {
-            let _ = send.finish();
-        }
-    })
-    .await;
+async fn reply(runtime: &dyn Runtime, send: SendStream, answer: &Answer) {
+    stream::write_reply(runtime, send, &answer.encode(), MESSAGE_BUDGET).await;
 }
-
-/// Flips the receiving tasks' flag when the service that started them is dropped.
-struct Stopping(Arc<AtomicBool>);
-
-impl Drop for Stopping {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
-    }
-}
-
-/// The first fault a service's receiving task met, for the service to return.
-///
-/// The receiving task is detached — a connection's reader cannot be awaited by the loop
-/// that offers — so this is how its refusal reaches whoever started the service.
-type Fault = Arc<Mutex<Option<MessageError>>>;
 
 /// The act that records a queue's drop, for the store to append between two holdings of the
 /// queue.
@@ -1149,13 +1007,13 @@ fn refused_act(peer: &PeerId, id: EnvelopeId, count: u64, reason: RefusedReason)
 /// The decision is `trusted`'s alone — one predicate for the handshake, the decision and
 /// this layer — and this only says which of the three reasons it was, so a caller sees
 /// "not paired", "withdrawn" or "closed" rather than one word for all three.
-fn untrusted(peer: PeerId, record: &PeerRecord, limits: &Limits) -> MessageError {
-    if record.is_withdrawn() {
-        MessageError::Withdrawn { peer }
-    } else if record.is_closed(limits) {
-        MessageError::Closed { peer }
-    } else {
-        MessageError::NotPaired { peer }
+impl From<Untrusted> for MessageError {
+    fn from(why: Untrusted) -> Self {
+        match why {
+            Untrusted::Withdrawn(peer) => Self::Withdrawn { peer },
+            Untrusted::Closed(peer) => Self::Closed { peer },
+            Untrusted::NotPaired(peer) => Self::NotPaired { peer },
+        }
     }
 }
 
@@ -1204,7 +1062,7 @@ pub enum MessageError {
     /// again. One layer's own writes wait for each other instead.
     Busy { peer: PeerId },
     /// The caller's [`Deliveries::deliver`] panicked. The message is still queued and the
-    /// service that started the receiving task stopped: a panic is a bug, and a pair that
+    /// service that started the stream task stopped: a panic is a bug, and a pair that
     /// went on receiving nothing would hide it. A restarted service takes messages again.
     Delivery { peer: PeerId },
     /// The peer's record refused, in the record's own words: a record that cannot be read or
@@ -1214,15 +1072,6 @@ pub enum MessageError {
     Audit(AuditError),
     /// The decision refused, in the decision's own words.
     Rights(RightsError),
-    /// The pair's connection presents a key that is not the peer's, or none at all. Nothing
-    /// read on it could be attributed to the pair, so the service that started the receiving
-    /// task ends instead of receiving nothing for the connection's life. Unreachable while
-    /// [`Connections`] keys a connection by the key it presented; it exists so that a path
-    /// that ever stops doing so cannot silence a pair.
-    WrongPeer {
-        peer: PeerId,
-        presented: Option<Fingerprint>,
-    },
     /// The bytes are not a frame this layer writes, naming which part of the framing is
     /// wrong. The vocabulary is shared with a queue file's [`MessageMalformed::Framing`],
     /// which adds the faults only a file can have; a frame's refusal carries no path.
@@ -1248,18 +1097,10 @@ pub enum MessageMalformed {
 /// can share.
 ///
 /// A queue file's refusal adds the faults only a file can have ([`MessageMalformed`]), so a
-/// fault a frame cannot produce is not expressible where a frame's reason is expected.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FramingFault {
-    /// The bytes do not open with the magic they should.
-    Magic,
-    /// The bytes open with the magic and stop before their version byte.
-    Truncated,
-    /// The version byte is zero, which no build writes.
-    Version { found: u8 },
-    /// A known field has the wrong shape or length.
-    Field { tag: u8, detail: String },
-}
+/// fault a frame cannot produce is not expressible where a frame's reason is expected. The
+/// faults themselves are the framing's, written once in `crate::peer::tlv` and shared with
+/// the action layer.
+pub use crate::peer::tlv::FramingFault;
 
 impl fmt::Display for MessageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1316,15 +1157,6 @@ impl fmt::Display for MessageError {
             Self::Frame { reason } => {
                 write!(f, "the bytes are not what this layer writes: {reason}")
             }
-            Self::WrongPeer { peer, presented } => {
-                let presented =
-                    presented.map_or_else(|| "no key".to_owned(), |key| key.to_string());
-                write!(
-                    f,
-                    "the connection for {} presents {presented}, not the peer",
-                    peer.fingerprint()
-                )
-            }
             Self::Delivery { peer } => write!(
                 f,
                 "the caller's delivery panicked, so the service stopped taking messages from {}",
@@ -1357,7 +1189,6 @@ impl std::error::Error for MessageError {
             | Self::Busy { .. }
             | Self::Delivery { .. }
             | Self::Frame { .. }
-            | Self::WrongPeer { .. }
             | Self::Random => None,
         }
     }
@@ -1376,21 +1207,6 @@ impl fmt::Display for MessageMalformed {
                 "`{name}` is not a message name: 64 lowercase hex characters"
             ),
             Self::Framing(reason) => reason.fmt(f),
-        }
-    }
-}
-
-impl fmt::Display for FramingFault {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Magic => f.write_str("the bytes do not open with the magic this format writes"),
-            Self::Truncated => {
-                f.write_str("the bytes end after the magic, before the version byte")
-            }
-            Self::Version { found } => {
-                write!(f, "the version byte is {found}, which no build writes")
-            }
-            Self::Field { tag, detail } => write!(f, "field {tag:#04x} {detail}"),
         }
     }
 }

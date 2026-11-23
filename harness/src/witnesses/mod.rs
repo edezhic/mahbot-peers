@@ -22,6 +22,7 @@
 
 use crate::inventory::Witness;
 
+mod actions;
 mod beacon;
 mod binding;
 mod checks;
@@ -113,6 +114,16 @@ pub const UNIX_WITNESSES: &[Witness] = &[
         id: "a_service_that_cannot_read_or_write_ends",
         capabilities: &["library.peer.messages.service_reports_a_broken_queue"],
         case: messages::a_service_that_cannot_read_or_write_ends,
+    },
+    Witness {
+        id: "an_action_file_is_private_to_the_account",
+        capabilities: &["library.peer.actions.private"],
+        case: actions::memory::an_action_file_is_private_to_the_account,
+    },
+    Witness {
+        id: "an_untraceable_unknown_names_both_outcomes",
+        capabilities: &["library.peer.actions.untraced"],
+        case: actions::memory::an_untraceable_unknown_names_both_outcomes,
     },
 ];
 
@@ -1203,8 +1214,244 @@ const WITNESSES: &[Witness] = &[
         ],
         case: messages::a_message_file_is_additive_and_refuses_garbage,
     },
+    Witness {
+        id: "an_action_runs_once_when_the_operation_is_offered_three_times",
+        capabilities: &[
+            "library.peer.actions.at_most_once",
+            "library.peer.actions.identifier_from_caller",
+        ],
+        case: actions::memory::an_action_runs_once_when_the_operation_is_offered_three_times,
+    },
+    Witness {
+        id: "a_reused_identifier_is_a_repeat_whatever_the_body",
+        capabilities: &["library.peer.actions.identifier_is_one_operation"],
+        case: actions::memory::a_reused_identifier_is_a_repeat_whatever_the_body,
+    },
+    Witness {
+        id: "an_action_remembers_across_the_receivers_restart",
+        capabilities: &["library.peer.actions.memory_survives_restart"],
+        case: actions::memory::an_action_remembers_across_the_receivers_restart,
+    },
+    Witness {
+        id: "a_repeat_after_the_week_runs_again",
+        capabilities: &["library.peer.actions.memory_retention"],
+        case: actions::memory::a_repeat_after_the_week_runs_again,
+    },
+    Witness {
+        id: "an_unanswered_action_is_unknown_and_never_offered_again",
+        capabilities: &[
+            "library.peer.actions.unknown_mark",
+            "library.peer.actions.unknown_survives_restart",
+            "library.peer.actions.never_retried",
+        ],
+        case: actions::memory::an_unanswered_action_is_unknown_and_never_offered_again,
+    },
+    Witness {
+        id: "a_repeat_while_the_first_runs_is_already_executed",
+        capabilities: &["library.peer.actions.in_flight_repeat"],
+        case: actions::memory::a_repeat_while_the_first_runs_is_already_executed,
+    },
+    Witness {
+        id: "a_withdrawn_trust_clears_the_action_memory",
+        capabilities: &["library.peer.actions.trust_withdrawal_clears"],
+        case: actions::memory::a_withdrawn_trust_clears_the_action_memory,
+    },
+    Witness {
+        id: "a_full_memory_refuses_rather_than_forgetting",
+        capabilities: &[
+            "library.peer.actions.memory_full",
+            "library.peer.actions.expired_cleared_first",
+        ],
+        case: actions::memory::a_full_memory_refuses_rather_than_forgetting,
+    },
+    Witness {
+        id: "a_result_too_large_to_carry_is_answered_and_remembered",
+        capabilities: &["library.peer.actions.result_bounded"],
+        case: actions::memory::a_result_too_large_to_carry_is_answered_and_remembered,
+    },
+    Witness {
+        id: "a_body_is_handed_over_as_written",
+        capabilities: &[
+            "library.peer.actions.body_stored_as_written",
+            "library.peer.actions.body_bounded",
+        ],
+        case: actions::memory::a_body_is_handed_over_as_written,
+    },
+    Witness {
+        id: "an_action_file_is_additive_and_refuses_garbage",
+        capabilities: &[
+            "library.peer.actions.format",
+            "library.peer.actions.malformed",
+        ],
+        case: actions::memory::an_action_file_is_additive_and_refuses_garbage,
+    },
+    Witness {
+        id: "a_refused_action_names_its_step_and_runs_once_the_right_is_given",
+        capabilities: &[
+            "library.peer.actions.right",
+            "library.peer.actions.refusal_not_remembered",
+        ],
+        case: actions::rights::a_refused_action_names_its_step_and_runs_once_the_right_is_given,
+    },
+    Witness {
+        id: "a_declined_action_is_not_remembered_and_answered_as_not_run",
+        capabilities: &["library.peer.actions.declined"],
+        case: actions::rights::a_declined_action_is_not_remembered_and_answered_as_not_run,
+    },
+    Witness {
+        id: "a_decline_is_answered_before_a_memory_fault_ends_the_service",
+        capabilities: &["library.peer.actions.declined"],
+        case: actions::rights::a_decline_is_answered_before_a_memory_fault_ends_the_service,
+    },
+    Witness {
+        id: "an_unbound_pair_is_not_ready_and_runs_once_bound",
+        capabilities: &["library.peer.actions.not_ready"],
+        case: actions::rights::an_unbound_pair_is_not_ready_and_runs_once_bound,
+    },
+    Witness {
+        id: "a_closed_pair_is_refused_before_the_dial",
+        capabilities: &["library.peer.actions.closed_pair"],
+        case: actions::rights::a_closed_pair_is_refused_before_the_dial,
+    },
+    Witness {
+        id: "an_action_body_cannot_choose_a_right",
+        capabilities: &["library.peer.actions.body_cannot_reach_a_capability"],
+        case: actions::rights::an_action_body_cannot_choose_a_right,
+    },
+    Witness {
+        id: "an_action_body_cannot_reach_a_capability_by_source",
+        capabilities: &["library.peer.actions.source_has_no_capability"],
+        case: checks::an_action_body_cannot_reach_a_capability_by_source,
+    },
+    Witness {
+        id: "an_unknown_kind_is_refused",
+        capabilities: &["library.peer.actions.kind_closed"],
+        case: actions::rights::an_unknown_kind_is_refused,
+    },
+    Witness {
+        id: "an_action_that_cannot_be_recorded_does_not_run",
+        capabilities: &[
+            "library.peer.actions.audit_first",
+            "library.peer.actions.audit_full_stops",
+            "library.peer.actions.audit_cap_stops",
+            "library.peer.actions.audit_entry",
+            "library.peer.actions.audit_no_body",
+        ],
+        case: actions::rights::an_action_that_cannot_be_recorded_does_not_run,
+    },
+    Witness {
+        id: "a_log_that_cannot_be_written_is_a_fault_the_sender_hears",
+        capabilities: &["library.peer.actions.audit_fault"],
+        case: actions::rights::a_log_that_cannot_be_written_is_a_fault_the_sender_hears,
+    },
+    Witness {
+        id: "a_second_process_on_the_root_is_busy",
+        capabilities: &["library.peer.actions.busy"],
+        case: actions::rights::a_second_process_on_the_root_is_busy,
+    },
+    Witness {
+        id: "a_sweep_of_a_held_memory_is_busy",
+        capabilities: &["library.peer.actions.sweep_busy"],
+        case: actions::rights::a_sweep_of_a_held_memory_is_busy,
+    },
+    Witness {
+        id: "a_message_and_an_action_share_one_connection",
+        capabilities: &[
+            "library.peer.inbox.dispatch",
+            "library.peer.actions.shared_connection",
+            "library.peer.messages.shared_connection",
+        ],
+        case: actions::link::a_message_and_an_action_share_one_connection,
+    },
+    Witness {
+        id: "the_pair_has_one_stream_acceptor",
+        capabilities: &["library.peer.inbox.one_reader"],
+        case: checks::the_pair_has_one_stream_acceptor,
+    },
+    Witness {
+        id: "a_malformed_action_is_answered_unreadable",
+        capabilities: &["library.peer.actions.unreadable_answered"],
+        case: actions::link::a_malformed_action_is_answered_unreadable,
+    },
+    Witness {
+        id: "a_flood_of_actions_is_throttled_and_messages_are_unaffected",
+        capabilities: &[
+            "library.peer.actions.throttle",
+            "library.peer.actions.separate_window",
+            "library.peer.actions.slow_down_not_traffic",
+        ],
+        case: actions::link::a_flood_of_actions_is_throttled_and_messages_are_unaffected,
+    },
+    Witness {
+        id: "a_retry_after_is_clamped_to_one_window",
+        capabilities: &["library.peer.actions.retry_after_bounded"],
+        case: actions::link::a_retry_after_is_clamped_to_one_window,
+    },
+    Witness {
+        id: "the_beacon_never_carries_an_action",
+        capabilities: &["library.peer.actions.not_on_the_beacon"],
+        case: actions::link::the_beacon_never_carries_an_action,
+    },
+    Witness {
+        id: "an_action_asked_while_the_pair_is_away_waits_for_the_dial",
+        capabilities: &["library.peer.actions.dial_on_demand"],
+        case: actions::link::an_action_asked_while_the_pair_is_away_waits_for_the_dial,
+    },
+    Witness {
+        id: "a_failed_dial_holds_nothing",
+        capabilities: &["library.peer.actions.no_queue"],
+        case: actions::link::a_failed_dial_holds_nothing,
+    },
+    Witness {
+        id: "a_slow_execution_is_unknown_and_another_pair_is_unaffected",
+        capabilities: &[
+            "library.peer.actions.execution_bounded",
+            "library.peer.actions.one_pair_at_a_time",
+        ],
+        case: actions::link::a_slow_execution_is_unknown_and_another_pair_is_unaffected,
+    },
+    Witness {
+        id: "an_action_memory_that_cannot_be_read_ends_the_service",
+        capabilities: &["library.peer.actions.service_reports_a_broken_memory"],
+        case: actions::link::an_action_memory_that_cannot_be_read_ends_the_service,
+    },
+    Witness {
+        id: "an_action_in_flight_is_not_the_pairs_traffic",
+        capabilities: &["library.peer.actions.offering_is_not_traffic"],
+        case: actions::link::an_action_in_flight_is_not_the_pairs_traffic,
+    },
+    Witness {
+        id: "an_answered_action_is_the_pairs_traffic",
+        capabilities: &["library.peer.actions.answered_is_traffic"],
+        case: actions::link::an_answered_action_is_the_pairs_traffic,
+    },
+    Witness {
+        id: "a_panicking_executor_ends_the_service",
+        capabilities: &["library.peer.actions.execution_panic"],
+        case: actions::link::a_panicking_executor_ends_the_service,
+    },
+    Witness {
+        id: "an_eagerly_panicking_executor_ends_the_service",
+        capabilities: &["library.peer.actions.execution_panic_eager"],
+        case: actions::link::an_eagerly_panicking_executor_ends_the_service,
+    },
+    Witness {
+        id: "an_identifier_round_trips_through_its_hex",
+        capabilities: &["library.peer.actions.identifier_hex"],
+        case: actions::memory::an_identifier_round_trips_through_its_hex,
+    },
+    Witness {
+        id: "a_request_that_never_left_is_not_spent",
+        capabilities: &["library.peer.actions.not_sent_not_spent"],
+        case: actions::link::a_request_that_never_left_is_not_spent,
+    },
+    Witness {
+        id: "one_request_has_one_total_budget",
+        capabilities: &["library.peer.actions.one_budget"],
+        case: actions::link::one_request_has_one_total_budget,
+    },
 ];
 
 // The host-independent part of the table, which the platform tables add to. This is
 // the floor that keeps a shrinking table from looking like a pass.
-const _: () = assert!(WITNESSES.len() >= 119, "the shared witness table shrank");
+const _: () = assert!(WITNESSES.len() >= 124, "the shared witness table shrank");

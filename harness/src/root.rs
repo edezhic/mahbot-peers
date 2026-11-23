@@ -12,24 +12,55 @@ use std::sync::Arc;
 use mahbot_peers::identity::keyfile;
 use mahbot_peers::identity::{Identity, PeerId};
 use mahbot_peers::peer::{
-    AuditError, AuditLog, Deliveries, Floor, Limits, Messages, Moment, RecordError, RecordStore,
+    Actions, AuditError, AuditLog, Deliveries, Executor, Floor, Limits, Messages, Moment,
+    RecordError, RecordStore,
 };
 use tempfile::TempDir;
 
 use crate::machine::RootId;
 
-/// A root directory owned by exactly one machine, removed when it is dropped.
+/// A root directory owned by exactly one machine, removed when the last handle is dropped.
+///
+/// The handle is shareable, so a case can keep the root, or hand a clone to a hook the machine's
+/// own code runs, while the machine keeps using it.
+#[derive(Clone)]
 pub(crate) struct Root {
     id: RootId,
-    dir: TempDir,
+    dir: Arc<TempDir>,
 }
+
+/// One service's files under a root, named by the module that owns them.
+///
+/// The message and action stores share one shape — a directory, one file per peer and one lock
+/// file beside it — so the plumbing is written once here and each service's methods are one-line
+/// wrappers over it.
+struct Store {
+    dir_in: fn(&Path) -> PathBuf,
+    path_for: fn(&Path, &PeerId) -> PathBuf,
+    lock_path_for: fn(&Path, &PeerId) -> PathBuf,
+}
+
+const MESSAGES_STORE: Store = Store {
+    dir_in: Messages::dir_in,
+    path_for: Messages::path_for,
+    lock_path_for: Messages::lock_path_for,
+};
+
+const ACTIONS_STORE: Store = Store {
+    dir_in: Actions::dir_in,
+    path_for: Actions::path_for,
+    lock_path_for: Actions::lock_path_for,
+};
 
 impl Root {
     pub(crate) fn create(id: RootId, parent: &Path) -> io::Result<Self> {
         let dir = tempfile::Builder::new()
             .prefix("root-")
             .tempdir_in(parent)?;
-        Ok(Self { id, dir })
+        Ok(Self {
+            id,
+            dir: Arc::new(dir),
+        })
     }
 
     pub(crate) fn id(&self) -> RootId {
@@ -184,40 +215,39 @@ impl Root {
         .map_err(|error| error.to_string())
     }
 
-    /// The name `peer`'s queue has under this root, as the message module spells it.
-    pub(crate) fn message_name(&self, peer: &PeerId) -> io::Result<String> {
+    /// The name `peer`'s file in `store` has under this root, as the owning module spells it.
+    fn store_name(&self, store: &Store, peer: &PeerId) -> io::Result<String> {
         self.ensure_alive()?;
-        self.relative(&Messages::path_for(self.dir.path(), peer))
+        self.relative(&(store.path_for)(self.dir.path(), peer))
     }
 
-    /// `peer`'s queue file, read as this root's bytes.
-    pub(crate) fn read_message(&self, peer: &PeerId) -> io::Result<Vec<u8>> {
-        self.read(&self.message_name(peer)?)
+    /// `peer`'s file in `store`, read as this root's bytes.
+    fn read_store(&self, store: &Store, peer: &PeerId) -> io::Result<Vec<u8>> {
+        self.read(&self.store_name(store, peer)?)
     }
 
-    /// `peer`'s queue file, replaced as this root's bytes.
-    pub(crate) fn write_message(&self, peer: &PeerId, bytes: &[u8]) -> io::Result<()> {
-        self.write(&self.message_name(peer)?, bytes)
+    /// `peer`'s file in `store`, replaced as this root's bytes.
+    fn write_store(&self, store: &Store, peer: &PeerId, bytes: &[u8]) -> io::Result<()> {
+        self.write(&self.store_name(store, peer)?, bytes)
     }
 
-    /// `peer`'s queue file, removed as a deleted file or a restored backup removes it.
-    pub(crate) fn remove_message(&self, peer: &PeerId) -> io::Result<()> {
+    /// `peer`'s file in `store`, removed as a deleted file or a restored backup removes it.
+    fn remove_store(&self, store: &Store, peer: &PeerId) -> io::Result<()> {
         self.ensure_alive()?;
-        fs::remove_file(self.resolve(&self.message_name(peer)?)?)
+        fs::remove_file(self.resolve(&self.store_name(store, peer)?)?)
     }
 
-    /// The name of the file a writer locks for `peer`'s queue: beside the queue, as the
-    /// message module spells it.
-    pub(crate) fn message_lock_name(&self, peer: &PeerId) -> io::Result<String> {
+    /// The name of the file a writer locks for `peer`'s file in `store`.
+    fn store_lock_name(&self, store: &Store, peer: &PeerId) -> io::Result<String> {
         self.ensure_alive()?;
-        self.relative(&Messages::lock_path_for(self.dir.path(), peer))
+        self.relative(&(store.lock_path_for)(self.dir.path(), peer))
     }
 
-    /// Hold `peer`'s queue lock, as the self-update window's second process does for the span
-    /// of one read-modify-publish. The file is created privately, by the crate's own rule, so
-    /// the lock the case holds is one the crate would take itself.
-    pub(crate) fn lock_message(&self, peer: &PeerId) -> io::Result<File> {
-        let name = self.message_lock_name(peer)?;
+    /// Hold `peer`'s lock in `store`, as the self-update window's second process does. The file
+    /// is created privately, by the crate's own rule, so the lock the case holds is one the crate
+    /// would take itself.
+    fn lock_store(&self, store: &Store, peer: &PeerId) -> io::Result<File> {
+        let name = self.store_lock_name(store, peer)?;
         self.write(&name, b"")?;
         let file = File::options()
             .read(true)
@@ -227,51 +257,182 @@ impl Root {
         Ok(file)
     }
 
+    /// The directory `store` keeps its files in.
+    fn store_dir(&self, store: &Store) -> io::Result<PathBuf> {
+        self.ensure_alive()?;
+        Ok((store.dir_in)(self.dir.path()))
+    }
+
+    /// The mode of `store`'s directory.
+    #[cfg(unix)]
+    fn store_dir_mode(&self, store: &Store) -> io::Result<u32> {
+        use std::os::unix::fs::PermissionsExt;
+        Ok(fs::metadata(self.store_dir(store)?)?.permissions().mode() & 0o777)
+    }
+
+    /// Give `store`'s directory a mode, as a root that was never hardened leaves it.
+    #[cfg(unix)]
+    fn set_store_dir_mode(&self, store: &Store, mode: u32) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(self.store_dir(store)?, fs::Permissions::from_mode(mode))
+    }
+
+    /// Give `peer`'s file in `store` a mode, as an installation whose root was never hardened
+    /// leaves it reachable by another account.
+    #[cfg(unix)]
+    fn set_store_file_mode(&self, store: &Store, peer: &PeerId, mode: u32) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let path = self.resolve(&self.store_name(store, peer)?)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+    }
+
+    /// Turn `store`'s directory into a symbolic link to a directory beside it, as a backup tool
+    /// that moved it leaves it.
+    #[cfg(unix)]
+    fn replace_store_dir_with_a_link(&self, store: &Store) -> io::Result<()> {
+        let dir = self.store_dir(store)?;
+        let name = dir.file_name().map_or_else(
+            || "store".to_owned(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        let elsewhere = dir.with_file_name(format!("{name}-elsewhere"));
+        fs::rename(&dir, &elsewhere)?;
+        std::os::unix::fs::symlink(&elsewhere, &dir)
+    }
+
+    /// The name `peer`'s queue has under this root, as the message module spells it.
+    pub(crate) fn message_name(&self, peer: &PeerId) -> io::Result<String> {
+        self.store_name(&MESSAGES_STORE, peer)
+    }
+
+    /// `peer`'s queue file, read as this root's bytes.
+    pub(crate) fn read_message(&self, peer: &PeerId) -> io::Result<Vec<u8>> {
+        self.read_store(&MESSAGES_STORE, peer)
+    }
+
+    /// `peer`'s queue file, replaced as this root's bytes.
+    pub(crate) fn write_message(&self, peer: &PeerId, bytes: &[u8]) -> io::Result<()> {
+        self.write_store(&MESSAGES_STORE, peer, bytes)
+    }
+
+    /// `peer`'s queue file, removed as a deleted file or a restored backup removes it.
+    pub(crate) fn remove_message(&self, peer: &PeerId) -> io::Result<()> {
+        self.remove_store(&MESSAGES_STORE, peer)
+    }
+
+    /// The name of the file a writer locks for `peer`'s queue: beside the queue, as the
+    /// message module spells it.
+    pub(crate) fn message_lock_name(&self, peer: &PeerId) -> io::Result<String> {
+        self.store_lock_name(&MESSAGES_STORE, peer)
+    }
+
+    /// Hold `peer`'s queue lock, as the self-update window's second process does for the span
+    /// of one read-modify-publish.
+    pub(crate) fn lock_message(&self, peer: &PeerId) -> io::Result<File> {
+        self.lock_store(&MESSAGES_STORE, peer)
+    }
+
     /// The directory holding this root's queues, removed whole, as a cleaner or a botched
     /// restore removes it.
     pub(crate) fn remove_message_dir(&self) -> io::Result<()> {
-        self.ensure_alive()?;
-        fs::remove_dir_all(Messages::dir_in(self.dir.path()))
-    }
-
-    /// The directory holding this root's queues, as the message module spells it.
-    #[cfg(unix)]
-    fn messages_dir(&self) -> io::Result<PathBuf> {
-        self.ensure_alive()?;
-        Ok(Messages::dir_in(self.dir.path()))
+        fs::remove_dir_all(self.store_dir(&MESSAGES_STORE)?)
     }
 
     /// The mode of the messages directory.
     #[cfg(unix)]
     pub(crate) fn message_dir_mode(&self) -> io::Result<u32> {
-        use std::os::unix::fs::PermissionsExt;
-        Ok(fs::metadata(self.messages_dir()?)?.permissions().mode() & 0o777)
+        self.store_dir_mode(&MESSAGES_STORE)
     }
 
     /// Give the messages directory a mode, as a root that was never hardened leaves it.
     #[cfg(unix)]
     pub(crate) fn set_message_dir_mode(&self, mode: u32) -> io::Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(self.messages_dir()?, fs::Permissions::from_mode(mode))
+        self.set_store_dir_mode(&MESSAGES_STORE, mode)
     }
 
     /// Give `peer`'s queue file a mode, as an installation whose root was never hardened
     /// leaves it reachable by another account.
     #[cfg(unix)]
     pub(crate) fn set_message_file_mode(&self, peer: &PeerId, mode: u32) -> io::Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-        let path = self.resolve(&self.message_name(peer)?)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        self.set_store_file_mode(&MESSAGES_STORE, peer, mode)
     }
 
     /// Turn the messages directory into a symbolic link to a directory beside it, as a
     /// backup tool that moved it leaves it.
     #[cfg(unix)]
     pub(crate) fn replace_message_dir_with_a_link(&self) -> io::Result<()> {
-        let dir = self.messages_dir()?;
-        let elsewhere = dir.with_file_name("messages-elsewhere");
-        fs::rename(&dir, &elsewhere)?;
-        std::os::unix::fs::symlink(&elsewhere, &dir)
+        self.replace_store_dir_with_a_link(&MESSAGES_STORE)
+    }
+
+    /// This root's action layer, opened over the real directory.
+    ///
+    /// The records and the log are the machine's own handles, so the memory, the decision and
+    /// the record of it come from one root.
+    pub(crate) fn actions(
+        &self,
+        records: RecordStore,
+        audit: AuditLog,
+        floor: Arc<dyn Floor + Send + Sync>,
+        moment: Arc<dyn Moment + Send + Sync>,
+        executor: Arc<dyn Executor + Send + Sync>,
+        runtime: Arc<dyn quinn::Runtime>,
+    ) -> Result<Actions, String> {
+        self.ensure_alive().map_err(|error| error.to_string())?;
+        Actions::open(
+            self.dir.path(),
+            records,
+            audit,
+            floor,
+            moment,
+            executor,
+            runtime,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    /// The name `peer`'s action memory has under this root, as the action module spells it.
+    pub(crate) fn action_name(&self, peer: &PeerId) -> io::Result<String> {
+        self.store_name(&ACTIONS_STORE, peer)
+    }
+
+    /// `peer`'s action memory, read as this root's bytes.
+    pub(crate) fn read_action(&self, peer: &PeerId) -> io::Result<Vec<u8>> {
+        self.read_store(&ACTIONS_STORE, peer)
+    }
+
+    /// `peer`'s action memory, replaced as this root's bytes.
+    pub(crate) fn write_action(&self, peer: &PeerId, bytes: &[u8]) -> io::Result<()> {
+        self.write_store(&ACTIONS_STORE, peer, bytes)
+    }
+
+    /// Hold `peer`'s action-memory lock, as the self-update window's second process does.
+    pub(crate) fn lock_action(&self, peer: &PeerId) -> io::Result<File> {
+        self.lock_store(&ACTIONS_STORE, peer)
+    }
+
+    /// The mode of the actions directory.
+    #[cfg(unix)]
+    pub(crate) fn action_dir_mode(&self) -> io::Result<u32> {
+        self.store_dir_mode(&ACTIONS_STORE)
+    }
+
+    /// Give the actions directory a mode, as a root that was never hardened leaves it.
+    #[cfg(unix)]
+    pub(crate) fn set_action_dir_mode(&self, mode: u32) -> io::Result<()> {
+        self.set_store_dir_mode(&ACTIONS_STORE, mode)
+    }
+
+    /// Give `peer`'s action memory a mode, as an installation whose root was never hardened
+    /// leaves it reachable by another account.
+    #[cfg(unix)]
+    pub(crate) fn set_action_file_mode(&self, peer: &PeerId, mode: u32) -> io::Result<()> {
+        self.set_store_file_mode(&ACTIONS_STORE, peer, mode)
+    }
+
+    /// Turn the actions directory into a symbolic link to a directory beside it.
+    #[cfg(unix)]
+    pub(crate) fn replace_action_dir_with_a_link(&self) -> io::Result<()> {
+        self.replace_store_dir_with_a_link(&ACTIONS_STORE)
     }
 
     /// The audit log's bytes, as this root's file.
@@ -282,6 +443,26 @@ impl Root {
     /// Replace the audit log's bytes, as a torn write or a damaged file leaves them.
     pub(crate) fn write_audit(&self, bytes: &[u8]) -> io::Result<()> {
         self.write(&self.audit_name()?, bytes)
+    }
+
+    /// Turn the audit log into a directory, so the next append is refused: a hard fault rather
+    /// than the cap's refusal.
+    pub(crate) fn replace_audit_with_a_directory(&self) -> io::Result<()> {
+        self.replace_with_a_directory(&self.audit_name()?)
+    }
+
+    /// Turn `peer`'s action memory into a directory, so the next read is refused: a hard fault
+    /// rather than the journal's own refusals.
+    pub(crate) fn replace_action_with_a_directory(&self, peer: &PeerId) -> io::Result<()> {
+        self.replace_with_a_directory(&self.action_name(peer)?)
+    }
+
+    /// Replace one of this root's files with a directory of the same name.
+    fn replace_with_a_directory(&self, name: &str) -> io::Result<()> {
+        let path = self.resolve(name)?;
+        self.ensure_alive()?;
+        fs::remove_file(&path)?;
+        fs::create_dir(&path)
     }
 
     /// The name the audit log has under this root, as the audit module spells it.

@@ -1,10 +1,17 @@
 //! `[tag][len u16 big-endian][body]`: the one framing every peer file and frame shares.
 //!
 //! Every format this crate writes spells it — a record's fields, an audit entry's fields, a
-//! fact's fields, a queue file's fields (and those of the message or taken identifier inside
-//! one), and the message and answer frames — and each reader must refuse a length that runs
+//! fact's fields, a queue or action file's fields (and those of the records inside one), and
+//! the message, action and answer frames — and each reader must refuse a length that runs
 //! past the end the same way. This is the one place the framing is written and walked, so a
 //! field is framed once and its frame's faults are named once.
+//!
+//! [`FramingFault`] is the four faults a file and a frame share. It lives here because every
+//! reader of this framing answers with them; a layer's own malformed type adds the faults only
+//! a file can have, so a fault a frame cannot produce is not expressible where a frame's reason
+//! is expected.
+
+use std::fmt;
 
 /// A body longer than the `u16` length a field can name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,5 +89,33 @@ impl<'a> Iterator for Fields<'a> {
         };
         self.rest = after;
         Some(Ok((tag, body)))
+    }
+}
+
+/// What is wrong with the framing of a layer's bytes: the four faults a file and a frame can
+/// share.
+///
+/// A file's own refusal adds the faults only a file can have, so a fault a frame cannot
+/// produce is not expressible where a frame's reason is expected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FramingFault {
+    /// The bytes do not open with the magic they should.
+    Magic,
+    /// The bytes open with the magic and stop before their version byte.
+    Truncated,
+    /// The version byte is zero, which no build writes.
+    Version { found: u8 },
+    /// A known field has the wrong shape or length.
+    Field { tag: u8, detail: String },
+}
+
+impl fmt::Display for FramingFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Magic => f.write_str("it does not begin with the magic"),
+            Self::Truncated => f.write_str("it stops before its version byte"),
+            Self::Version { found } => write!(f, "its version is {found}, which no build writes"),
+            Self::Field { tag, detail } => write!(f, "its field {tag:#04x} {detail}"),
+        }
     }
 }

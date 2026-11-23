@@ -3,11 +3,12 @@
 //! # What it holds
 //!
 //! Every grant, every refusal, every ending, every withdrawal, every return, the
-//! clearing of a pairing attempt lock, and — at the message layer — every message a
-//! receiver refused and every queue that was dropped: what was decided, under whose
-//! rights, and when. The moment is the caller's, like every other moment this crate
-//! records. A message's body is never here: the entry names the envelope and the
-//! reason, so the log says what happened without keeping what was said.
+//! clearing of a pairing attempt lock, and — at the message and action layers — every
+//! message a receiver refused, every queue that was dropped and every action recorded
+//! before it ran: what was decided, under whose rights, and when. The moment is the
+//! caller's, like every other moment this crate records. A message's body and an
+//! action's body are never here: the entry names the envelope or the operation, so the
+//! log says what happened without keeping what was said or what was asked.
 //!
 //! # Why append-only
 //!
@@ -68,9 +69,10 @@
 //! file past it is refused rather than read into memory. Within it, the bytes above
 //! [`RESERVED_FOR_PERSON_BYTES`] below the cap are kept for a person's acts. The
 //! entries a peer causes by asking — a refusal, a refused write, the ending a question
-//! notices, a message a receiver refuses — are not written once they would reach into that
-//! reserve, while a grant, a withdrawal, a trust withdrawal, a return and an attempt-lock
-//! clearing still are. So a peer cannot fill the log and take away the acts that stop it,
+//! notices, a message a receiver refuses and an action a receiver executes — are not written
+//! once they would reach into that reserve, while a grant, a withdrawal, a trust withdrawal, a
+//! return and an attempt-lock clearing still are. So a peer cannot fill the log and take away
+//! the acts that stop it,
 //! and a refusal that cannot be written is still answered: nothing changes when a question
 //! is refused, so the answer does not depend on the entry. An ending that cannot be written
 //! leaves its row unmarked and refuses all the same — the term passed, and the row's own
@@ -154,6 +156,7 @@ mod code {
     pub const WRITE_REFUSED: u8 = 8;
     pub const MESSAGE_REFUSED: u8 = 9;
     pub const MESSAGES_DROPPED: u8 = 10;
+    pub const ACTION_EXECUTED: u8 = 11;
 }
 
 /// The act body's field tags.
@@ -176,6 +179,7 @@ mod field_tag {
     pub const COUNT: u8 = 0x10;
     pub const DROPPED: u8 = 0x11;
     pub const DROP: u8 = 0x12;
+    pub const ACTION_ID: u8 = 0x13;
 }
 
 /// The entry body's field tags.
@@ -255,6 +259,24 @@ pub enum Act {
         /// Why they went.
         reason: DropReason,
     },
+    /// An action was recorded before it ran, naming the peer, the right it ran under and the
+    /// operation's identifier. It never carries the body: what the command actually was is the
+    /// product's own record, keyed by the identifier.
+    ///
+    /// The entry is written before the run it describes, as every other act in this crate is:
+    /// a crash may leave a recorded execution that did not happen and never an execution
+    /// nobody recorded. An execution the machine's own code declines leaves the entry behind,
+    /// which is the same direction.
+    ActionExecuted {
+        pair: Pair,
+        capability: Capability,
+        /// The operation's identifier, 16 bytes.
+        id: [u8; 16],
+        /// Who issued the right it ran under.
+        issuer: Issuer,
+        /// The right's term, when it had one.
+        expires_at: Option<Timestamp>,
+    },
     /// An act a newer build wrote: kept so nothing hides, never acted on.
     Unrecognised { code: u8 },
 }
@@ -310,14 +332,15 @@ pub struct Dropped {
 impl Act {
     /// Whether a question or a peer's write can cause this act.
     ///
-    /// A refused question, a refused write, an ending a question notices and a message
-    /// a receiver refuses are the acts a peer causes by asking: none of them changes a
-    /// right, and a peer that keeps asking can cause another one each time — an ending
-    /// that cannot be marked on the row is noticed again by the next question. Every
-    /// other act is a person's, or the default's at a pair's coming-into-being, and is
-    /// bounded by what the record holds. Only these stop at [`RESERVED_FOR_PERSON_BYTES`].
-    /// A drop is not among them: every drop is this machine's own — a sweep, or a withdrawal
-    /// a person made — so a peer cannot cause one at all.
+    /// A refused question, a refused write, an ending a question notices, a message a receiver
+    /// refuses and an action a receiver executes are the acts a peer causes by asking: none of
+    /// them changes a right, and a peer that keeps asking can cause another one each time — an
+    /// ending that cannot be marked on the row is noticed again by the next question, and a
+    /// peer that keeps sending actions causes an execution entry for each one it is allowed.
+    /// Every other act is a person's, or the default's at a pair's coming-into-being, and is
+    /// bounded by what the record holds. Only these stop at [`RESERVED_FOR_PERSON_BYTES`]. A
+    /// drop is not among them: every drop is this machine's own — a sweep, or a withdrawal a
+    /// person made — so a peer cannot cause one at all.
     #[must_use]
     pub(crate) const fn is_peer_driven(&self) -> bool {
         matches!(
@@ -326,6 +349,7 @@ impl Act {
                 | Self::WriteRefused { .. }
                 | Self::Ended { .. }
                 | Self::MessageRefused { .. }
+                | Self::ActionExecuted { .. }
         )
     }
 }
@@ -846,6 +870,7 @@ struct Fields {
     remote: Option<PeerId>,
     write_refusal: Option<u8>,
     message_id: Option<[u8; 16]>,
+    action_id: Option<[u8; 16]>,
     count: Option<u64>,
     dropped: Option<Vec<Dropped>>,
     drop: Option<DropReason>,
@@ -918,6 +943,9 @@ impl Fields {
                 }
                 field_tag::MESSAGE_ID => {
                     fields.message_id = Some(tlv::id_of(tag, body).map_err(field_error)?);
+                }
+                field_tag::ACTION_ID => {
+                    fields.action_id = Some(tlv::id_of(tag, body).map_err(field_error)?);
                 }
                 field_tag::COUNT => {
                     fields.count = Some(tlv::u64_of(tag, body).map_err(field_error)?);
@@ -1032,8 +1060,14 @@ fn encode_entry(entry: &Entry) -> Result<Vec<u8>, String> {
         entry_tag::AT,
         &entry.at.unix_seconds().to_be_bytes(),
     )?;
-    let mut act = Vec::with_capacity(40);
-    match &entry.act {
+    put_field(&mut body, entry_tag::ACT, &encode_act(&entry.act)?)?;
+    Ok(body)
+}
+
+/// One act's bytes: its code and the fields that code names.
+fn encode_act(act: &Act) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::with_capacity(40);
+    match act {
         Act::Granted {
             pair,
             capability,
@@ -1041,60 +1075,60 @@ fn encode_entry(entry: &Entry) -> Result<Vec<u8>, String> {
             expires_at,
             kind,
         } => {
-            act.push(code::GRANTED);
-            put_granted(&mut act, pair, *capability, issuer, *expires_at, *kind)?;
+            bytes.push(code::GRANTED);
+            put_granted(&mut bytes, pair, *capability, issuer, *expires_at, *kind)?;
         }
         Act::Refused {
             pair,
             capability,
             refusal,
         } => {
-            act.push(code::REFUSED);
-            put_refusal(&mut act, pair, *capability, refusal)?;
+            bytes.push(code::REFUSED);
+            put_refusal(&mut bytes, pair, *capability, refusal)?;
         }
         Act::Ended { pair, capability } => {
-            act.push(code::ENDED);
-            put_capability(&mut act, pair, *capability)?;
+            bytes.push(code::ENDED);
+            put_capability(&mut bytes, pair, *capability)?;
         }
         Act::Withdrawn {
             pair,
             capability,
             by,
         } => {
-            act.push(code::WITHDRAWN);
-            put_capability(&mut act, pair, *capability)?;
-            put_person(&mut act, by)?;
+            bytes.push(code::WITHDRAWN);
+            put_capability(&mut bytes, pair, *capability)?;
+            put_person(&mut bytes, by)?;
         }
         Act::TrustWithdrawn { peer, by, rights } => {
-            act.push(code::TRUST_WITHDRAWN);
-            put_field(&mut act, field_tag::PEER, peer.as_bytes())?;
-            put_person(&mut act, by)?;
+            bytes.push(code::TRUST_WITHDRAWN);
+            put_field(&mut bytes, field_tag::PEER, peer.as_bytes())?;
+            put_person(&mut bytes, by)?;
             let removed = u32::try_from(*rights).unwrap_or(u32::MAX);
-            put_field(&mut act, field_tag::REMOVED, &removed.to_be_bytes())?;
+            put_field(&mut bytes, field_tag::REMOVED, &removed.to_be_bytes())?;
         }
         Act::TrustRestored { peer, by } => {
-            act.push(code::TRUST_RESTORED);
-            put_field(&mut act, field_tag::PEER, peer.as_bytes())?;
-            put_person(&mut act, by)?;
+            bytes.push(code::TRUST_RESTORED);
+            put_field(&mut bytes, field_tag::PEER, peer.as_bytes())?;
+            put_person(&mut bytes, by)?;
         }
         Act::AttemptLockCleared { peer, by } => {
-            act.push(code::ATTEMPT_LOCK_CLEARED);
-            put_field(&mut act, field_tag::PEER, peer.as_bytes())?;
-            put_person(&mut act, by)?;
+            bytes.push(code::ATTEMPT_LOCK_CLEARED);
+            put_field(&mut bytes, field_tag::PEER, peer.as_bytes())?;
+            put_person(&mut bytes, by)?;
         }
         Act::WriteRefused {
             pair,
             capability,
             reason,
         } => {
-            act.push(code::WRITE_REFUSED);
-            put_capability(&mut act, pair, *capability)?;
+            bytes.push(code::WRITE_REFUSED);
+            put_capability(&mut bytes, pair, *capability)?;
             let (refusal, remote) = match reason {
                 WriteRefusal::RemoteAuthority { peer } => (1, Some(peer)),
             };
-            put_field(&mut act, field_tag::WRITE_REFUSAL, &[refusal])?;
+            put_field(&mut bytes, field_tag::WRITE_REFUSAL, &[refusal])?;
             if let Some(remote) = remote {
-                put_field(&mut act, field_tag::REMOTE, remote.as_bytes())?;
+                put_field(&mut bytes, field_tag::REMOTE, remote.as_bytes())?;
             }
         }
         Act::MessageRefused {
@@ -1103,23 +1137,30 @@ fn encode_entry(entry: &Entry) -> Result<Vec<u8>, String> {
             count,
             reason,
         } => {
-            act.push(code::MESSAGE_REFUSED);
-            put_message_refused(&mut act, peer, id, *count, *reason)?;
+            bytes.push(code::MESSAGE_REFUSED);
+            put_message_refused(&mut bytes, peer, id, *count, *reason)?;
         }
         Act::MessagesDropped {
             peer,
             dropped,
             reason,
         } => {
-            act.push(code::MESSAGES_DROPPED);
-            put_field(&mut act, field_tag::PEER, peer.as_bytes())?;
-            put_dropped(&mut act, dropped)?;
-            put_field(&mut act, field_tag::DROP, &[drop_reason_byte(*reason)])?;
+            bytes.push(code::MESSAGES_DROPPED);
+            put_messages_dropped(&mut bytes, peer, dropped, *reason)?;
         }
-        Act::Unrecognised { code } => act.push(*code),
+        Act::ActionExecuted {
+            pair,
+            capability,
+            id,
+            issuer,
+            expires_at,
+        } => {
+            bytes.push(code::ACTION_EXECUTED);
+            put_action_executed(&mut bytes, pair, *capability, id, issuer, *expires_at)?;
+        }
+        Act::Unrecognised { code } => bytes.push(*code),
     }
-    put_field(&mut body, entry_tag::ACT, &act)?;
-    Ok(body)
+    Ok(bytes)
 }
 
 /// Append a grant: the pair and capability, the issuer, the term and the kind.
@@ -1143,6 +1184,28 @@ fn put_granted(
     put_field(act, field_tag::KIND, &[grant_kind_byte(kind)])
 }
 
+/// Append an executed action: the pair and capability, the identifier, the issuer and the term.
+fn put_action_executed(
+    act: &mut Vec<u8>,
+    pair: &Pair,
+    capability: Capability,
+    id: &[u8; 16],
+    issuer: &Issuer,
+    expires_at: Option<Timestamp>,
+) -> Result<(), String> {
+    put_capability(act, pair, capability)?;
+    put_field(act, field_tag::ACTION_ID, id)?;
+    put_issuer(act, issuer)?;
+    if let Some(expires_at) = expires_at {
+        put_field(
+            act,
+            field_tag::EXPIRY,
+            &expires_at.unix_seconds().to_be_bytes(),
+        )?;
+    }
+    Ok(())
+}
+
 /// Append a refused message: the machine, the envelope and the class of the refusal.
 fn put_message_refused(
     act: &mut Vec<u8>,
@@ -1155,6 +1218,18 @@ fn put_message_refused(
     put_field(act, field_tag::MESSAGE_ID, id)?;
     put_field(act, field_tag::COUNT, &count.to_be_bytes())?;
     put_field(act, field_tag::REASON, &[refused_reason_byte(reason)])
+}
+
+/// Append a dropped queue: the machine, the messages and the reason.
+fn put_messages_dropped(
+    act: &mut Vec<u8>,
+    peer: &PeerId,
+    dropped: &[Dropped],
+    reason: DropReason,
+) -> Result<(), String> {
+    put_field(act, field_tag::PEER, peer.as_bytes())?;
+    put_dropped(act, dropped)?;
+    put_field(act, field_tag::DROP, &[drop_reason_byte(reason)])
 }
 
 /// Append the dropped messages: 24 bytes each, a count and an identifier.
@@ -1297,7 +1372,7 @@ fn decode_act(body: &[u8]) -> Result<Act, String> {
     if code == 0 {
         return Err("the act code is zero".to_owned());
     }
-    if !(code::GRANTED..=code::MESSAGES_DROPPED).contains(&code) {
+    if !(code::GRANTED..=code::ACTION_EXECUTED).contains(&code) {
         return Ok(Act::Unrecognised { code });
     }
     // A code this build knows but whose fields it cannot read is a newer build's
@@ -1390,6 +1465,16 @@ fn decode_known_act(code: u8, fields: &[u8]) -> Result<Act, String> {
             dropped: fields.dropped.clone().ok_or("the act names no messages")?,
             reason: fields.drop.ok_or("the act names no reason")?,
         }),
+        code::ACTION_EXECUTED => Ok(Act::ActionExecuted {
+            pair: fields.pair()?,
+            capability: fields.capability()?,
+            id: fields.action_id.ok_or("the act names no action")?,
+            issuer: fields
+                .issuer
+                .clone()
+                .ok_or("the execution names no issuer")?,
+            expires_at: fields.expiry,
+        }),
         _ => Ok(Act::Unrecognised { code }),
     }
 }
@@ -1415,8 +1500,9 @@ pub enum AuditError {
     /// The entry would use bytes the log keeps for a person's acts.
     ///
     /// Only an entry a peer causes by asking — a refusal, a refused write, an ending a
-    /// question notices — is refused this way, and nothing a peer asks changes anything,
-    /// so a caller that only answers a question may carry on without the entry.
+    /// question notices, a message a receiver refuses or an action a receiver executes — is
+    /// refused this way, and nothing a peer asks changes anything, so a caller that only
+    /// answers a question may carry on without the entry.
     NoRoom { path: PathBuf, kept: u64 },
 }
 

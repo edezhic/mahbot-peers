@@ -1,19 +1,22 @@
-//! The message layer's rig: a moment read from the simulated clock, a sink that keeps
-//! what was delivered, and the service tasks a case starts and stops.
+//! The peer layer's rig: a moment read from the simulated clock, a sink that keeps what the
+//! receiver's caller was handed, an executor that keeps what the machine's own code was given,
+//! and the service tasks a case starts and stops.
 //!
-//! The layer has no clock and no runtime of its own — both are injected — so a case
-//! hands it this clock and the machine's runtime, and time moves only when the case
-//! moves it. Deliveries are kept in memory: a case asserts on what its caller was
-//! handed, not on a product's storage.
+//! The layers have no clock and no runtime of their own — both are injected — so a case hands
+//! them this clock and the machine's runtime, and time moves only when the case moves it.
+//! Deliveries and executions are kept in memory: a case asserts on what its caller was handed,
+//! not on a product's storage.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use mahbot_peers::peer::{
-    Connections, Deliveries, Delivery, Floor, MessageError, Messages, Moment, QueueState, Timestamp,
+    Actions, Connections, Deliveries, Delivery, Executor, Floor, Inbox, InboxError, Messages,
+    Moment, QueueState, Timestamp,
 };
 
+use crate::actions::Executions;
 use crate::machine::Machine;
 use crate::sim::Sim;
 
@@ -155,19 +158,25 @@ impl Deliveries for Collected {
     }
 }
 
-/// One machine's message layer, its sink and the tasks its service runs.
+/// One machine's peer layer, its sink, its executor and the tasks its service runs.
 pub struct Messaging {
-    /// The layer itself, as the product holds it.
+    /// The message layer itself, as the product holds it.
     pub messages: Arc<Messages>,
-    /// The moment the layer reads, which a case can push forward.
+    /// The action layer itself, as the product holds it.
+    pub actions: Arc<Actions>,
+    /// The moment both layers read, which a case can push forward.
     pub moment: Arc<SimMoment>,
-    /// What its caller was handed.
+    /// What the message layer's caller was handed.
     pub collected: Arc<Collected>,
-    tasks: Mutex<Vec<tokio::task::JoinHandle<Result<(), MessageError>>>>,
+    /// The machine's own code, as the action layer calls it.
+    pub executions: Arc<Executions>,
+    /// The one reader that tells a message from an action.
+    inbox: Arc<Inbox>,
+    tasks: Mutex<Vec<tokio::task::JoinHandle<Result<(), InboxError>>>>,
 }
 
 impl Messaging {
-    /// Open `machine`'s layer over its own root, composing at [`NOW`] plus the virtual
+    /// Open `machine`'s layers over its own root, composing at [`NOW`] plus the virtual
     /// time the case has moved.
     ///
     /// # Errors
@@ -180,35 +189,57 @@ impl Messaging {
     ) -> Result<Self, String> {
         let collected = Collected::new();
         let moment = Arc::new(SimMoment::new(sim.clock().clone(), NOW));
+        let runtime = sim.clock().runtime();
+        let executions = Executions::new(Arc::clone(&runtime));
         let messages = Arc::new(machine.messages(
-            floor,
+            Arc::clone(&floor),
             Arc::clone(&moment) as Arc<dyn Moment + Send + Sync>,
             collected.clone(),
         )?);
+        let actions = Arc::new(machine.actions(
+            floor,
+            Arc::clone(&moment) as Arc<dyn Moment + Send + Sync>,
+            Arc::clone(&executions) as Arc<dyn Executor + Send + Sync>,
+        )?);
+        let inbox = Arc::new(Inbox::new(
+            Arc::clone(&messages),
+            Arc::clone(&actions),
+            runtime,
+        ));
         Ok(Self {
             messages,
+            actions,
             moment,
             collected,
+            executions,
+            inbox,
             tasks: Mutex::new(Vec::new()),
         })
     }
 
-    /// Run the layer's service for `peer`: offer what is queued over the pair's live
-    /// connection, and answer what the peer offers.
+    /// Run the pair's service: offer what is queued, and answer both messages and actions.
     ///
     /// The handle is kept: a case that wants to see how the service ended asks
     /// [`Self::endings`], and dropping the layer stops it.
     pub fn serve(&self, connections: &Arc<Connections>, peer: &Machine) {
         let peer_id = peer.peer_id();
-        let handle =
-            tokio::spawn(Arc::clone(&self.messages).serve(Arc::clone(connections), peer_id));
+        let handle = tokio::spawn(Arc::clone(&self.inbox).serve(Arc::clone(connections), peer_id));
         self.tasks().push(handle);
+    }
+
+    /// Stop every service this case started, as a product that stops serving a peer does.
+    ///
+    /// The layer stays open: [`Self::serve`] starts a fresh service over the same root.
+    pub fn stop(&self) {
+        for task in self.tasks().drain(..) {
+            task.abort();
+        }
     }
 
     /// Wait for every service this case started, and answer how each one ended.
     ///
-    /// A service that met a queue it could not read ends with that refusal rather than
-    /// going on answering nothing, so this is how a case sees it.
+    /// A service that met a queue, memory, record or log it could not read or write ends with
+    /// that refusal rather than going on answering nothing, so this is how a case sees it.
     pub async fn endings(&self) -> Vec<Result<(), String>> {
         let tasks: Vec<_> = self.tasks().drain(..).collect();
         let mut endings = Vec::with_capacity(tasks.len());
@@ -222,7 +253,7 @@ impl Messaging {
         endings
     }
 
-    fn tasks(&self) -> MutexGuard<'_, Vec<tokio::task::JoinHandle<Result<(), MessageError>>>> {
+    fn tasks(&self) -> MutexGuard<'_, Vec<tokio::task::JoinHandle<Result<(), InboxError>>>> {
         self.tasks
             .lock()
             .expect("the service tasks are not poisoned")

@@ -88,13 +88,15 @@ impl PeerPolicy for Policy {
 /// an attempt abandoned mid-handshake leaves at most one stale entry behind, and
 /// the map is bounded by the number of machines that ever dialed this one.
 #[derive(Debug, Default)]
-pub(crate) struct Inbox {
+pub(crate) struct Unclaimed {
     waiting: Mutex<HashMap<SocketAddr, Incoming>>,
 }
 
-impl Inbox {
+impl Unclaimed {
     fn lock(&self) -> MutexGuard<'_, HashMap<SocketAddr, Incoming>> {
-        self.waiting.lock().expect("inbox is not poisoned")
+        self.waiting
+            .lock()
+            .expect("the unclaimed connections are not poisoned")
     }
 
     fn put(&self, incoming: Incoming) {
@@ -172,10 +174,10 @@ impl Machine {
         if slot.is_some() {
             return Ok(());
         }
-        let inbox = Arc::clone(&self.inbox);
+        let unclaimed = Arc::clone(&self.unclaimed);
         *slot = Some(tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
-                inbox.put(incoming);
+                unclaimed.put(incoming);
             }
         }));
         Ok(())
@@ -300,7 +302,7 @@ async fn accept_for(
             // The machine's own endpoint files every connection it is offered,
             // so this attempt takes only its own and leaves the rest.
             Accepting::Filed => {
-                let Some(incoming) = to.inbox.take(from) else {
+                let Some(incoming) = to.unclaimed.take(from) else {
                     tokio::task::yield_now().await;
                     continue;
                 };

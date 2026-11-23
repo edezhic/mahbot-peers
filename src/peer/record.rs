@@ -22,8 +22,10 @@
 //! flow info and scope id), `0x04` the failures (1), `0x05` the attempt (8 expiry,
 //! 4 lifetime seconds), `0x06` the trust withdrawal's moment (8), `0x07` the binding
 //! (`peer::access`'s body), `0x08` the claim (the other side's fact, byte for byte),
-//! `0x09` one pair's default marker (the assistant's label and 8 seconds), and `0x0a`
-//! one right (`peer::access`'s body). A field this build does not know is kept and
+//! `0x09` one pair's default marker (the assistant's label and 8 seconds), `0x0a`
+//! one right (`peer::access`'s body), and `0x0b` the most recent withdrawal's moment
+//! (8), kept after a return so the action memory knows what to forget. A field this
+//! build does not know is kept and
 //! written back, after the fields it knows: a rewrite may move it, which changes no
 //! meaning. A right naming a capability this build does not know is kept the same way
 //! and satisfies nothing. The file is named by the 64 lowercase hex characters of the
@@ -185,6 +187,8 @@ mod tag {
     pub const CLAIM: u8 = 0x08;
     pub const DEFAULT: u8 = 0x09;
     pub const RIGHT: u8 = 0x0a;
+    /// The most recent withdrawal's moment, kept after a return. Tag 0x0b, appended.
+    pub const LAST_WITHDRAWN: u8 = 0x0b;
 }
 
 /// A moment the caller supplies. The library never reads a clock.
@@ -267,6 +271,17 @@ impl Attempt {
     }
 }
 
+/// Why a pair is not trusted, when [`PeerRecord::trusted`] says it is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Untrusted {
+    /// A person withdrew this machine's trust in the peer.
+    Withdrawn(PeerId),
+    /// Three failed comparisons closed the pair.
+    Closed(PeerId),
+    /// No person on this machine made the comparison.
+    NotPaired(PeerId),
+}
+
 /// One peer as this machine remembers it.
 ///
 /// Constructed by [`RecordStore`] only: a record is what a file says, and the
@@ -285,6 +300,13 @@ pub struct PeerRecord {
     /// are removed by the same act; the binding is kept, because a return restores
     /// the acquaintance without a new comparison.
     withdrawn_at: Option<Timestamp>,
+    /// The moment of the most recent withdrawal, kept after a return.
+    ///
+    /// A withdrawal is the repair for a full action memory, and a product may stop the
+    /// peer's service for the whole withdrawal. What the action layer must forget is
+    /// therefore read from here, not from a service that happened to notice: anything
+    /// recorded before this moment is gone whenever the layer next looks.
+    last_withdrawn_at: Option<Timestamp>,
     /// The connection level this machine decided: which account on which instance,
     /// and to which assistant.
     binding: Option<Binding>,
@@ -314,6 +336,7 @@ impl PeerRecord {
             failures: 0,
             attempt: None,
             withdrawn_at: None,
+            last_withdrawn_at: None,
             binding: None,
             claim: None,
             defaults: Vec::new(),
@@ -381,6 +404,15 @@ impl PeerRecord {
         self.withdrawn_at.is_some()
     }
 
+    /// The moment of the most recent withdrawal, kept after the trust returns.
+    ///
+    /// The action memory forgets everything recorded before it, so a person's
+    /// withdrawal clears that peer's journal even across a stop of the service.
+    #[must_use]
+    pub const fn last_withdrawn_at(&self) -> Option<Timestamp> {
+        self.last_withdrawn_at
+    }
+
     /// The connection level this machine decided, if it decided one.
     #[must_use]
     pub const fn binding(&self) -> Option<&Binding> {
@@ -431,18 +463,35 @@ impl PeerRecord {
     /// Whether this machine trusts the peer at `limits`: a person paired it, the pair
     /// is not closed, and its trust was not withdrawn.
     ///
-    /// This is the one trust predicate. The handshake asks it of the record on disk
-    /// (`PeerPolicy` for [`RecordStore`]) and the decision asks it of the record it
-    /// just re-read, so the two cannot drift apart.
+    /// This is `untrusted` with the reason dropped: one predicate, so the handshake's
+    /// read of the record on disk and the decision's read of the record it just re-read cannot
+    /// drift apart.
     #[must_use]
     pub fn trusted(&self, limits: &Limits) -> bool {
-        self.is_paired() && !self.is_withdrawn() && self.failures < limits.max_failures
+        self.untrusted(limits).is_none()
     }
 
     /// Whether failed comparisons have closed the pair at `limits`.
     #[must_use]
     pub const fn is_closed(&self, limits: &Limits) -> bool {
         self.failures >= limits.max_failures
+    }
+
+    /// Which of the three reasons [`Self::trusted`] rejected the pair, when it did.
+    ///
+    /// [`Self::trusted`] is this predicate with the reason dropped, so the message and action
+    /// layers cannot disagree about what an untrusted pair is.
+    #[must_use]
+    pub(crate) const fn untrusted(&self, limits: &Limits) -> Option<Untrusted> {
+        if self.is_withdrawn() {
+            Some(Untrusted::Withdrawn(self.key))
+        } else if self.is_closed(limits) {
+            Some(Untrusted::Closed(self.key))
+        } else if self.is_paired() {
+            None
+        } else {
+            Some(Untrusted::NotPaired(self.key))
+        }
     }
 
     /// Whether the record says nothing worth keeping.
@@ -893,21 +942,24 @@ impl RecordStore {
     /// build wrote for a capability this build does not know is kept as an opaque field
     /// and is removed too, or a newer build would resurrect what the person withdrew.
     ///
-    /// The first withdrawal's moment is kept: a repeated one only finishes a removal an
+    /// The latest withdrawal's moment is kept: a repeated one only finishes a removal an
     /// older build left undone. Answers whether there was a record to withdraw: `false`
     /// is a peer whose file is gone, which the rights layer reports rather than claiming
     /// a withdrawal that changed nothing.
     pub(crate) fn withdraw_trust(&self, peer: &PeerId, at: Timestamp) -> Result<bool, RecordError> {
         let record = self.update_existing(peer, |record, _| {
             let unknown_right = record.unknown.iter().any(|(tag, _)| *tag == tag::RIGHT);
+            let last = record.last_withdrawn_at.map_or(at, |old| old.max(at));
             if record.withdrawn_at.is_some()
                 && record.rights.is_empty()
                 && record.defaults.is_empty()
                 && !unknown_right
+                && record.last_withdrawn_at == Some(last)
             {
                 return Ok(Change::Nothing);
             }
             record.withdrawn_at = Some(record.withdrawn_at.unwrap_or(at));
+            record.last_withdrawn_at = Some(last);
             record.rights.clear();
             record.defaults.clear();
             record.unknown.retain(|(tag, _)| *tag != tag::RIGHT);
@@ -1492,6 +1544,14 @@ fn encode(record: &PeerRecord, path: &Path) -> Result<Vec<u8>, RecordError> {
             path,
         )?;
     }
+    if let Some(at) = record.last_withdrawn_at {
+        field(
+            &mut bytes,
+            tag::LAST_WITHDRAWN,
+            &at.unix_seconds().to_be_bytes(),
+            path,
+        )?;
+    }
     if let Some(binding) = &record.binding {
         let body = binding
             .encode_body()
@@ -1548,6 +1608,7 @@ fn decode(bytes: &[u8], expected: &PeerId) -> Result<PeerRecord, Malformed> {
                 | tag::FAILURES
                 | tag::ATTEMPT
                 | tag::WITHDRAWN
+                | tag::LAST_WITHDRAWN
                 | tag::BINDING
                 | tag::CLAIM
         ) {
@@ -1580,6 +1641,9 @@ fn decode(bytes: &[u8], expected: &PeerId) -> Result<PeerRecord, Malformed> {
             }
             tag::WITHDRAWN => {
                 record.withdrawn_at = Some(Timestamp::from_unix_seconds(read_u64(tag, body)?));
+            }
+            tag::LAST_WITHDRAWN => {
+                record.last_withdrawn_at = Some(Timestamp::from_unix_seconds(read_u64(tag, body)?));
             }
             tag::BINDING => {
                 record.binding =

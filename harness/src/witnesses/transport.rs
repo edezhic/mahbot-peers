@@ -326,10 +326,10 @@ pub(crate) fn retry_after_a_timeout() -> Result<(), String> {
         // older rather than accumulating.
         abandon_dial(&client, &server).await?;
         abandon_dial(&client, &server).await?;
-        if server.inbox.len() > 1 {
+        if server.unclaimed.len() > 1 {
             return Err(format!(
                 "the server filed {} connections for one dialer",
-                server.inbox.len()
+                server.unclaimed.len()
             ));
         }
         // The client's first datagram gets through, so the server holds a
@@ -368,7 +368,7 @@ pub(crate) fn retry_after_a_timeout() -> Result<(), String> {
         if &received[..] != b"retry" {
             return Err(format!("the retried pair carried {received:?}"));
         }
-        if !server.inbox.is_empty() {
+        if !server.unclaimed.is_empty() {
             return Err("the server kept an entry after the attempt took its own".to_owned());
         }
         Ok(())

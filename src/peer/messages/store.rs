@@ -59,10 +59,9 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::fs::{self, File, TryLockError};
-use std::io::{self, Write};
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 use ring::rand::{SecureRandom, SystemRandom};
 
@@ -74,16 +73,11 @@ use crate::peer::messages::{
     MessageMalformed, TAKEN_RETENTION,
 };
 use crate::peer::record::Timestamp;
+use crate::peer::store::{self, Coded, Fault};
 use crate::peer::tlv;
-use crate::private::{self, PrivateFileError};
 
 /// The directory under a storage root that holds the queues.
 const DIR: &str = "messages";
-
-/// The file a writer locks for one peer's read-modify-publish, so a second process on the
-/// same root cannot lose a message. It is never published or replaced, and it is not a
-/// queue: [`EXTENSION`] names those.
-const LOCK: &str = "lock";
 
 /// A queue file's extension. A file in `messages/` without it is ignored — a desktop's
 /// metadata or an operator's note is not a queue — while a file with it must be a queue.
@@ -159,6 +153,52 @@ impl Default for QueueFile {
     }
 }
 
+impl store::Coded for QueueFile {
+    const CAP: u64 = MAX_MESSAGES_BYTES;
+    type Error = MessageError;
+
+    fn absent() -> Self {
+        Self::default()
+    }
+
+    fn encode(&self, path: &Path) -> Result<Vec<u8>, MessageError> {
+        encode(self).map_err(|reason| malformed_at(path, reason))
+    }
+
+    fn decode(path: &Path, bytes: &[u8]) -> Result<Self, MessageError> {
+        decode(bytes).map_err(|reason| malformed_at(path, reason))
+    }
+
+    fn malformed(path: &Path, reason: store::Malformed) -> MessageError {
+        malformed_at(path, reason.into())
+    }
+
+    fn too_large(path: &Path, bytes: u64) -> MessageError {
+        MessageError::TooLarge {
+            path: path.to_owned(),
+            bytes,
+        }
+    }
+
+    fn fault(fault: Fault) -> MessageError {
+        match fault {
+            Fault::RootMissing(path) => MessageError::RootMissing { path },
+            Fault::Io { path, source } => MessageError::Io { path, source },
+            Fault::Insecure { path, reason } => MessageError::Insecure { path, reason },
+            Fault::Busy(peer) => MessageError::Busy { peer },
+        }
+    }
+}
+
+impl From<store::Malformed> for MessageMalformed {
+    fn from(reason: store::Malformed) -> Self {
+        match reason {
+            store::Malformed::Empty => Self::Empty,
+            store::Malformed::TooLarge { bytes } => Self::TooLarge { bytes },
+        }
+    }
+}
+
 /// One queued message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Queued {
@@ -196,25 +236,19 @@ struct Taken {
 ///
 /// Cheap to clone: every clone names the same directory and shares the same writer.
 pub(crate) struct MessageStore {
-    inner: Arc<Inner>,
-}
-
-struct Inner {
-    dir: PathBuf,
-    /// This process's one writer, held across a read-modify-publish so two queues are never
-    /// written at once. The lock file below covers a second process.
-    writer: Mutex<()>,
+    files: Arc<store::Files>,
     /// The messages being handed to the caller right now, in this process: a second offer
     /// of one of them is answered nothing rather than being delivered twice at once. Two
     /// processes never race here — a connection's receiver lives in one process — and the
     /// lock file covers the record itself.
-    inflight: Mutex<BTreeSet<(PeerId, EnvelopeId)>>,
+    inflight: Arc<Mutex<BTreeSet<(PeerId, EnvelopeId)>>>,
 }
 
 impl Clone for MessageStore {
     fn clone(&self) -> Self {
         Self {
-            inner: Arc::clone(&self.inner),
+            files: Arc::clone(&self.files),
+            inflight: Arc::clone(&self.inflight),
         }
     }
 }
@@ -222,7 +256,7 @@ impl Clone for MessageStore {
 impl fmt::Debug for MessageStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MessageStore")
-            .field("dir", &self.inner.dir)
+            .field("dir", &self.files.dir())
             .finish_non_exhaustive()
     }
 }
@@ -230,19 +264,9 @@ impl fmt::Debug for MessageStore {
 impl MessageStore {
     /// Open the queues under `root`, creating `messages/` on the first start.
     pub(crate) fn open(root: &Path) -> Result<Self, MessageError> {
-        if !root.is_dir() {
-            return Err(MessageError::RootMissing {
-                path: root.to_owned(),
-            });
-        }
-        let dir = dir_in(root);
-        private::create_private_dir(&dir).map_err(|error| mapped(error, &dir))?;
         Ok(Self {
-            inner: Arc::new(Inner {
-                dir,
-                writer: Mutex::new(()),
-                inflight: Mutex::new(BTreeSet::new()),
-            }),
+            files: Arc::new(store::Files::open(root, DIR).map_err(QueueFile::fault)?),
+            inflight: Arc::new(Mutex::new(BTreeSet::new())),
         })
     }
 
@@ -487,15 +511,16 @@ impl MessageStore {
     /// that claims to be a queue and is not one is exactly what must not be silently
     /// skipped.
     pub(crate) fn peers(&self) -> Result<Vec<PeerId>, MessageError> {
-        let entries = fs::read_dir(&self.inner.dir).map_err(|source| MessageError::Io {
-            path: self.inner.dir.clone(),
+        let dir = self.files.dir();
+        let entries = fs::read_dir(dir).map_err(|source| MessageError::Io {
+            path: dir.to_owned(),
             source,
         })?;
         let mut peers = BTreeSet::new();
         for entry in entries {
             let path = entry
                 .map_err(|source| MessageError::Io {
-                    path: self.inner.dir.clone(),
+                    path: dir.to_owned(),
                     source,
                 })?
                 .path();
@@ -522,56 +547,22 @@ impl MessageStore {
 
     /// Read one peer's queue, or an empty one when the file is absent.
     fn read(&self, peer: &PeerId) -> Result<QueueFile, MessageError> {
-        read_file(&path_in(&self.inner.dir, peer))
+        store::read_coded(&self.files.path(peer))
     }
 
     /// Publish one peer's queue.
     fn write(&self, peer: &PeerId, file: &QueueFile) -> Result<(), MessageError> {
-        publish(&self.inner.dir, peer, file)
+        self.files.write_coded(peer, file)
     }
 
-    fn lock(&self, peer: &PeerId) -> Result<Held<'_>, MessageError> {
-        // This process's writer first: a second task waits here for the few file operations
-        // the holder is doing, never for a caller's own code.
-        let writer = self
-            .inner
-            .writer
-            .lock()
-            .expect("a queue's writer is not poisoned");
-        let path = lock_in(&self.inner.dir, peer);
-        let file = Self::lock_file(&path)?;
-        match file.try_lock() {
-            Ok(()) => Ok(Held {
-                _writer: writer,
-                file,
-            }),
-            // Another writer — the second process a self-update leaves on the root, or a
-            // second `Messages` in this one — is publishing this peer's queue this instant.
-            // That wait is not this layer's to make: the caller is told and tries again.
-            Err(TryLockError::WouldBlock) => Err(MessageError::Busy { peer: *peer }),
-            Err(TryLockError::Error(source)) => Err(MessageError::Io { path, source }),
-        }
-    }
-
-    /// The lock file for one peer's queue, created on the first write.
-    fn lock_file(path: &Path) -> Result<File, MessageError> {
-        if let Some(file) = private::open_private(path).map_err(|error| mapped(error, path))? {
-            return Ok(file);
-        }
-        private::create_private(path, ".lock.", b"").map_err(|error| mapped(error, path))?;
-        private::open_private(path)
-            .map_err(|error| mapped(error, path))?
-            .ok_or_else(|| MessageError::Io {
-                path: path.to_owned(),
-                source: io::Error::other("the lock file vanished after it was created"),
-            })
+    fn lock(&self, peer: &PeerId) -> Result<store::Held<'_>, MessageError> {
+        self.files.lock(peer).map_err(QueueFile::fault)
     }
 
     /// Take the in-flight place for `id`, or `None` when it is already taken.
     fn claim(&self, peer: &PeerId, id: EnvelopeId) -> Option<Claimed<'_>> {
         let key = (*peer, id);
-        self.inner
-            .inflight
+        self.inflight
             .lock()
             .expect("the in-flight messages are not poisoned")
             .insert(key)
@@ -591,30 +582,10 @@ struct Claimed<'a> {
 impl Drop for Claimed<'_> {
     fn drop(&mut self) {
         self.store
-            .inner
             .inflight
             .lock()
             .expect("the in-flight messages are not poisoned")
             .remove(&self.key);
-    }
-}
-
-/// One writer's hold on one peer's queue: this process's writer and the lock file, held for
-/// the whole read-modify-publish.
-///
-/// The lock is released here rather than by the descriptor's own drop, and the order matters:
-/// fields drop in declaration order, so the writer's guard goes first, and a second task could
-/// take the writer and `try_lock` a file whose lock this one has not let go yet — a spurious
-/// [`MessageError::Busy`] for a queue nobody holds. Unlocking first also means a panic between
-/// the read and the publish does not leave the queue locked.
-struct Held<'a> {
-    _writer: MutexGuard<'a, ()>,
-    file: File,
-}
-
-impl Drop for Held<'_> {
-    fn drop(&mut self) {
-        let _ = self.file.unlock();
     }
 }
 
@@ -635,17 +606,17 @@ fn trim_taken(file: &mut QueueFile, now: Timestamp) {
 
 /// The directory under `root` that holds the queues.
 pub(super) fn dir_in(root: &Path) -> PathBuf {
-    root.join(DIR)
+    store::dir_in(root, DIR)
 }
 
 /// The queue file's path for `peer` inside `dir`.
 pub(super) fn path_in(dir: &Path, peer: &PeerId) -> PathBuf {
-    dir.join(format!("{}.{EXTENSION}", hex::encode(peer.as_bytes())))
+    store::path_in(dir, peer, EXTENSION)
 }
 
 /// The lock file's path for `peer` inside `dir`.
 pub(super) fn lock_in(dir: &Path, peer: &PeerId) -> PathBuf {
-    dir.join(format!("{}.{LOCK}", hex::encode(peer.as_bytes())))
+    store::lock_in(dir, peer)
 }
 
 /// The peer a queue file's stem names, or `None` when it names none.
@@ -664,70 +635,6 @@ fn random_id() -> Result<[u8; ENVELOPE_ID_BYTES], MessageError> {
         .fill(&mut id)
         .map_err(|_| MessageError::Random)?;
     Ok(id)
-}
-
-/// Read one queue file, or an empty queue when nothing is there.
-fn read_file(path: &Path) -> Result<QueueFile, MessageError> {
-    let file = match private::open_private(path) {
-        Ok(Some(file)) => file,
-        Ok(None) => return Ok(QueueFile::default()),
-        Err(error) => return Err(mapped(error, path)),
-    };
-    let (bytes, length) =
-        private::read_capped(file, MAX_MESSAGES_BYTES + 1).map_err(|source| MessageError::Io {
-            path: path.to_owned(),
-            source,
-        })?;
-    if let Some(length) = length
-        && length > MAX_MESSAGES_BYTES
-    {
-        return Err(malformed_at(
-            path,
-            MessageMalformed::TooLarge { bytes: length },
-        ));
-    }
-    if bytes.is_empty() {
-        return Err(malformed_at(path, MessageMalformed::Empty));
-    }
-    if bytes.len() as u64 > MAX_MESSAGES_BYTES {
-        return Err(malformed_at(
-            path,
-            MessageMalformed::TooLarge {
-                bytes: bytes.len() as u64,
-            },
-        ));
-    }
-    decode(&bytes).map_err(|reason| malformed_at(path, reason))
-}
-
-/// Publish `file` atomically: a private temporary file beside the destination, flushed,
-/// and published by one rename.
-fn publish(dir: &Path, peer: &PeerId, file: &QueueFile) -> Result<(), MessageError> {
-    let path = path_in(dir, peer);
-    let bytes = encode(file).map_err(|reason| malformed_at(&path, reason))?;
-    if bytes.len() as u64 > MAX_MESSAGES_BYTES {
-        return Err(MessageError::TooLarge {
-            path,
-            bytes: bytes.len() as u64,
-        });
-    }
-    let mut temp =
-        private::private_temp(&path, ".messages.").map_err(|error| mapped(error, &path))?;
-    temp.write_all(&bytes).map_err(|source| MessageError::Io {
-        path: path.clone(),
-        source,
-    })?;
-    temp.as_file()
-        .sync_all()
-        .map_err(|source| MessageError::Io {
-            path: path.clone(),
-            source,
-        })?;
-    temp.persist(&path).map_err(|error| MessageError::Io {
-        path: path.clone(),
-        source: error.error,
-    })?;
-    Ok(())
 }
 
 /// The queue's bytes.
@@ -944,19 +851,5 @@ fn malformed_at(path: &Path, reason: MessageMalformed) -> MessageError {
     MessageError::Malformed {
         path: path.to_owned(),
         reason,
-    }
-}
-
-/// A private-file refusal, named with the file it is about.
-fn mapped(error: PrivateFileError, path: &Path) -> MessageError {
-    match error {
-        PrivateFileError::Io(source) => MessageError::Io {
-            path: path.to_owned(),
-            source,
-        },
-        PrivateFileError::Insecure(reason) => MessageError::Insecure {
-            path: path.to_owned(),
-            reason,
-        },
     }
 }

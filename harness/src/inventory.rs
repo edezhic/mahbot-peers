@@ -437,6 +437,28 @@ fn platform_capabilities() -> Vec<Capability> {
             MESSAGES_PRIVATE_HOW,
         )
     };
+    let actions_private = if cfg!(unix) {
+        Capability::witnessed("library.peer.actions.private", ACTIONS_PRIVATE_CLAIM)
+            .with_procedure(ACTIONS_PRIVATE_HOW)
+    } else {
+        Capability::unproducible(
+            "library.peer.actions.private",
+            ACTIONS_PRIVATE_CLAIM,
+            "the case sets a unix mode on the actions directory and on one action memory: this host has no mode bits, and the access-list state it would need instead is the one `library.peer.record.windows_dacl` records, which no case builds here",
+            ACTIONS_PRIVATE_HOW,
+        )
+    };
+    let actions_untraced = if cfg!(unix) {
+        Capability::witnessed("library.peer.actions.untraced", ACTIONS_UNTRACED_CLAIM)
+            .with_procedure(ACTIONS_UNTRACED_HOW)
+    } else {
+        Capability::unproducible(
+            "library.peer.actions.untraced",
+            ACTIONS_UNTRACED_CLAIM,
+            "the case makes the actions directory readable but not writable with a unix mode: this host has no mode bits, and the access-list state it would need instead is the one `library.peer.record.windows_dacl` records, which no case builds here",
+            ACTIONS_UNTRACED_HOW,
+        )
+    };
     vec![
         insecure_file,
         extended_acl,
@@ -452,6 +474,8 @@ fn platform_capabilities() -> Vec<Capability> {
         peer_record_read_only,
         peer_record_symlink,
         messages_private,
+        actions_private,
+        actions_untraced,
     ]
 }
 
@@ -525,6 +549,19 @@ const MESSAGES_PRIVATE_CLAIM: &str = "a message file and its directory are priva
 /// What a host that can produce [`MESSAGES_PRIVATE_CLAIM`] does: the mode is unix's, so a
 /// unix host runs the case and the procedure only records it.
 const MESSAGES_PRIVATE_HOW: &str = "In a scratch root, run the case `a_message_file_is_private_to_the_account` (`cargo test -p mahbot-peers-harness` on a unix host runs it): it opens the message layer on an empty root, which creates `messages/` mode 0700, and queues one message; `chmod 777` on the `messages/` directory in the scratch root makes the next open refuse with `is not private`, and `chmod 700` on the same directory opens it again; `chmod 644` on the queue file makes `pending` refuse with `is not private`, and `chmod 600` on the same file reads the queue.";
+
+/// The claim about an action memory and its directory.
+const ACTIONS_PRIVATE_CLAIM: &str = "an action memory and its directory are private to the account the product runs as: a directory another account can write, a linked directory and a memory another account can read are each refused with the file named, and restoring the owner-only mode reads the same memory";
+
+/// What a host that can produce [`ACTIONS_PRIVATE_CLAIM`] does: the mode is unix's, so a
+/// unix host runs the case and the procedure only records it.
+const ACTIONS_PRIVATE_HOW: &str = "In a scratch root, run the case `an_action_file_is_private_to_the_account` (`cargo test -p mahbot-peers-harness` on a unix host runs it): it opens the action layer on an empty root, which creates `actions/` mode 0700, and records one identifier; `chmod 777` on the `actions/` directory in the scratch root makes the next open refuse with `is not private`, and `chmod 700` on the same directory opens it again; `chmod 644` on the memory file makes `unknown` refuse with `is not private`, and `chmod 600` on the same file reads it.";
+
+/// The claim about an unknown trace that cannot be kept.
+const ACTIONS_UNTRACED_CLAIM: &str = "an unknown outcome whose trace cannot be kept answers a fault that names both the outcome and the storage refusal, and the receiver's journal still answers a repeat as already executed";
+
+/// What a host that can produce [`ACTIONS_UNTRACED_CLAIM`] does.
+const ACTIONS_UNTRACED_HOW: &str = "In a scratch root, run the case `an_untraceable_unknown_names_both_outcomes` (`cargo test -p mahbot-peers-harness` on a unix host runs it): it pairs two machines, holds the receiving machine's execution past `EXECUTION_BUDGET`, makes the sender's `actions/` directory readable but not writable with `chmod 500`, and asks one action; the call answers a fault naming both outcomes, and `chmod 700` on the same directory lets a repeat be answered as already executed.";
 
 /// What a host that can produce [`UNREADABLE_RECORD_CLAIM`] does.
 const UNREADABLE_RECORD_HOW: &str = "In a scratch root, run the case `an_unreadable_record_is_not_an_unpaired_machine` (`cargo test -p mahbot-peers-harness` on a unix host runs it): it pairs two machines, `chmod 644` on the peer's record file in the scratch root, and dials, which refuses with `not trusted: its record cannot be read` and names the record. `chmod 600` on the same file in the same scratch root makes the same dial connect.";
@@ -1356,6 +1393,228 @@ const CAPABILITIES: &[Capability] = &[
     Capability::witnessed(
         "library.peer.messages.malformed",
         "a file that is not a message file is refused, not believed",
+    ),
+    // The action layer: the identifier the caller names, the at-most-once memory, the answer
+    // that never guesses, the right, and the one connection it shares with messages.
+    Capability::witnessed(
+        "library.peer.actions.identifier_from_caller",
+        "the crate never mints an operation's identifier: the caller names it, a repeat under it is answered already executed, and a new identifier is a new operation that runs",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.identifier_is_one_operation",
+        "an identifier belongs to one operation: the same identifier with a different body is answered already executed, and the second body never reaches the machine's own code",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.at_most_once",
+        "the same operation offered three times is executed once, and the two repeats are answered already executed without a result",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.memory_survives_restart",
+        "the receiving machine's journal of executed identifiers survives its restart",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.memory_retention",
+        "an executed identifier is remembered for a week and then forgotten: a repeat after the week runs again, which is the honest cost of remembering",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.unknown_mark",
+        "an action whose result never came back is marked unknown, and the mark is durable and read back by the caller",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.unknown_survives_restart",
+        "the unknown mark survives the sender's restart, so the one trace that something may have run is not lost",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.never_retried",
+        "the same identifier is never offered again after its outcome is unknown: a repeat is a person's new operation with a new identifier",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.trust_withdrawal_clears",
+        "a person's trust withdrawal clears that peer's executed identifiers and unknown marks, which is the way out of a full journal; the record keeps the withdrawal's moment, so the clearing works even when the peer's service is stopped for the whole withdrawal, and the same identifier runs again once the trust is back",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.in_flight_repeat",
+        "a repeat that arrives while the first execution is still running is answered already executed and is not run",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.memory_full",
+        "a full journal refuses a new action rather than forgetting an old identifier, and an identifier already there is still answered already executed",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.expired_cleared_first",
+        "expired identifiers are cleared before the journal is called full, so a week-old memory does not refuse a new action",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.result_bounded",
+        "a result too large to carry is answered as ran-but-not-carried, never truncated, and the identifier stays remembered; a result of exactly the cap is carried whole",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.body_stored_as_written",
+        "a body is handed to the machine's own code exactly as composed, never escaped or rendered",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.body_bounded",
+        "a body of exactly the cap is carried and one byte more is refused before anything is sent",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.format",
+        "an action memory's unknown fields are kept and written back, so the format is additive",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.malformed",
+        "a file that is not an action memory, or one past its byte cap, is refused, not believed",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.right",
+        "an action is decided by the pair's work-on-me right and the host's floor, in the plan's order, and a refusal names the step that refused it",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.refusal_not_remembered",
+        "a refused action is not remembered: the same identifier runs once the right is given",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.declined",
+        "an action the receiving machine's own code declines is answered as not run and is not remembered, and the decline is answered before a memory that cannot release the identifier ends the service, so it never becomes an unknown",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.not_ready",
+        "a pair whose binding has not arrived is answered as not ready, which is neither a refusal nor an execution, and the same identifier runs once the binding arrives",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.closed_pair",
+        "a pair closed by three failed comparisons is refused before the dial",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.body_cannot_reach_a_capability",
+        "nothing in an action body chooses a right: a body that looks like a grant runs under the fixed work-on-me right and changes nothing",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.source_has_no_capability",
+        "the summary scan proves the action layer's sources name no `Capability` value and ask no question of their own, so no path leads from a body to a right; the capability the layer records is the one the decision returned, and the case pins the checker's controls",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.kind_closed",
+        "an action of a kind this build does not know is answered unsupported rather than run as a command, and the right is settled before the kind, so a peer without it is refused at the right whatever kind it names",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.one_budget",
+        "one request has one total ACTION_BUDGET: a dial that spends its connect bound leaves the answer only the rest, so the request resolves at the budget's end rather than after another full one",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.audit_cap_stops",
+        "a log at its own file cap — not merely past the room kept for a person — also stops the peer from acting, answers `not recorded`, and leaves the service up",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.audit_first",
+        "the execution is recorded before it runs, and an action that cannot be recorded does not run",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.audit_full_stops",
+        "a log with no room left for a peer's act stops the peer from acting visibly, and the identifier is not remembered for an execution that did not run",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.audit_entry",
+        "the execution entry names the peer, the pair, the right it ran under and the identifier",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.audit_no_body",
+        "the audit log never carries the action's body: what the command was is the product's own record, keyed by the identifier",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.busy",
+        "a second writer on the root is answered busy, nothing runs and nothing is remembered, and the same call succeeds once the writer lets go",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.sweep_busy",
+        "the public sweep of the action memory answers `busy` when another writer holds it, and the same call compacts the file once the writer lets go",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.shared_connection",
+        "messages and actions share the pair's connection, and each is taken for itself under a link that drops and reorders",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.shared_connection",
+        "a message is never taken for an action on the shared connection",
+    ),
+    Capability::witnessed(
+        "library.peer.inbox.dispatch",
+        "one reader decides by the frame's magic which layer owns a stream, so a message is never taken for an action nor an action for a message, in either direction",
+    ),
+    Capability::witnessed(
+        "library.peer.inbox.one_reader",
+        "the summary scan proves the pair's connection is accepted in two files and no third — the binding exchange and the inbox, the only two the exemption table excuses — and that each of them has at most one `accept_bi` call site, held to at least one by the exemption test, with the exemption table and the acceptor list pinned to name the same files; the case pins both checkers' controls",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.unreadable_answered",
+        "a malformed action frame is answered unreadable rather than executed or ignored",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.throttle",
+        "a peer that sends too many actions is told to slow down rather than ignored, and the crate never re-offers by itself",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.separate_window",
+        "the action window is its own, so a flood of actions cannot throttle the same peer's messages",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.slow_down_not_traffic",
+        "a slow-down means the receiving side took nothing, so it is not the pair's traffic and a connection that drops after one is not a link failure",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.retry_after_bounded",
+        "a peer's slow-down delay never reaches the caller above one ACTION_WINDOW: the wire clamps it when it is read, and a delay this machine writes is already bounded by its own window",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.not_on_the_beacon",
+        "the beacon never carries an action and never holds one, and an action still runs with the beacon gone",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.dial_on_demand",
+        "an action asked for while the pair is away waits for the dial and then runs",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.no_queue",
+        "a failed dial holds nothing: there is no action queue and no store-and-forward",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.execution_bounded",
+        "a slow execution is reported as unknown and its identifier stays remembered, because the action may have run",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.one_pair_at_a_time",
+        "a slow execution holds its own pair and no other",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.service_reports_a_broken_memory",
+        "an action memory that cannot be read or written ends the service with that refusal rather than being stepped over",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.offering_is_not_traffic",
+        "an action in flight does not count as the pair's traffic for the keeper",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.answered_is_traffic",
+        "only an answer that means the receiving side accepted the operation — it ran, ran with a result too large to carry, or the identifier was already spent — is the pair's traffic; a refusal or a slow-down is not, so a machine holding one unanswered action is not re-dialled for ever",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.execution_panic",
+        "a panicking executor ends the service with the bug named; the sender keeps the identifier's durable unknown mark and the crate never offers it again",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.execution_panic_eager",
+        "an executor that panics before it returns its future ends the service with the bug named, exactly as one that panics while running does",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.identifier_hex",
+        "an identifier has one lowercase-hex spelling, and `ActionId::from_hex` reads exactly that text back; uppercase, the wrong length and non-hex are refused",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.audit_fault",
+        "a log the machine cannot write at all — the append's hard fault, not the cap's refusal — stops the action from running, answers the sender `not recorded`, and ends the service with the log's fault named",
+    ),
+    Capability::witnessed(
+        "library.peer.actions.not_sent_not_spent",
+        "a request that never left the machine — the stream could not be opened before the budget passed — is answered `not sent`, the identifier is not marked unknown, and the same operation runs once the peer has stream credit again",
     ),
     Capability::unproducible(
         "library.peer.connect.real_network",

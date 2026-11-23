@@ -7,21 +7,66 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use mahbot_peers::peer::{Account, Binding, Instance, Keeper, Label, Pair};
+use mahbot_peers::identity::PeerId;
+use mahbot_peers::peer::{Account, Binding, Floor, Instance, Keeper, Label, Pair};
 use mahbot_peers::tls::PeerPolicy;
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::udp::RecvMeta;
-use quinn::{AsyncUdpSocket, Endpoint, EndpointConfig};
+use quinn::{AsyncUdpSocket, Connection, Endpoint, EndpointConfig};
 
+use crate::beacon::TestBeacon;
 use crate::invariants::Source;
 use crate::machine::Machine;
+use crate::messages::Messaging;
 use crate::sim::Sim;
 
 use super::connection::Managed;
 use super::peer::NOW;
+use super::rights::{label, paired_machines, wait_claim};
 
 pub(crate) fn io_error(error: io::Error) -> String {
     error.to_string()
+}
+
+/// One field as the format writes it: a tag, a two-byte length and the body.
+pub(super) fn field(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    out.extend_from_slice(
+        &u16::try_from(body.len())
+            .expect("a field this case writes is short")
+            .to_be_bytes(),
+    );
+    out.extend_from_slice(body);
+    out
+}
+
+/// Whether `haystack` holds `needle` verbatim.
+pub(super) fn holds_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack.len() >= needle.len()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+/// The one service a case started, and how it ended, within `budget` of virtual time.
+///
+/// The budget is the case's: a refusal the service's own round meets arrives within a round
+/// or two, so a case that wants to show *which* path met it asks for seconds, and a case that
+/// only cares that it ended asks for more.
+pub(super) async fn single_ending(
+    sim: &Sim,
+    messaging: &Messaging,
+    budget: Duration,
+) -> Result<Result<(), String>, String> {
+    let endings = within(sim, budget, messaging.endings()).await?;
+    let [ending] = &endings[..] else {
+        return Err(format!(
+            "the case started {} services, not one",
+            endings.len()
+        ));
+    };
+    Ok(ending.clone())
 }
 
 /// The connection level a machine records for `peer`, with its own account, instance and
@@ -53,6 +98,150 @@ pub(super) fn spawn_keeper(managed: &Managed, peer: &Machine) -> tokio::task::Jo
     let endpoint = managed.endpoint.clone();
     let peer = peer.fingerprint();
     tokio::spawn(async move { connections.keep_connected(&endpoint, &peer).await })
+}
+
+/// The pieces one connected case needs, all live.
+///
+/// The manager owns the endpoint and the accept lanes, so it lives as long as the case
+/// does; the message layers are the machines' own, and the keeper is the dialling
+/// side's, spawned once. The layers' services are the case's to start: a case that has
+/// to change a right or queue something first does it before the service runs.
+pub(super) struct Ready {
+    pub(super) main: Machine,
+    pub(super) laptop: Machine,
+    pub(super) main_managed: Managed,
+    pub(super) laptop_managed: Managed,
+    pub(super) main_messages: Messaging,
+    pub(super) laptop_messages: Messaging,
+    pub(super) keeper: tokio::task::JoinHandle<Keeper>,
+}
+
+/// Two paired machines, connected, with a message layer on each and nothing bound.
+///
+/// `floor` is the host's own say over what it allows at all, for both machines' layers:
+/// `NoFloor` unless a case has a host that refuses. The laptop dials, so the case has one
+/// keeper and one dialling direction to reason about.
+pub(super) async fn connected(
+    sim: &Sim,
+    beacon: &TestBeacon,
+    floor: Arc<dyn Floor + Send + Sync>,
+) -> Result<Ready, String> {
+    let (main, laptop) = paired_machines(sim)?;
+    connect(sim, beacon, main, laptop, floor).await
+}
+
+/// Two paired machines, connected, with a message layer on each and the main bound to the
+/// laptop.
+///
+/// `bind_laptop` binds the other way round as well. The laptop dials, so the case has one
+/// keeper and one dialling direction to reason about.
+pub(super) async fn ready(
+    sim: &Sim,
+    beacon: &TestBeacon,
+    bind_laptop: bool,
+    floor: Arc<dyn Floor + Send + Sync>,
+) -> Result<Ready, String> {
+    let (main, laptop) = paired_machines(sim)?;
+    main.rights()?
+        .bind(&laptop.peer_id(), main_binding(&label("admin")?)?, NOW)
+        .map_err(|error| error.to_string())?;
+    if bind_laptop {
+        laptop
+            .rights()?
+            .bind(
+                &main.peer_id(),
+                binding(
+                    "laptop-account",
+                    "laptop-instance",
+                    &label("laptop-assistant")?,
+                )?,
+                NOW,
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    let ready = connect(sim, beacon, main, laptop, floor).await?;
+    if !bind_laptop {
+        wait_claim(
+            sim,
+            &ready.laptop.reopen_records()?,
+            &ready.main.peer_id(),
+            None,
+        )
+        .await?;
+    }
+    Ok(ready)
+}
+
+/// The connection itself: managers, layers, keeper, and both sides' exchange.
+async fn connect(
+    sim: &Sim,
+    beacon: &TestBeacon,
+    main: Machine,
+    laptop: Machine,
+    floor: Arc<dyn Floor + Send + Sync>,
+) -> Result<Ready, String> {
+    let main_managed = Managed::start(sim, beacon, &main, &main.records())?;
+    let laptop_managed = Managed::start(sim, beacon, &laptop, &laptop.records())?;
+    let main_messages = Messaging::open(sim, &main, Arc::clone(&floor))?;
+    let laptop_messages = Messaging::open(sim, &laptop, floor)?;
+    let keeper = spawn_keeper(&laptop_managed, &main);
+    // Both sides must hold the connection and have finished the exchange before the
+    // case speaks of either: the exchange is what makes the pair's "write to me" reach
+    // the side that did not decide it.
+    wait_live(sim, &main_managed.connections, &laptop.peer_id()).await?;
+    wait_live(sim, &laptop_managed.connections, &main.peer_id()).await?;
+    Ok(Ready {
+        main,
+        laptop,
+        main_managed,
+        laptop_managed,
+        main_messages,
+        laptop_messages,
+        keeper,
+    })
+}
+
+/// Wait until `peer`'s pair holds a live connection whose binding exchange has finished,
+/// and hand it back.
+///
+/// The exchange owns the first stream a kept connection carries, so a case that offers
+/// by hand waits for it: its own stream would otherwise be taken for the exchange's.
+pub(super) async fn wait_live(
+    sim: &Sim,
+    connections: &mahbot_peers::peer::Connections,
+    peer: &PeerId,
+) -> Result<Connection, String> {
+    within(sim, Duration::from_secs(120), async {
+        loop {
+            if let Some(traffic) = connections.traffic(peer)
+                && traffic.exchange_done()
+            {
+                return Ok::<Connection, String>(traffic.connection().clone());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?
+}
+
+/// Offer one frame's bytes over `connection` and read up to `limit` bytes of the answer,
+/// so a case can send a frame the typed layer would not produce.
+pub(super) async fn offer_frame(
+    connection: &Connection,
+    bytes: &[u8],
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|error| error.to_string())?;
+    send.write_all(bytes)
+        .await
+        .map_err(|error| error.to_string())?;
+    send.finish().map_err(|error| error.to_string())?;
+    recv.read_to_end(limit)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// How much virtual time one request may take before a case fails instead of

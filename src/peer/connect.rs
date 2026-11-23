@@ -200,20 +200,21 @@ struct Live {
 ///
 /// The frame counters at adoption, and the frames written since then that belong to
 /// the binding exchange — the manager's handshake and not the pair's use: a connection
-/// that only exchanged its binding and then died carried nothing. The message layer
-/// adds its own measurement: a round is an offer in flight, `quiet` is where the
-/// frames stood when the last one finished, and `taken` is a message the peer took.
+/// that only exchanged its binding and then died carried nothing. The message and action
+/// layers add their own measurement: a round is an offer or an action request in flight,
+/// `quiet` is where the frames stood when the last one finished, and `taken` is a request
+/// the peer accepted.
 #[derive(Debug)]
 struct Watch {
     carried_from: Frames,
     /// The frames the exchange wrote, once it has finished; `None` while it is still
     /// in flight.
     exchanged: Mutex<Option<Frames>>,
-    /// How many messages this connection has taken from this machine.
+    /// How many messages or actions this connection has carried an accepted answer for.
     taken: AtomicU64,
-    /// The frames up to the end of the last message round; `None` before one ran.
+    /// The frames up to the end of the last offer or action round; `None` before one ran.
     quiet: Mutex<Option<Frames>>,
-    /// How many message rounds are in flight now.
+    /// How many offer or action rounds are in flight now.
     rounds: AtomicU32,
 }
 
@@ -285,12 +286,12 @@ impl Frames {
     }
 }
 
-/// One pair's live connection, as the message layer offers over it.
+/// One pair's live connection, as the message and action layers use it.
 ///
 /// Cheap to clone: the connection is a handle and the watch is shared with the keeper, so
-/// what the message layer reports — a round begun or ended, a message taken — is what the
-/// keeper judges the connection by. An offer in flight and an offer that finished are not
-/// the pair's traffic; a message the peer took always is.
+/// what the layers above report — a round begun or ended, a request accepted — is what the
+/// keeper judges the connection by. An offer or action in flight and one that finished are
+/// not the pair's traffic; an accepted answer always is.
 #[derive(Clone)]
 pub struct Traffic {
     connection: Connection,
@@ -334,17 +335,39 @@ impl Traffic {
 
     /// Whether the binding exchange has finished on this connection.
     ///
-    /// The exchange owns the first stream a kept connection carries, so a message is
-    /// never offered before it: a receiver would take the exchange's stream for an
-    /// offer.
+    /// The exchange owns the first stream a kept connection carries, so a message or an
+    /// action is never offered before it: a receiver would take the exchange's stream for a
+    /// request.
     #[must_use]
     pub fn exchange_done(&self) -> bool {
         self.watch.exchange_done()
     }
 
-    /// Mark one offer as started, until the guard is dropped.
+    /// How many answers this connection has carried that the peer accepted: a message it took,
+    /// or an action it ran, ran with a result too large to carry, or answered as already
+    /// executed.
     ///
-    /// Until then the connection is not judged by its frames: an offer in flight is this
+    /// The keeper reads the same counter, beside the in-flight rounds, to tell a lost live pair
+    /// from a dial that carried nothing. Hidden from the documented API: it exists for the
+    /// workspace's own measurement of a connection.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn taken(&self) -> u64 {
+        self.watch.taken.load(Ordering::SeqCst)
+    }
+
+    /// How many offers or action requests are in flight on this connection now.
+    ///
+    /// Hidden for the reason [`Self::taken`] is.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn rounds(&self) -> u32 {
+        self.watch.rounds.load(Ordering::SeqCst)
+    }
+
+    /// Mark one offer or action request as started, until the guard is dropped.
+    ///
+    /// Until then the connection is not judged by its frames: a request in flight is this
     /// machine's own act, not evidence the pair is alive. A guard rather than a paired call,
     /// because a round abandoned mid-offer — a service dropped, a task cancelled — must not
     /// leave the connection looking like one that carries nothing for the rest of its life.
@@ -353,15 +376,19 @@ impl Traffic {
         Round { traffic: self }
     }
 
-    /// Record that the peer took a message over this connection.
+    /// Record that the peer accepted a message offer or an action request over this connection.
     ///
-    /// A taken message is the pair's use however the frames are counted, so it is
-    /// remembered separately from them.
+    /// The layers agree on what counts: a message the peer took, or an action it ran, ran with
+    /// a result too large to carry, or answered as already executed. A message's repeat is not
+    /// counted here because its take was; an action's repeat is, because its journal proves the
+    /// receiver accepted the operation before. Every other answer — refused, not ready, slow
+    /// down, memory full, not recorded, busy, unsupported, unreadable — means the peer took
+    /// nothing, so a connection that drops after one is not counted as a link failure.
     pub(crate) fn took(&self) {
         self.watch.taken.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Mark the offer as finished, keeping where the frames stood when it ended.
+    /// Mark the round as finished, keeping where the frames stood when it ended.
     ///
     /// The measurement is taken from the connection's adoption, so it already contains
     /// the binding exchange's frames and nothing has to be added to it.
@@ -370,13 +397,13 @@ impl Traffic {
             .watch
             .quiet
             .lock()
-            .expect("the message round is not poisoned") =
+            .expect("the offer round is not poisoned") =
             Some(self.watch.carried_from.delta(Frames::of(&self.connection)));
         self.watch.rounds.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
-/// One offer in flight, ended when it is dropped however the round ends.
+/// One offer or action request in flight, ended when it is dropped however the round ends.
 pub(crate) struct Round<'a> {
     traffic: &'a Traffic,
 }
@@ -511,12 +538,12 @@ impl Connections {
         self.current(peer).map(|(_, started_by)| started_by)
     }
 
-    /// The pair's live connection as the message layer offers over it, or `None` when
+    /// The pair's live connection as the message and action layers use it, or `None` when
     /// the pair has no live connection.
     ///
     /// A closed connection is not one; see [`Self::live`]. The handle shares the
-    /// manager's own measurement of the connection, so what the message layer reports
-    /// back — a round begun or ended, a message taken — is what the keeper judges the
+    /// manager's own measurement of the connection, so what the layers above report back —
+    /// a round begun or ended, a request accepted — is what the keeper judges the
     /// connection by.
     #[must_use]
     pub fn traffic(&self, peer: &PeerId) -> Option<Traffic> {
@@ -763,8 +790,8 @@ impl Connections {
     /// once the connection is gone.
     ///
     /// A connection that carried anything — a QUIC datagram or stream frame either
-    /// way, beyond the manager's own binding exchange and the message layer's own
-    /// rounds — and then died is a link failure: the keeper re-dials it however many
+    /// way, beyond the manager's own binding exchange and the layers' own rounds — and
+    /// then died is a link failure: the keeper re-dials it however many
     /// times it happens and however long it lived, with no bound, because that is
     /// recovery and not a loop. A connection that only exchanged its binding and then
     /// died carried nothing, because the exchange is the manager's handshake and not
@@ -776,10 +803,10 @@ impl Connections {
     /// settled the same way: the pair got to use it, so its loss is ordinary churn and
     /// clears the count.
     ///
-    /// The message layer's offers are measured with the exchange: an offer in flight,
-    /// and an offer that finished, are not the pair's traffic, so a peer that keeps
-    /// dropping a connection after one unanswered offer is not mistaken for a live pair.
-    /// A message the peer took is: it is the peer acting, so the connection carried
+    /// The message and action layers' requests are measured with the exchange: a request
+    /// in flight, and one that finished, are not the pair's traffic, so a peer that keeps
+    /// dropping a connection after one unanswered request is not mistaken for a live pair.
+    /// A request the peer accepted is: it is the peer acting, so the connection carried
     /// something and its loss is a link failure.
     ///
     /// Only a dial whose connection ends before the pair carried anything and inside
@@ -939,8 +966,8 @@ impl Connections {
             if let Some(fact) = fact {
                 let _ = store.record_claim(&peer, &fact);
             }
-            // Marked after the claim is kept: the message layer offers once this is set,
-            // and a message offered before the claim landed would find no pair to name.
+            // Marked after the claim is kept: the layers above speak once this is set, and
+            // a request offered before the claim landed would find no pair to name.
             let written = from.delta(Frames::of(&connection));
             *watch
                 .exchanged
@@ -1061,7 +1088,7 @@ pub(crate) fn presented(connection: &Connection) -> Option<Fingerprint> {
 
 /// Whether a connection carried anything the pair used: one QUIC datagram or stream
 /// frame either way, beyond what the connection had when it was adopted, less the
-/// stream frames the binding exchange wrote and those of the last message round.
+/// stream frames the binding exchange wrote and those of the last offer or action round.
 ///
 /// Keep-alives, handshake frames and acknowledgements are not traffic, so they do
 /// not turn a peer that drops a fresh connection into a link failure. Neither is the
@@ -1073,13 +1100,14 @@ pub(crate) fn presented(connection: &Connection) -> Option<Fingerprint> {
 /// and not only the handshake: traffic the pair sends inside it is discounted too,
 /// which is the price of the bound.
 ///
-/// The message layer is measured the same way and for the same reason: an offer in
-/// flight is this machine's own act, and an offer that finished is measured back to
-/// where the frames stood when the round ended, so neither counts as the pair's use.
-/// A message the peer took is different — the peer acted on it, which is the pair
-/// being alive — so it counts however the frames are read. The receiving half is not
-/// measured at all: a stream the peer opened is the peer acting, and answering it is
-/// the pair being used, so only this machine's own rounds are discounted.
+/// The message and action layers are measured the same way and for the same reason: a
+/// request in flight is this machine's own act, and one that finished is measured back to
+/// where the frames stood when the round ended, so neither counts as the pair's use. A
+/// request the peer *accepted* is different — the peer acted on it, which is the pair being
+/// alive — so it counts however the frames are read. An answer that took nothing does not
+/// count: see [`Traffic::took`]. The receiving half is not measured at all: a stream the
+/// peer opened is the peer acting, and answering it is the pair being used, so only this
+/// machine's own rounds are discounted.
 fn carried(connection: &Connection, watch: &Watch) -> bool {
     if watch.taken.load(Ordering::SeqCst) > 0 {
         return true;
@@ -1087,10 +1115,7 @@ fn carried(connection: &Connection, watch: &Watch) -> bool {
     if watch.rounds.load(Ordering::SeqCst) > 0 {
         return false;
     }
-    let quiet = *watch
-        .quiet
-        .lock()
-        .expect("the message round is not poisoned");
+    let quiet = *watch.quiet.lock().expect("the offer round is not poisoned");
     let exchanged = *watch
         .exchanged
         .lock()

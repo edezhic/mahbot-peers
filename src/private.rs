@@ -1,19 +1,19 @@
 //! The one way this crate publishes a private file: a temporary file beside the
 //! destination, given the rule and checked, flushed, and published by one rename.
 //!
-//! The key file, the peer record, the audit log's creation and the message queues all
-//! write this way, and all read through the same checked open, so the ordering that
-//! keeps a private half out of the wrong access has one spelling: a file is private
-//! before its first byte lands, not made private afterwards. The log is only *created*
-//! this way — it is appended in place, because an append-only record cannot be
+//! The key file, the peer record, the audit log's creation, the message queues and the
+//! action memories all write this way, and all read through the same checked open, so the
+//! ordering that keeps a private half out of the wrong access has one spelling: a file is
+//! private before its first byte lands, not made private afterwards. The log is only
+//! *created* this way — it is appended in place, because an append-only record cannot be
 //! rewritten without losing a concurrent writer's entry, so its appends are opened,
 //! checked and written through the same descriptor, and `peer::audit` states the lock
 //! and the flush that make them safe. The rule itself is `identity::access`; this
 //! module only applies it around the write and the read.
 //!
-//! The directories this crate keeps under a root — `peers/` and `messages/` — are made
-//! and checked by the one function here too: a directory another account can write
-//! lets it delete what this crate keeps, which is a silent un-pairing, so a directory
+//! The directories this crate keeps under a root — `peers/`, `messages/` and `actions/` —
+//! are made and checked by the one function here too: a directory another account can
+//! write lets it delete what this crate keeps, which is a silent un-pairing, so a directory
 //! this crate creates is hardened before it is checked and one it finds is checked.
 
 use std::fs::{self, File, OpenOptions};

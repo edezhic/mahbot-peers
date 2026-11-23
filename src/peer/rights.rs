@@ -204,19 +204,30 @@ pub(crate) enum Writing {
     Refused(Refusal),
 }
 
-/// Whether this machine may take a peer's message now, and as which pair.
+/// Whether this machine may take a peer's message or run a peer's action now, and as which
+/// pair.
 ///
-/// The receiver's side of the decision: `Rights::may_take_message` answers it with the same
-/// fixed order and the same record as [`Rights::decide`], and the message layer turns it
-/// into one wire answer. The message layer's own question, like [`Writing`].
+/// The receiver's side of the decision: `Rights::may_take_message` and `Rights::may_run_action`
+/// answer it with the same fixed order and the same record as [`Rights::decide`], and the layer
+/// above turns it into one wire answer. The capability is the layer's, never the body's: a
+/// message asks "write to me" and an action asks "work on me", and neither names one.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Taking {
-    /// The message may be taken, as this pair.
-    Allowed(Pair),
+pub(crate) enum Admission {
+    /// The request may be taken, as this pair and under this right.
+    Allowed {
+        /// The pair the request travels under.
+        pair: Pair,
+        /// The right that allowed it, which the action layer names in its record of the run.
+        right: Right,
+        /// This machine's most recent withdrawal of trust in the peer, from the same record
+        /// read that named the pair. The action memory treats everything recorded before it as
+        /// gone; the message layer ignores it.
+        since: Option<Timestamp>,
+    },
     /// Neither a binding this machine decided nor a claim has arrived: there is no pair to
-    /// name yet, so the sender is told nothing and offers again.
+    /// name yet, so the sender is told nothing and asks again.
     Unbound,
-    /// The decision refused this message.
+    /// The decision refused this request.
     Refused(Refusal),
 }
 
@@ -435,13 +446,13 @@ impl Rights {
 
     /// The receiver's question: may a message from `peer` be taken now?
     ///
-    /// The same fixed order and the same record of what happened as [`Self::decide`]:
-    /// the question is the pair's assistant asking to "write to me", with the host's
-    /// floor. The pair is the binding's when this machine decided one, the claim's
-    /// otherwise; with neither there is no pair to name, so the answer is
-    /// [`Taking::Unbound`] — nothing decided, nothing recorded — and the sender offers
-    /// again rather than losing its message to a state that is about to change. A peer
-    /// with no record at all is [`Refusal::Untrusted`], the authenticate step's answer.
+    /// The same fixed order and the same record of what happened as [`Self::decide`]: the
+    /// question is the pair's assistant asking to "write to me", with the host's floor. The
+    /// pair is the binding's when this machine decided one, the claim's otherwise; with neither
+    /// there is no pair to name, so the answer is [`Admission::Unbound`] — nothing decided,
+    /// nothing recorded — and the sender offers again rather than losing its message to a state
+    /// that is about to change. A peer with no record at all is [`Refusal::Untrusted`], the
+    /// authenticate step's answer.
     ///
     /// # Errors
     ///
@@ -451,30 +462,63 @@ impl Rights {
         peer: &PeerId,
         floor: &dyn Floor,
         now: Timestamp,
-    ) -> Result<Taking, RightsError> {
+    ) -> Result<Admission, RightsError> {
+        self.admission(peer, Capability::WRITE, floor, now)
+    }
+
+    /// The receiver's question: may an action from `peer` be run now?
+    ///
+    /// The same order and the same record as [`Self::may_take_message`], with the right the
+    /// plan gives a command: "work on me". The capability is fixed here and never comes from
+    /// the action's body or its kind; the action layer names no capability at all, which is
+    /// what the `actions.no_capability_from_a_body` invariant scans for. A second kind of
+    /// action would extend this mapping where the right belongs, not in the layer that carries
+    /// the bytes.
+    ///
+    /// # Errors
+    ///
+    /// The record's and the log's own refusals.
+    pub(crate) fn may_run_action(
+        &self,
+        peer: &PeerId,
+        floor: &dyn Floor,
+        now: Timestamp,
+    ) -> Result<Admission, RightsError> {
+        self.admission(peer, Capability::WORK, floor, now)
+    }
+
+    /// The one admission both services ask: a fresh record, the pair it names, the decision.
+    fn admission(
+        &self,
+        peer: &PeerId,
+        capability: Capability,
+        floor: &dyn Floor,
+        now: Timestamp,
+    ) -> Result<Admission, RightsError> {
         let Some(record) = self.records.reread(peer)? else {
-            // No record is no acquaintance: the handshake would already have refused
-            // this peer, so the answer is the one the authenticate step gives.
-            return Ok(Taking::Refused(Refusal::Untrusted));
+            // No record is no acquaintance: the handshake would already have refused this
+            // peer, so the answer is the one the authenticate step gives.
+            return Ok(Admission::Refused(Refusal::Untrusted));
         };
         let pair = record
             .binding()
             .map(|binding| Pair::of_binding(*peer, binding))
             .or_else(|| record.claim().map(|claim| Pair::of_claim(&claim)));
+        let since = record.last_withdrawn_at();
         let Some(pair) = pair else {
-            return Ok(Taking::Unbound);
+            return Ok(Admission::Unbound);
         };
         match self.decide(
             &Question {
                 speaker: Speaker::Authenticated(*peer),
                 pair: pair.clone(),
-                capability: Capability::WRITE,
+                capability,
             },
             floor,
             now,
         )? {
-            Decision::Allowed { .. } => Ok(Taking::Allowed(pair)),
-            Decision::Refused { refusal } => Ok(Taking::Refused(refusal)),
+            Decision::Allowed { right } => Ok(Admission::Allowed { pair, right, since }),
+            Decision::Refused { refusal } => Ok(Admission::Refused(refusal)),
         }
     }
 

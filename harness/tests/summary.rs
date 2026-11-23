@@ -16,8 +16,8 @@
 //! witness table (`harness.check.*`), which the first test runs like any other.
 
 use mahbot_peers_harness::invariants::{
-    ENTRY_FILE, EXEMPT, INVARIANTS, SHIPPED_SCOPE, Source, UNSHIPPED_SCOPE,
-    check as check_invariants, find, workspace_sources,
+    ACCEPTOR_FILES, BINDING_FILE, ENTRY_FILE, EXEMPT, INBOX_FILE, INVARIANTS, SHIPPED_SCOPE,
+    Source, UNSHIPPED_SCOPE, check as check_invariants, find, workspace_sources,
 };
 use mahbot_peers_harness::inventory::{capabilities, check};
 use mahbot_peers_harness::witnesses;
@@ -41,42 +41,70 @@ fn invariants_hold_over_every_source() {
 }
 
 #[test]
-fn every_exemption_is_exactly_the_invariants_the_entry_point_trips() {
+fn every_exemption_is_exactly_the_invariants_the_file_trips() {
+    // The exempted files, and how many invariants each is excused from, are a hand-kept list,
+    // so a new entry has to be argued for here rather than added quietly. The entry point
+    // answers to the wall clock, the socket and the environment; the two acceptor files answer
+    // for the one stream reader each has.
+    let mut exempted: Vec<(&str, usize)> = EXEMPT
+        .iter()
+        .map(|exemption| (exemption.path, exemption.exempt_from.len()))
+        .collect();
+    exempted.sort_unstable();
+    let mut expected = vec![(ENTRY_FILE, 3), (BINDING_FILE, 1), (INBOX_FILE, 1)];
+    expected.sort_unstable();
     assert_eq!(
-        EXEMPT.len(),
-        1,
-        "the scan exempts {} files; a second exception must be argued for here",
-        EXEMPT.len()
-    );
-    assert_eq!(EXEMPT[0].path, ENTRY_FILE);
-    assert!(
-        !EXEMPT[0].reason.trim().is_empty(),
-        "an exemption without a reason is not documented"
+        exempted, expected,
+        "the exemption table is not the one this test pins; argue for every change here"
     );
 
-    // That the file trips nothing outside this list is what `check` enforces in
-    // `invariants_hold_over_every_source`: it skips only the named claims. What
-    // needs saying here is the other direction — an exemption the file no longer
-    // needs is a stale excuse — and that every named id really covers the file,
-    // since a typo would excuse nothing and pass quietly.
     let sources = workspace_sources();
-    let source = entry_source(&sources);
-    assert_eq!(
-        EXEMPT[0].exempt_from.len(),
-        3,
-        "a fourth exemption needs the entry point's docs and the README updated with it"
-    );
-    for id in EXEMPT[0].exempt_from {
-        let invariant = find(id).expect("an exemption names a listed invariant");
+    for exemption in EXEMPT {
         assert!(
-            invariant.covers(&source.path),
-            "{id} does not cover {ENTRY_FILE}, so exempting it excuses nothing"
+            !exemption.reason.trim().is_empty(),
+            "an exemption without a reason is not documented"
         );
-        assert!(
-            !(invariant.check)(source).is_empty(),
-            "{id} no longer trips {ENTRY_FILE}; drop the exemption"
-        );
+        let source = sources
+            .iter()
+            .find(|source| source.path == exemption.path)
+            .unwrap_or_else(|| panic!("{} is exempt but not in the scan", exemption.path));
+        // That the file trips nothing outside this list is what `check` enforces in
+        // `invariants_hold_over_every_source`: it skips only the named claims. What
+        // needs saying here is the other direction — an exemption the file no longer
+        // needs is a stale excuse — and that every named id really covers the file,
+        // since a typo would excuse nothing and pass quietly.
+        for id in exemption.exempt_from {
+            let invariant = find(id).expect("an exemption names a listed invariant");
+            assert!(
+                invariant.covers(&source.path),
+                "{id} does not cover {}, so exempting it excuses nothing",
+                exemption.path
+            );
+            assert!(
+                !(invariant.check)(source).is_empty(),
+                "{id} no longer trips {}; drop the exemption",
+                exemption.path
+            );
+        }
     }
+}
+
+#[test]
+fn the_acceptor_lists_name_the_same_files() {
+    // The files excused from the third-acceptor claim are exactly the ones the per-file claim
+    // holds to one call site, so a third excused file cannot escape that check.
+    let mut excused: Vec<&str> = EXEMPT
+        .iter()
+        .filter(|exemption| exemption.exempt_from.contains(&"peer.one_stream_acceptor"))
+        .map(|exemption| exemption.path)
+        .collect();
+    excused.sort_unstable();
+    let mut acceptors = ACCEPTOR_FILES.to_vec();
+    acceptors.sort_unstable();
+    assert_eq!(
+        excused, acceptors,
+        "the files excused from peer.one_stream_acceptor and ACCEPTOR_FILES must be the same files"
+    );
 }
 
 #[test]
@@ -156,12 +184,4 @@ fn the_beacon_entry_crate_holds_only_the_entry_point() {
         [ENTRY_FILE],
         "a second source in the entry-point crate must be added to the beacon's no-state claim or exempted here"
     );
-}
-
-/// The entry point as the source scan sees it.
-fn entry_source(sources: &[Source]) -> &Source {
-    sources
-        .iter()
-        .find(|source| source.path == ENTRY_FILE)
-        .expect("the entry point is in the scan")
 }

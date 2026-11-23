@@ -21,7 +21,7 @@ use crate::machine::Machine;
 use crate::sim::Sim;
 
 use super::peer::NOW;
-use super::support::{io_error, main_binding, pair, within};
+use super::support::{field, io_error, main_binding, pair, within};
 
 /// The assistant a case declares. The product's guest declaration changes no decision
 /// the crate makes, so the crate keeps the name alone; see `peer::access::Binding`.
@@ -1616,7 +1616,7 @@ pub(crate) fn a_right_for_an_unknown_capability_is_never_satisfied() -> Result<(
         body.extend_from_slice(&[0, 1, 0, 1]); // no term, the default issuer, no withdrawal
         body.extend_from_slice(&NOW.unix_seconds().to_be_bytes()); // the ending
 
-        let crafted = field(0x0a, &body)?;
+        let crafted = field(0x0a, &body);
         let storage = main.storage();
         let mut bytes = storage.read_record(&peer.peer_id()).map_err(io_error)?;
         bytes.extend_from_slice(&crafted);
@@ -2142,10 +2142,10 @@ pub(crate) fn an_audit_field_with_bytes_after_its_label_keeps_its_code() -> Resu
             (0x04, vec![1u8]), // the default issuer
             (0x0b, vec![1u8]), // created
         ] {
-            act.extend(field(tag, &body)?);
+            act.extend(field(tag, &body));
         }
-        let mut entry = field(0x01, &NOW.unix_seconds().to_be_bytes())?;
-        entry.extend(field(0x02, &act)?);
+        let mut entry = field(0x01, &NOW.unix_seconds().to_be_bytes());
+        entry.extend(field(0x02, &act));
         let mut file = header;
         file.extend_from_slice(
             &u32::try_from(entry.len())
@@ -2190,18 +2190,6 @@ fn last_frame(bytes: &[u8]) -> Result<&[u8], String> {
         rest = &after[length..];
     }
     last.ok_or_else(|| "the log holds no entry frame".to_owned())
-}
-
-/// One `[tag][u16 BE length][body]` field, as a record and an audit entry frame them.
-fn field(tag: u8, body: &[u8]) -> Result<Vec<u8>, String> {
-    let mut framed = vec![tag];
-    framed.extend_from_slice(
-        &u16::try_from(body.len())
-            .map_err(|_| format!("a field of {} bytes is too long to frame", body.len()))?
-            .to_be_bytes(),
-    );
-    framed.extend_from_slice(body);
-    Ok(framed)
 }
 
 /// Fill the log with copies of its last entry until one more would pass `target`.

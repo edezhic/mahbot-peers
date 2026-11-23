@@ -12,14 +12,16 @@
 //! what it is: it contains the forbidden constructs as data, and a checker's own
 //! pattern list is not evidence.
 //!
-//! One source file beyond this one is exempt from some invariants, and the
+//! Three source files beyond this one are exempt from some invariants, and the
 //! exemption is data too: the beacon server's process entry point binds a real
 //! socket, reads the environment and reads the wall clock, because that is what a
-//! process entry point is for. [`EXEMPT`] names it, the invariants it does not
-//! answer to, and why; every other invariant judges it like any other source, so
-//! its key handling is scanned. The summary check proves the list is exactly that
-//! one file, that each exemption is needed, and that nothing else about the file
-//! is excused.
+//! process entry point is for; and the binding exchange and the inbox are the two
+//! places the pair's connection is accepted, each with one `accept_bi` call site.
+//! [`EXEMPT`] names every one of them, the invariants it does not answer to, and
+//! why; every other invariant judges them like any other source, so the entry
+//! point's key handling is scanned. The summary check proves the list is exactly
+//! these files and these many invariants each, that each exemption is needed, and
+//! that nothing else about them is excused.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -220,8 +222,22 @@ pub const CLOCK_FILE: &str = "harness/src/clock.rs";
 /// not evidence.
 pub const TABLE_FILE: &str = "harness/src/invariants.rs";
 
-/// The beacon server's process entry point: the one file with an exemption.
+/// The beacon server's process entry point: the one file exempt from ambient reads,
+/// real sockets and the wall clock.
 pub const ENTRY_FILE: &str = "beacon-server/src/main.rs";
+
+/// The binding exchange: it takes the first stream a kept connection carries, on the side that
+/// accepted the connection.
+pub const BINDING_FILE: &str = "src/peer/binding.rs";
+
+/// The inbox: it takes every stream after the binding exchange and decides by the frame's magic
+/// which layer owns it.
+pub const INBOX_FILE: &str = "src/peer/inbox.rs";
+
+/// The two files that accept a stream of the pair's connection. They are the only entries
+/// [`EXEMPT`] excuses from `peer.one_stream_acceptor`, and the summary check proves the two
+/// lists name the same files.
+pub const ACCEPTOR_FILES: &[&str] = &[BINDING_FILE, INBOX_FILE];
 
 /// A source file that some invariants do not cover, and why.
 ///
@@ -236,18 +252,30 @@ pub struct Exemption {
     pub reason: &'static str,
 }
 
-/// The documented exemptions: exactly one file, and the summary check proves both
-/// that each listed invariant is still tripped by the file and that no other one
-/// is.
-pub const EXEMPT: &[Exemption] = &[Exemption {
-    path: ENTRY_FILE,
-    exempt_from: &[
-        "workspace.no_ambient_configuration",
-        "workspace.no_real_sockets",
-        "workspace.single_source_of_time",
-    ],
-    reason: "the process entry point: it binds the UDP socket, reads the listening address and the directory holding its key from the command line, owns the executor and the wall clock. Everything else is scanned here like anywhere: how the command line is read, what it means and how the server is configured are pure functions in `mahbot-beacon`, and the key file is the peer library's `identity.key`, reached only through `keyfile::load_or_create` — so it stays under `identity.key_is_never_replaced`, `identity.key_file_name_is_one_place` and `identity.key_is_minted_in_one_place`, as a machine's identity is.",
-}];
+/// The documented exemptions, and the summary check proves both that each listed
+/// invariant is still tripped by the file and that no other one is, and pins how many
+/// invariants each file is excused from, so an added excuse has to be argued for there.
+pub const EXEMPT: &[Exemption] = &[
+    Exemption {
+        path: ENTRY_FILE,
+        exempt_from: &[
+            "workspace.no_ambient_configuration",
+            "workspace.no_real_sockets",
+            "workspace.single_source_of_time",
+        ],
+        reason: "the process entry point: it binds the UDP socket, reads the listening address and the directory holding its key from the command line, owns the executor and the wall clock. Everything else is scanned here like anywhere: how the command line is read, what it means and how the server is configured are pure functions in `mahbot-beacon`, and the key file is the peer library's `identity.key`, reached only through `keyfile::load_or_create` — so it stays under `identity.key_is_never_replaced`, `identity.key_file_name_is_one_place` and `identity.key_is_minted_in_one_place`, as a machine's identity is.",
+    },
+    Exemption {
+        path: BINDING_FILE,
+        exempt_from: &["peer.one_stream_acceptor"],
+        reason: "one of the pair's two stream acceptors: the binding exchange takes the first stream a kept connection carries, on the side that accepted the connection. It answers `peer.one_acceptor_per_file` with exactly one `accept_bi` call site, and every other invariant scans it like any other source.",
+    },
+    Exemption {
+        path: INBOX_FILE,
+        exempt_from: &["peer.one_stream_acceptor"],
+        reason: "the pair's other stream acceptor: the inbox takes every stream after the binding exchange and decides by the frame's magic which layer it belongs to. It answers `peer.one_acceptor_per_file` with exactly one `accept_bi` call site, and every other invariant scans it like any other source.",
+    },
+];
 
 /// Whether `path` does not answer to the invariant `id`: only a documented
 /// exemption excuses a file, and only from the invariants it names.
@@ -434,7 +462,28 @@ pub const INVARIANTS: &[Invariant] = &[
         claim: "the message layer names no capability and asks no question of its own: its one decision is `Rights::may_take_message`, whose inputs are the transport's peer, the host's floor and the moment, so a body cannot select a capability or reach a grant",
         scope: &["src/peer/messages.rs", "src/peer/messages/"],
         control: r#"let capability = Capability::WORK;"#,
-        check: messages_name_no_capability,
+        check: layer_names_no_capability,
+    },
+    Invariant {
+        id: "actions.no_capability_from_a_body",
+        claim: "the action layer names no `Capability` value of its own and asks no question of its own: its one decision is `Rights::may_run_action`, whose inputs are the transport's peer, the host's floor and the moment, so a body cannot select a capability or reach a grant; the capability it records is the one that decision returned",
+        scope: &["src/peer/actions.rs", "src/peer/actions/"],
+        control: r#"let capability = Capability::WORK;"#,
+        check: layer_names_no_capability,
+    },
+    Invariant {
+        id: "peer.one_stream_acceptor",
+        claim: "the pair's connection is accepted in two files the exemption table names — the binding exchange, which owns the first stream a kept connection carries, and the inbox, which owns every stream after it and decides by the frame's magic which layer it belongs to — and in no other file under the peer layer; no service takes a stream of its own",
+        scope: &["src/peer.rs", "src/peer/"],
+        control: "let (send, recv) = connection.accept_bi().await?;",
+        check: one_stream_acceptor,
+    },
+    Invariant {
+        id: "peer.one_acceptor_per_file",
+        claim: "each of the pair's two acceptor files has at most one `accept_bi` call site: a second reader in either would race the first for the connection's streams and could take a frame meant for the other layer. The exemption test holds each file to at least one, since a file that stopped accepting would leave its half of the connection unread",
+        scope: ACCEPTOR_FILES,
+        control: "let (send, recv) = connection.accept_bi().await?;\nlet (send, recv) = connection.accept_bi().await?;",
+        check: one_acceptor_per_file,
     },
 ];
 
@@ -716,13 +765,16 @@ fn no_persistent_state(source: &Source) -> Vec<Finding> {
     forbidden(source, &["std::fs", "OpenOptions", "File::"])
 }
 
-/// The message layer names no capability and asks no question of its own.
+/// A peer layer names no capability and asks no question of its own.
 ///
-/// Its one decision is `Rights::may_take_message`, taken from the transport's peer and
-/// the moment: nothing a body says is an input, so no body can select a capability, ask a
-/// question or reach a grant. The tokens are the layer's own: a grant, a withdrawal, a
-/// binding or a decision taken here would be a second path from bytes to a right.
-fn messages_name_no_capability(source: &Source) -> Vec<Finding> {
+/// Its one decision is a rights method whose inputs are the transport's peer, the host's floor
+/// and the moment: nothing a body says is an input, so no body can select a capability, ask a
+/// question or reach a grant. The tokens are the layer's own: a grant, a withdrawal, a binding
+/// or a decision taken here would be a second path from bytes to a right. The scan is lexical —
+/// it pins the vocabulary such a path would have to use — and the signatures are what make the
+/// property structural: a body enters as bytes, and the only capability is the one the rights
+/// method fixes on the receiver's side.
+fn layer_names_no_capability(source: &Source) -> Vec<Finding> {
     forbidden(
         source,
         &[
@@ -735,4 +787,36 @@ fn messages_name_no_capability(source: &Source) -> Vec<Finding> {
             "decide(",
         ],
     )
+}
+
+/// No file under the peer layer accepts a stream of the pair's connection: the two
+/// that do are the documented exemptions, and `peer.one_acceptor_per_file` holds each
+/// of them to one. A service that accepted its own stream would race the inbox and
+/// could take a frame meant for the other layer.
+fn one_stream_acceptor(source: &Source) -> Vec<Finding> {
+    forbidden(source, &["accept_bi("])
+}
+
+/// Each acceptor file has at most one `accept_bi` call site: the binding exchange's first
+/// stream and the inbox's every stream after it. A second call site in either file would be a
+/// second reader of the same connection, racing the first for streams it may not own — it could
+/// take a frame meant for the other layer. The exemption test holds each file to at least one,
+/// since a file that stopped accepting would leave its half of the connection unread.
+fn one_acceptor_per_file(source: &Source) -> Vec<Finding> {
+    // Occurrences are counted, not lines, so two calls written on one line are two.
+    let acceptors: Vec<usize> = code_lines(&source.text)
+        .flat_map(|(line, text)| std::iter::repeat_n(line, text.matches("accept_bi(").count()))
+        .collect();
+    if let [_, second, ..] = acceptors.as_slice() {
+        return vec![Finding {
+            path: source.path.clone(),
+            line: *second,
+            detail: format!(
+                "has {} `accept_bi` call sites; each acceptor file has one reader, so remove all \
+                 but one",
+                acceptors.len()
+            ),
+        }];
+    }
+    Vec::new()
 }

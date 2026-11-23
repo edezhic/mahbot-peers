@@ -18,9 +18,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use mahbot_peers::identity::{Fingerprint, Identity, PeerId};
-use mahbot_peers::peer::{AuditError, AuditLog, RecordError, RecordStore};
+use mahbot_peers::peer::{
+    Actions, AuditError, AuditLog, Executor, Floor, Moment, RecordError, RecordStore,
+};
 
-use crate::connect::Inbox;
+use crate::connect::Unclaimed;
 use crate::link::{Link, LinkedSocket};
 use crate::root::Root;
 
@@ -97,7 +99,7 @@ pub struct Machine {
     pub(crate) transport: mahbot_peers::net::Transport,
     pub(crate) trust: Arc<crate::connect::TrustSet>,
     pub(crate) records: RecordStore,
-    pub(crate) inbox: Arc<Inbox>,
+    pub(crate) unclaimed: Arc<Unclaimed>,
     /// The task accepting on this machine's endpoint, once it has started.
     pub(crate) accepting: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub(crate) endpoint: Mutex<Option<quinn::Endpoint>>,
@@ -121,7 +123,7 @@ impl Machine {
             clock,
             transport: mahbot_peers::net::Transport::default(),
             trust: Arc::new(crate::connect::TrustSet::default()),
-            inbox: Arc::new(Inbox::default()),
+            unclaimed: Arc::new(Unclaimed::default()),
             accepting: Mutex::new(None),
             endpoint: Mutex::new(None),
         }
@@ -245,6 +247,33 @@ impl Machine {
         )
     }
 
+    /// This machine's action layer, over its own root.
+    ///
+    /// The records and the log are this machine's, so the memory, the decision about a peer
+    /// and the record of it come from one root. The floor, the clock the layer reads moments
+    /// from and the executor an action goes to are the case's; the runtime is this machine's
+    /// own, because the layer's waits and its receiving tasks belong to the runtime the
+    /// endpoint runs on.
+    ///
+    /// # Errors
+    ///
+    /// The layer's refusal, as text: a gone root, an unreadable or insecure memory.
+    pub fn actions(
+        &self,
+        floor: Arc<dyn Floor + Send + Sync>,
+        moment: Arc<dyn Moment + Send + Sync>,
+        executor: Arc<dyn Executor + Send + Sync>,
+    ) -> Result<Actions, String> {
+        self.root.actions(
+            self.records.clone(),
+            self.audit()?,
+            floor,
+            moment,
+            executor,
+            self.clock.runtime(),
+        )
+    }
+
     /// Remember `peer` as a machine this one may talk to.
     pub fn trust(&self, peer: &Machine) {
         self.trust.insert(peer.fingerprint());
@@ -289,8 +318,8 @@ impl Machine {
     /// The endpoint is closed, the accept task is stopped, and the helper waits —
     /// advancing the clock, because nothing else moves time — until the transport
     /// has let go of the socket. Then the machine comes back with a fresh socket
-    /// at a new address, the identity read from the root again, and an empty
-    /// inbox: everything a process restart keeps is the root, and everything it
+    /// at a new address, the identity read from the root again, and no unclaimed
+    /// connections: everything a process restart keeps is the root, and everything it
     /// loses is in memory.
     ///
     /// Every endpoint, connection and manager handle a case holds must be dropped
@@ -329,7 +358,7 @@ impl Machine {
             .map_err(|error| error.to_string())?;
         self.records = self.root.records()?;
         self.trust = Arc::new(crate::connect::TrustSet::default());
-        self.inbox = Arc::new(Inbox::default());
+        self.unclaimed = Arc::new(Unclaimed::default());
         Ok(self.socket.addr())
     }
 
@@ -462,6 +491,16 @@ impl Storage<'_> {
     /// The filesystem's refusal.
     pub fn write_audit(&self, bytes: &[u8]) -> io::Result<()> {
         self.root.write_audit(bytes)
+    }
+
+    /// Turn the audit log into a directory, so the next append is refused: a hard fault rather
+    /// than the cap's refusal.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's refusal.
+    pub fn replace_audit_with_a_directory(&self) -> io::Result<()> {
+        self.root.replace_audit_with_a_directory()
     }
 
     /// Give `peer`'s record a mode, as an installation whose root was never hardened

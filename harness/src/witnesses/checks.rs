@@ -344,3 +344,91 @@ pub(crate) fn invariant_check_is_two_way() -> Result<(), String> {
         },
     )
 }
+
+/// The source check behind the runtime case: the action layer names no capability and asks no
+/// question of its own, so no path leads from a body to a right. The summary scan runs the
+/// invariant over the whole tree and proves its one control is caught; this case adds the forms
+/// that control does not exercise, so a checker that only catches its own control fails here.
+pub(crate) fn an_action_body_cannot_reach_a_capability_by_source() -> Result<(), String> {
+    use crate::invariants::find;
+    let invariant = find("actions.no_capability_from_a_body")
+        .ok_or_else(|| "actions.no_capability_from_a_body is not in the table".to_owned())?;
+    // The scope must keep scanning the layer's submodules: `ScopeNotFound` only fires when a
+    // scope entry matches no file, so narrowing the directory to one file would silently stop
+    // the scan.
+    for path in ["src/peer/actions/wire.rs", "src/peer/actions/store.rs"] {
+        if !invariant.covers(path) {
+            return Err(format!("the claim no longer covers {path}"));
+        }
+    }
+    let at = |text: &str| source("src/peer/actions.rs", text);
+    for form in [
+        "let question = Question { .. };",
+        "rights.grant(&pair, capability, &authority, None, now)?;",
+        "rights.decide(&question, &*floor, now)?;",
+    ] {
+        if (invariant.check)(&at(form)).is_empty() {
+            return Err(format!("the claim no longer flags `{form}`"));
+        }
+    }
+    if !(invariant.check)(&at(
+        "let right = rights.may_run_action(&peer, &*floor, now)?;",
+    ))
+    .is_empty()
+    {
+        return Err("the claim flags the layer's own decision".to_owned());
+    }
+    Ok(())
+}
+
+/// The pair's connection has two stream acceptors and no third, and each of the two has one
+/// `accept_bi` call site. The summary scan proves the property over the whole tree; this case
+/// proves both checks are awake — an acceptor in a third file and a second call site in an
+/// acceptor file are each flagged — and that the two allowed files are excused by the documented
+/// table rather than by a path comparison inside the check.
+pub(crate) fn the_pair_has_one_stream_acceptor() -> Result<(), String> {
+    use crate::invariants::{ACCEPTOR_FILES, exempt, find};
+    let third = find("peer.one_stream_acceptor")
+        .ok_or_else(|| "peer.one_stream_acceptor is not in the table".to_owned())?;
+    let per_file = find("peer.one_acceptor_per_file")
+        .ok_or_else(|| "peer.one_acceptor_per_file is not in the table".to_owned())?;
+    // The two acceptor files are excused by the documented table, not by a path comparison
+    // inside the check.
+    for path in ACCEPTOR_FILES {
+        if !exempt("peer.one_stream_acceptor", path) {
+            return Err(format!(
+                "{path} accepts a stream but has no documented exemption"
+            ));
+        }
+    }
+    // The two services' files must stay in scope: `ScopeNotFound` only fires when a scope entry
+    // matches no file, so a narrowed scope would stop the scan without failing.
+    for path in ["src/peer/messages.rs", "src/peer/actions.rs"] {
+        if !third.covers(path) {
+            return Err(format!("the claim no longer covers {path}"));
+        }
+    }
+    let accepted = "let (send, recv) = connection.accept_bi().await?;";
+    // A third file's acceptor is a finding; the two allowed files answer through the documented
+    // exemption instead, which is why the scan passes with them in it.
+    if (third.check)(&source("src/peer/messages.rs", accepted)).is_empty() {
+        return Err("the claim does not flag an acceptor outside the two allowed files".to_owned());
+    }
+    for path in ACCEPTOR_FILES {
+        if !(per_file.check)(&source(path, accepted)).is_empty() {
+            return Err(format!("the claim flags the single acceptor in {path}"));
+        }
+        let twice = format!("{accepted}\n{accepted}");
+        if (per_file.check)(&source(path, &twice)).is_empty() {
+            return Err(format!("a second acceptor in {path} is not flagged"));
+        }
+        // Two calls on one line are two call sites, not one.
+        let together = "let first = connection.accept_bi(); let second = connection.accept_bi();";
+        if (per_file.check)(&source(path, together)).is_empty() {
+            return Err(format!(
+                "two acceptors on one line in {path} are not flagged"
+            ));
+        }
+    }
+    Ok(())
+}

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use mahbot_peers::identity::{Fingerprint, PeerId};
+use mahbot_peers::identity::Fingerprint;
 use mahbot_peers::peer::audit::{MAX_FILE_BYTES, RESERVED_FOR_PERSON_BYTES};
 use mahbot_peers::peer::messages::MAX_MESSAGES_BYTES;
 use mahbot_peers::peer::{
@@ -37,31 +37,11 @@ use crate::sim::Sim;
 
 use super::connection::Managed;
 use super::peer::session;
-use super::rights::{fill_log, label, paired_machines, person, wait_claim};
-use super::support::{binding, io_error, main_binding, pair, spawn_keeper, within};
-
-/// Wait until `peer`'s pair holds a live connection whose binding exchange has finished,
-/// and hand it back.
-///
-/// The exchange owns the first stream a kept connection carries, so a case that offers
-/// by hand waits for it: its own stream would otherwise be taken for the exchange's.
-async fn wait_live(
-    sim: &Sim,
-    connections: &mahbot_peers::peer::Connections,
-    peer: &PeerId,
-) -> Result<Connection, String> {
-    within(sim, Duration::from_secs(120), async {
-        loop {
-            if let Some(traffic) = connections.traffic(peer)
-                && traffic.exchange_done()
-            {
-                return Ok::<Connection, String>(traffic.connection().clone());
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await?
-}
+use super::rights::{fill_log, label, paired_machines, person};
+use super::support::{
+    binding, field, holds_bytes, io_error, main_binding, offer_frame, pair, ready, single_ending,
+    spawn_keeper, wait_live, within,
+};
 
 /// Offer one message by hand, as the sender's own service would.
 async fn offer_raw(connection: &Connection, message: &Message) -> Result<Answer, String> {
@@ -72,19 +52,8 @@ async fn offer_raw(connection: &Connection, message: &Message) -> Result<Answer,
 /// Offer one frame's bytes and read the answer, so a case can send a frame the typed
 /// messages would not produce.
 async fn offer_bytes(connection: &Connection, bytes: &[u8]) -> Result<Answer, String> {
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .map_err(|error| error.to_string())?;
-    send.write_all(bytes)
-        .await
-        .map_err(|error| error.to_string())?;
-    send.finish().map_err(|error| error.to_string())?;
-    let reply = recv
-        .read_to_end(ANSWER_BYTES)
-        .await
-        .map_err(|error| error.to_string())?;
-    Answer::decode(&reply).map_err(|error| error.to_string())
+    Answer::decode(&offer_frame(connection, bytes, ANSWER_BYTES).await?)
+        .map_err(|error| error.to_string())
 }
 
 /// How many bytes of an answer a case reads. Comfortably more than the longest answer this
@@ -105,18 +74,6 @@ const MESSAGE_MAGIC: &[u8] = b"mahbot-peer-message";
 
 /// The bytes a queue file opens with: the offset of its version byte is this length.
 const QUEUE_MAGIC: &[u8] = b"mahbot-peer-messages";
-
-/// One field as the format writes it: a tag, a two-byte length and the body.
-fn field(tag: u8, body: &[u8]) -> Vec<u8> {
-    let mut out = vec![tag];
-    out.extend_from_slice(
-        &u16::try_from(body.len())
-            .expect("a field this case writes is short")
-            .to_be_bytes(),
-    );
-    out.extend_from_slice(body);
-    out
-}
 
 /// The frame with the body of its first `tag` field replaced by `with`'s answer, keeping
 /// its magic, its version and every other field as they are.
@@ -166,15 +123,6 @@ fn rewrite(
     Ok(out)
 }
 
-/// Whether `haystack` holds `needle` verbatim.
-fn holds_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty()
-        && haystack.len() >= needle.len()
-        && haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
-}
-
 /// Two machines a person paired, each remembering the other's address.
 fn pair_up(left: &Machine, right: &Machine) -> Result<(), String> {
     for (machine, peer) in [(left, right), (right, left)] {
@@ -187,77 +135,6 @@ fn pair_up(left: &Machine, right: &Machine) -> Result<(), String> {
             .map_err(|error| error.to_string())?;
     }
     Ok(())
-}
-
-/// The pieces one connected case needs, all live.
-///
-/// The manager owns the endpoint and the accept lanes, so it lives as long as the case
-/// does; the message layers are the machines' own, and the keeper is the dialling
-/// side's, spawned once. The layers' services are the case's to start: a case that has
-/// to change a right or queue something first does it before the service runs.
-struct Ready {
-    main: Machine,
-    laptop: Machine,
-    main_managed: Managed,
-    laptop_managed: Managed,
-    main_messages: Messaging,
-    laptop_messages: Messaging,
-    keeper: tokio::task::JoinHandle<Keeper>,
-}
-
-/// Two paired machines, connected, with a message layer on each.
-///
-/// The main always decides for the laptop, which issues the pair's "write to me" on the
-/// side a message needs; `bind_laptop` binds the other way round as well. `floor` is the
-/// host's own say over what it allows at all, for both machines' layers: `NoFloor` unless a
-/// case has a host that refuses. The laptop dials, so the case has one keeper and one
-/// dialling direction to reason about.
-async fn ready(
-    sim: &Sim,
-    beacon: &TestBeacon,
-    bind_laptop: bool,
-    floor: Arc<dyn Floor + Send + Sync>,
-) -> Result<Ready, String> {
-    let (main, laptop) = paired_machines(sim)?;
-    main.rights()?
-        .bind(&laptop.peer_id(), main_binding(&label("admin")?)?, NOW)
-        .map_err(|error| error.to_string())?;
-    if bind_laptop {
-        laptop
-            .rights()?
-            .bind(
-                &main.peer_id(),
-                binding(
-                    "laptop-account",
-                    "laptop-instance",
-                    &label("laptop-assistant")?,
-                )?,
-                NOW,
-            )
-            .map_err(|error| error.to_string())?;
-    }
-    let main_managed = Managed::start(sim, beacon, &main, &main.records())?;
-    let laptop_managed = Managed::start(sim, beacon, &laptop, &laptop.records())?;
-    let main_messages = Messaging::open(sim, &main, Arc::clone(&floor))?;
-    let laptop_messages = Messaging::open(sim, &laptop, floor)?;
-    let keeper = spawn_keeper(&laptop_managed, &main);
-    // Both sides must hold the connection and have finished the exchange before the
-    // case speaks of either: the exchange is what makes the pair's "write to me" reach
-    // the side that did not decide it.
-    wait_live(sim, &main_managed.connections, &laptop.peer_id()).await?;
-    wait_live(sim, &laptop_managed.connections, &main.peer_id()).await?;
-    if !bind_laptop {
-        wait_claim(sim, &laptop.reopen_records()?, &main.peer_id(), None).await?;
-    }
-    Ok(Ready {
-        main,
-        laptop,
-        main_managed,
-        laptop_managed,
-        main_messages,
-        laptop_messages,
-        keeper,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2052,26 +1929,6 @@ pub(crate) fn a_queue_that_cannot_be_read_ends_the_service() -> Result<(), Strin
         }
         Ok(())
     })
-}
-
-/// The one service a case started, and how it ended, within `budget` of virtual time.
-///
-/// The budget is the case's: a refusal the service's own round meets arrives within a round
-/// or two, so a case that wants to show *which* path met it asks for seconds, and a case that
-/// only cares that it ended asks for more.
-async fn single_ending(
-    sim: &Sim,
-    messaging: &Messaging,
-    budget: Duration,
-) -> Result<Result<(), String>, String> {
-    let endings = within(sim, budget, messaging.endings()).await?;
-    let [ending] = &endings[..] else {
-        return Err(format!(
-            "the case started {} services, not one",
-            endings.len()
-        ));
-    };
-    Ok(ending.clone())
 }
 
 /// A refusal met by the *receiving task* ends the service that started it.

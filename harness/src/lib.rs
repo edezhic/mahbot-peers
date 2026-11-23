@@ -10,6 +10,7 @@
 //! Nothing here is process-global: two simulations share no state, and the
 //! suite is safe to run in parallel.
 
+pub mod actions;
 pub mod beacon;
 pub mod clock;
 pub mod connect;
