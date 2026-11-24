@@ -753,9 +753,8 @@ impl Rights {
     /// record from disk on every round — before a dial, before a handshake and while a
     /// connection is up — so a withdrawal written through this handle, another one, or
     /// the other process the self-update window keeps on this root stops it, and the
-    /// live connection is closed within one keeper round: [`crate::peer::TRUST_POLL`]
-    /// while a connection is watched, [`crate::peer::KEEPER_SETTLE`] while a fresh dial
-    /// is still being judged, so the bound is the larger of the two. A caller
+    /// live connection is closed within one keeper round, which is at most
+    /// [`crate::peer::TRUST_POLL`]: the settle window only cuts a round shorter. A caller
     /// that wants it closed now calls [`crate::peer::Connections::disconnect`] in the
     /// same act; the keeper then stops with [`crate::peer::NotTrustedCause::Withdrawn`].
     /// A manager that is not running for the pair is not reached at all, and a product

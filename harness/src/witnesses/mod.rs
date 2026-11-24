@@ -125,6 +125,25 @@ pub const UNIX_WITNESSES: &[Witness] = &[
         capabilities: &["library.peer.actions.untraced"],
         case: actions::memory::an_untraceable_unknown_names_both_outcomes,
     },
+    // The record fault these three need is an operating-system refusal of a record's path, which
+    // a unix host answers as an I/O fault. Whether a Windows host does the same is unverified —
+    // this workspace has no Windows host — so the deferral is not claimed there, and
+    // `platform_capabilities` records that, with the procedure that produces the fault.
+    Witness {
+        id: "a_transient_record_fault_defers_the_dial",
+        capabilities: &["library.peer.connect.transient_record"],
+        case: connection::a_transient_record_fault_defers_the_dial,
+    },
+    Witness {
+        id: "a_transient_record_fault_keeps_the_connection",
+        capabilities: &["library.peer.connect.transient_record_live"],
+        case: connection::a_transient_record_fault_keeps_the_connection,
+    },
+    Witness {
+        id: "a_transient_record_fault_defers_an_action",
+        capabilities: &["library.peer.actions.deferred_record"],
+        case: actions::link::a_transient_record_fault_defers_an_action,
+    },
 ];
 
 /// Nothing on a host without unix modes; `platform_capabilities` records the case
@@ -670,7 +689,7 @@ const WITNESSES: &[Witness] = &[
         case: connection::reconnect_falls_back_to_the_beacon,
     },
     Witness {
-        id: "reconnect_stops_after_both_fail",
+        id: "one_connect_call_makes_one_dial",
         capabilities: &["library.peer.connect.stops"],
         case: connection::reconnect_stops_after_both_fail,
     },
@@ -683,6 +702,11 @@ const WITNESSES: &[Witness] = &[
         id: "manager_refuses_an_unwatchable_transport",
         capabilities: &["library.peer.connect.unwatchable_transport"],
         case: connection::manager_refuses_an_unwatchable_transport,
+    },
+    Witness {
+        id: "a_slow_keep_alive_raises_the_bound",
+        capabilities: &["library.peer.connect.slow_keep_alive_raises_the_bound"],
+        case: connection::a_slow_keep_alive_raises_the_bound,
     },
     Witness {
         id: "one_connection_per_pair",
@@ -735,14 +759,14 @@ const WITNESSES: &[Witness] = &[
         case: connection::keeper_reconnects_without_a_caller,
     },
     Witness {
-        id: "keeper_stops_when_the_peer_keeps_closing",
+        id: "keeper_bounds_a_peer_that_keeps_closing",
         capabilities: &["library.peer.connect.keeper_bound"],
-        case: connection::keeper_stops_when_the_peer_keeps_closing,
+        case: connection::keeper_bounds_a_peer_that_keeps_closing,
     },
     Witness {
-        id: "keeper_stops_when_a_dial_fails",
+        id: "keeper_retries_a_failed_dial",
         capabilities: &["library.peer.connect.keeper_failed"],
-        case: connection::keeper_stops_when_a_dial_fails,
+        case: connection::keeper_retries_a_failed_dial,
     },
     Witness {
         id: "keeper_survives_a_failed_dial_while_the_pair_connects",
@@ -753,6 +777,26 @@ const WITNESSES: &[Witness] = &[
         id: "keeper_resets_after_a_settled_connection",
         capabilities: &["library.peer.connect.keeper_settle"],
         case: connection::keeper_resets_after_a_settled_connection,
+    },
+    Witness {
+        id: "a_cancelled_dial_is_given_back",
+        capabilities: &["library.peer.connect.cancelled_dial"],
+        case: connection::a_cancelled_dial_is_given_back,
+    },
+    Witness {
+        id: "a_keeper_that_stops_is_not_a_retry",
+        capabilities: &["library.peer.connect.watched"],
+        case: connection::a_keeper_that_stops_is_not_a_retry,
+    },
+    Witness {
+        id: "a_peer_dialling_in_does_not_restart_a_used_up_episode",
+        capabilities: &["library.peer.connect.inbound_keeps_the_episode"],
+        case: connection::a_peer_dialling_in_does_not_restart_a_used_up_episode,
+    },
+    Witness {
+        id: "a_second_keeper_does_not_restart_the_episode",
+        capabilities: &["library.peer.connect.one_episode_per_pair"],
+        case: connection::a_second_keeper_does_not_restart_the_episode,
     },
     Witness {
         id: "keeper_survives_a_supersession",
@@ -775,9 +819,92 @@ const WITNESSES: &[Witness] = &[
         case: connection::pairing_restart_then_keeper_reconnects,
     },
     Witness {
+        id: "the_recovery_state_is_readable",
+        capabilities: &["library.peer.connect.recovery_state"],
+        case: connection::the_recovery_state_is_readable,
+    },
+    Witness {
+        id: "nowhere_to_dial_stops_the_keeper",
+        capabilities: &[
+            "library.peer.connect.nowhere",
+            "library.peer.connect.nowhere_failure",
+        ],
+        case: connection::nowhere_to_dial_stops_the_keeper,
+    },
+    Witness {
+        id: "a_learned_address_reopens_a_stop",
+        capabilities: &["library.peer.connect.a_stop_reopens_when_its_cause_goes"],
+        case: connection::a_learned_address_reopens_a_stop,
+    },
+    Witness {
+        id: "a_withdrawn_pair_is_never_retried",
+        capabilities: &["library.peer.connect.not_trusted_never_retried"],
+        case: connection::a_withdrawn_pair_is_never_retried,
+    },
+    Witness {
+        id: "a_restored_trust_is_dialled_again",
+        capabilities: &["library.peer.connect.ensure_stops_and_reopens"],
+        case: connection::a_restored_trust_is_dialled_again,
+    },
+    Witness {
+        id: "pair_recovers_after_the_beacon_returns",
+        capabilities: &["library.peer.connect.beacon_restart"],
+        case: connection::pair_recovers_after_the_beacon_returns,
+    },
+    Witness {
+        id: "pair_recovers_after_the_peer_moves",
+        capabilities: &["library.peer.connect.moved_address"],
+        case: connection::pair_recovers_after_the_peer_moves,
+    },
+    Witness {
+        id: "presence_returns_after_the_beacon_restarts",
+        capabilities: &["library.peer.presence.rearms"],
+        case: connection::presence_returns_after_the_beacon_restarts,
+    },
+    Witness {
+        id: "a_vanished_peer_is_noticed_within_the_bound",
+        capabilities: &["library.peer.connect.vanish_bound"],
+        case: connection::a_vanished_peer_is_noticed_within_the_bound,
+    },
+    Witness {
+        id: "a_shorter_peer_timeout_is_not_a_strike",
+        capabilities: &["library.peer.connect.shorter_timeout"],
+        case: connection::a_shorter_peer_timeout_is_not_a_strike,
+    },
+    Witness {
+        id: "a_silent_pair_without_a_keep_alive_is_noticed_within_the_bound",
+        capabilities: &["library.peer.connect.vanish_bound_without_keep_alive"],
+        case: connection::a_silent_pair_without_a_keep_alive_is_noticed_within_the_bound,
+    },
+    Witness {
+        id: "a_stale_connection_does_not_outrank_a_fresh_one",
+        capabilities: &["library.peer.connect.fresh_wins"],
+        case: connection::a_stale_connection_does_not_outrank_a_fresh_one,
+    },
+    Witness {
+        id: "a_burst_of_stalled_handshakes_is_accepted",
+        capabilities: &["library.peer.connect.accept_burst"],
+        case: connection::a_burst_of_stalled_handshakes_is_accepted,
+    },
+    Witness {
         id: "quiet_pair_stays_connected",
         capabilities: &["library.net.quiet_pair_default"],
         case: connection::quiet_pair_stays_connected,
+    },
+    Witness {
+        id: "a_quiet_pair_outlives_the_vanish_bound",
+        capabilities: &["library.peer.connect.quiet_pair_outlives_the_bound"],
+        case: connection::a_quiet_pair_outlives_the_vanish_bound,
+    },
+    Witness {
+        id: "an_unmeasured_silence_is_not_concluded",
+        capabilities: &["library.peer.connect.unmeasured_silence"],
+        case: connection::an_unmeasured_silence_is_not_concluded,
+    },
+    Witness {
+        id: "a_recheck_is_spread_by_the_machine",
+        capabilities: &["library.peer.connect.recheck_spread"],
+        case: connection::a_recheck_is_spread_by_the_machine,
     },
     Witness {
         id: "connection_binding_is_decided_by_one_machine",
@@ -1152,6 +1279,21 @@ const WITNESSES: &[Witness] = &[
         case: messages::offering_a_message_is_not_the_pairs_traffic,
     },
     Witness {
+        id: "a_queued_message_causes_a_dial",
+        capabilities: &["library.peer.messages.queued_causes_dial"],
+        case: messages::a_queued_message_causes_a_dial,
+    },
+    Witness {
+        id: "an_already_taken_answer_is_traffic",
+        capabilities: &["library.peer.messages.already_taken_is_traffic"],
+        case: messages::an_already_taken_answer_is_traffic,
+    },
+    Witness {
+        id: "a_standing_message_does_not_let_a_closing_peer_escape_the_bound",
+        capabilities: &["library.peer.messages.queued_capped_by_the_episode"],
+        case: messages::a_standing_message_does_not_let_a_closing_peer_escape_the_bound,
+    },
+    Witness {
         id: "a_taken_message_is_the_pairs_traffic",
         capabilities: &["library.peer.messages.offering_is_not_traffic"],
         case: messages::a_taken_message_is_the_pairs_traffic,
@@ -1449,6 +1591,11 @@ const WITNESSES: &[Witness] = &[
         id: "one_request_has_one_total_budget",
         capabilities: &["library.peer.actions.one_budget"],
         case: actions::link::one_request_has_one_total_budget,
+    },
+    Witness {
+        id: "an_action_to_a_peer_that_is_not_there_names_the_failure",
+        capabilities: &["library.peer.actions.connect_failure"],
+        case: actions::link::an_action_to_a_peer_that_is_not_there_names_the_failure,
     },
 ];
 

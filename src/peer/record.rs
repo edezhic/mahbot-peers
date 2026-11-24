@@ -785,6 +785,10 @@ impl RecordStore {
     /// by the other one must refuse the next question. A record that vanished is
     /// removed from the map and answered as absent; a record that has become
     /// unreadable is the typed refusal [`Self::open`] would give.
+    ///
+    /// A root that disappears after the store was opened is not distinguishable from
+    /// an absent record here — the read of the path answers "nothing is there" — so it
+    /// reads as absent. [`Self::open`] is where a missing root fails loudly.
     pub fn reread(&self, peer: &PeerId) -> Result<Option<PeerRecord>, RecordError> {
         let mut map = self.write_map();
         let record = read_file(&path_in(&self.inner.dir, peer), peer)?;
@@ -1195,9 +1199,10 @@ impl PeerPolicy for RecordStore {
 /// Why a record could not be read, written, or believed.
 #[derive(Debug)]
 pub enum RecordError {
-    /// The storage root does not exist, or is not a directory. It is never created
-    /// here: a mistyped or deleted root must fail loudly instead of answering an
-    /// empty set that looks like a machine which knows nobody.
+    /// The storage root does not exist, or is not a directory. [`RecordStore::open`] is where
+    /// this is decided, and it never creates the root: a mistyped root fails loudly there instead
+    /// of opening as a machine which knows nobody. A root that disappears after the store is open
+    /// is not this — see [`RecordStore::reread`].
     RootMissing { path: PathBuf },
     /// The operating system could not read the file. Distinct from
     /// [`Self::Malformed`]: the bytes were not seen at all.
@@ -1250,6 +1255,21 @@ pub enum Malformed {
     KeyMismatch { named: PeerId, found: PeerId },
     /// The file name is not a record name.
     Name { name: String },
+}
+
+impl RecordError {
+    /// Whether this is a fault of the moment rather than a state a person must look at.
+    ///
+    /// This is the one rule about what a retry may outlast, and the connection manager asks it
+    /// rather than classifying faults itself. The bytes were not seen at all: the
+    /// operating system refused this instant, which is [`Self::Unreadable`] — what a read of a
+    /// record answers when it could not see them. Everything else — an insecure file, a
+    /// malformed one, one over the cap, a missing root — is a state that stays until somebody
+    /// changes it, and no retry makes it pass. [`Self::Io`] is an open's and a write's, and no
+    /// caller defers it.
+    pub(crate) fn deferrable(&self) -> bool {
+        matches!(self, Self::Unreadable { .. })
+    }
 }
 
 impl fmt::Display for RecordError {

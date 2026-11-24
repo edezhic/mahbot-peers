@@ -172,6 +172,9 @@ pub struct Messaging {
     pub executions: Arc<Executions>,
     /// The one reader that tells a message from an action.
     inbox: Arc<Inbox>,
+    /// The endpoint this machine's own connections run over: the offer loop dials with it,
+    /// so it must be the serving machine's and not the peer's.
+    endpoint: quinn::Endpoint,
     tasks: Mutex<Vec<tokio::task::JoinHandle<Result<(), InboxError>>>>,
 }
 
@@ -213,6 +216,7 @@ impl Messaging {
             collected,
             executions,
             inbox,
+            endpoint: machine.endpoint().map_err(|error| error.to_string())?,
             tasks: Mutex::new(Vec::new()),
         })
     }
@@ -223,7 +227,11 @@ impl Messaging {
     /// [`Self::endings`], and dropping the layer stops it.
     pub fn serve(&self, connections: &Arc<Connections>, peer: &Machine) {
         let peer_id = peer.peer_id();
-        let handle = tokio::spawn(Arc::clone(&self.inbox).serve(Arc::clone(connections), peer_id));
+        let handle = tokio::spawn(Arc::clone(&self.inbox).serve(
+            Arc::clone(connections),
+            self.endpoint.clone(),
+            peer_id,
+        ));
         self.tasks().push(handle);
     }
 

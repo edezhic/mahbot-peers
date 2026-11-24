@@ -23,7 +23,7 @@ The library (`src/`) holds:
 | `tls` | TLS 1.3 with raw public keys (RFC 7250), pinned to the peer's fingerprint instead of a certificate chain, with a per-service ALPN and resumption off so the pin always runs |
 | `net` | endpoint construction over an injected datagram socket and an injected clock — no default for either |
 | `beacon` | the beacon: the closed message set (`wire`), the client half (`Beacon`, `Session`) — register, look an id up, learn the address observed on this path, hand a signed introduction over, take the ones pushed to a live session — and the one deadline combinator the client and the server share (`timeout`, whose documentation says why there is one copy and not two) |
-| `peer` | the peer layer: `record` is the durable memory of another machine, at both levels; `access` is the connection level's vocabulary — the account on the instance, the assistant, the pair, the four capabilities, the rights and the small versioned fact; `pair` the acquaintance ceremony, `connect` the per-machine connection manager, `presence` the registration refresh, `binding` the exchange that carries the connection level over a live connection, `rights` the decision, `audit` the record of what happened, `messages` the queue a machine keeps for a peer and the offer it makes over the pair's own connection, `actions` the at-most-once command with its durable journal and unknown marks, and `inbox` the one reader that tells a message from an action on that connection. Each is documented where it is enforced |
+| `peer` | the peer layer: `record` is the durable memory of another machine, at both levels; `access` is the connection level's vocabulary — the account on the instance, the assistant, the pair, the four capabilities, the rights and the small versioned fact; `pair` the acquaintance ceremony, `connect` the per-machine connection manager, `recovery` the one retry policy for a pair, `presence` the registration refresh that re-arms itself after a beacon outage, `binding` the exchange that carries the connection level over a live connection, `rights` the decision, `audit` the record of what happened, `messages` the queue a machine keeps for a peer and the offer it makes over the pair's own connection, `actions` the at-most-once command with its durable journal and unknown marks, and `inbox` the one reader that tells a message from an action on that connection. Each is documented where it is enforced |
 
 The key-replacement invariant covers every shipped source: no `fs::rename`,
 `remove_dir` or `fs::copy` anywhere, and no write form in the identity module. The
@@ -179,8 +179,9 @@ instead of a right the machine cannot use.
 
 Nothing on that path depends on who holds which handle. The manager asks the record on
 disk before every dial, before every handshake and once per keeper round while a
-connection is up — `TRUST_POLL` while a connection is watched, `KEEPER_SETTLE` while a
-fresh dial is still being judged — so a withdrawal written through the rights layer's
+connection is up, and a round that watches a connection is at most `TRUST_POLL` — the
+settle window only cuts it shorter, and a round that dials is the dial's own budget
+instead, with nothing up to withdraw — so a withdrawal written through the rights layer's
 store, another store over the same root, or the other process the self-update window
 keeps on it stops the manager: the live connection is closed and the keeper stops naming
 the withdrawal, with no reload asked of the caller. A record that is there and cannot be
@@ -209,11 +210,100 @@ next question on this one. Every moment is the caller's; the crate reads no cloc
 The connection manager's rule for a fresh connection reads the binding exchange, a message
 offer and an action request as what they are: the manager's own handshake and the sender's
 own act, not the pair's use. A connection that only exchanged its binding, or offered a
-message or an action nobody answered, and then died carried nothing, and the keeper's strike
-rule applies to it. A message the receiver took, or an action whose answer means the receiver
-accepted it — it ran, ran with a result too large to carry, or the identifier was already
-spent — is the pair's use and clears the count, which is what keeps a machine holding one
-queued message or one unanswered action from being re-dialled for ever.
+message or an action nobody answered, and then died carried nothing, so it is one dial of the
+pair's recovery like any other that carried nothing. A message the receiver took, or answered
+"already taken", or an action whose answer means the receiver accepted it — it ran, ran with
+a result too large to carry, or the identifier was already spent — is the pair's use and ends
+the run of dials, which is what keeps a machine holding one queued message or one unanswered
+action from being re-dialled for ever.
+
+## Recovery
+
+A pair that has been acquainted recovers by itself, and the crate owns that: the product only
+shows what the crate reports. `Connections::keep_connected` is run once per paired peer and never
+returns while the pair is trusted and there is somewhere to dial. `Connections::recovery` says
+what the policy is doing at any moment — no keeper running for the pair, connected, dialling,
+waiting after a stated failure, an episode used up with its last failure, or stopped with the
+reason — and `Connections::watched` says whether a keeper will act on it. The moments are fields,
+because an `Instant` has no rendering of its own; `Display` gives a sentence a product may show,
+and it states a condition rather than a schedule — "the episode is used up", "stopped: this machine
+does not trust the peer" — because a reason to dial can move the moment.
+
+The policy itself — the episode, the gaps, the slow re-check, which reasons start a fresh episode
+and which only make the next dial due, what is retried and what never is, and why an authenticated
+inbound connection consumes a dial number instead of starting an episode — is stated once, in
+`src/peer/recovery.rs`'s module documentation, and that is the contract. This section summarises
+it and does not restate it: a restated contract is one that will be wrong somewhere within a week.
+Between them those rules are what make a pair come back after one machine was switched off for
+hours, after the beacon was down, after a NAT mapping expired and after the peer restarted on a
+different port, with no person and no restart. A bounded, visible, paced retry is not the plan's
+silent retry loop: that forbids a loop nobody can see and nothing bounds, and this one is bounded
+by the episode, paced by the gap and readable while it runs.
+
+A queued message dials, and does not dial once a second: `Connections::ensure` makes one dial only
+when the policy is due, so the queue's poll and the keeper cannot hammer a peer between them and a
+beacon session is not opened per poll. A product with news the crate cannot see — a person asking
+again — hands it in through `Connections::wake`, which starts a fresh episode. A stop is not
+permanent while its cause is: `ensure` re-opens a stopped pair once the cause has gone and dials it
+once, and self-recovery resumes when the caller runs `keep_connected` again — `watched` is how a
+product knows it is the one that has to. A stop whose cause is still there is answered as the stop,
+with its cause, and that is the same cause the readable state shows.
+
+The machine stays findable by itself too: `Presence::run` opens and holds its own session, and
+when the beacon is gone it opens another — so a beacon that comes back finds this machine
+registered again with no person and no restart. `Presence::state` reports a `Registration`, so a
+product can tell a registration being refreshed from a beacon that is unreachable and when the next
+try is due.
+
+Two things would defeat a retry, and both are fixed rather than papered over. A connection that is
+merely not yet declared dead does not outrank a fresh one, and the manager reads that itself rather
+than leaving it to whoever happens to look. How long a vanished peer goes unnoticed is this
+machine's own stated bound rather than the two machines' negotiated timeout:
+`Connections::vanish_bound` answers a `Vanish`, which says both the bound and whether this machine
+measures the silence at all, and every branch of it is measured by a case. A machine that cannot
+measure silence — no keep-alive, or its own reader not heard from — does not conclude it: nothing is
+judged vanished and the connection lives until the transport's own timeout ends it, and the reading
+says so rather than showing a bound nothing keeps. A connection that ended because it timed out is a
+peer that went quiet — a NAT mapping expiring, a laptop closing — so its loss is a redial and never a
+failure counted against the pair.
+
+A record read the operating system refused is this machine's own and may pass: the ask is answered
+`ConnectFailure::Deferred`, which names the record and is not a statement about the peer — a live
+connection is not torn down, and nothing is trusted on a file nobody could read. A deferral is not
+a reason the pair is down, either: over a pair whose last dial met something else, the state keeps
+that reason and so does the answer, and the fault is only why this call could not ask again. A peer
+that accepts a connection and closes it because its own record could not be read costs this machine
+one dial of the episode; that is the fault's cost and it passes with the fault. An insecure,
+malformed or too-large record never becomes trust and stops the pair's recovery.
+
+`Connections::serve` hands each incoming connection to a task of its own, so a burst of stalled
+handshakes costs a bounded number of tasks and delays the next accept by at most one keeper round.
+
+This release changes the public surface, which nothing published before this one had to. The accept
+path takes the manager's endpoint: `Inbox::serve` and the message service are given it so that a
+queued message can cause a dial. `Presence::run` opens and re-opens its own session and returns
+nothing, and `Presence::state` reports a `Registration` — no answer from the beacon yet, held, or
+the beacon unreachable with the moment the next try was due — so a product can show a beacon
+outage instead of looking as though nothing were wrong. The policy has a module of its own,
+`peer::recovery`, because the state a product shows and the failures it reports are one contract:
+`Recovery`, `StopCause`, `ConnectFailure` and `NotTrustedCause` live there — the last two moved
+from `peer::connect` and are still re-exported from `peer` — together with the stated numbers a
+caller plans against, `RECOVERY_FIRST_GAP`, `RECOVERY_DIALS` and `RECOVERY_RECHECK`, which is the
+bound the slow re-check never exceeds, and `DIAL_BUDGET`, the longest one dial may take, which the
+action budget reserves so that a record read cannot cost the dial. `ConnectFailure` gained
+`Nowhere` — no beacon and no remembered address, which is configuration rather than a network
+state — and `Deferred` — this machine could not read the peer's record just now, which is not a
+statement about the peer and not a claim that a dial was made. `Connections` gained `wake` (a
+person asking again starts a fresh episode), `ensure` (one dial, paced by the policy, which is how
+a queued message or a requested action dials), `recovery` and `watched` (the state, and whether a
+keeper will act on it), and `vanish_bound`, whose `Vanish` is a reading rather than a bare
+duration. `VANISH_BOUND` is the floor of the bound that reading states, public because a caller
+choosing a keep-alive acts on it. `ACCEPT_IN_FLIGHT` is the cap on half-finished handshakes one
+machine carries at once — public because the lane count it replaced was, and because a caller
+opening a public address needs the number. `Keeper`, `ACCEPT_LANES` and `KEEPER_UNSTABLE_LIMIT`
+are gone, and `Connections::keep_connected` answers the `StopCause` it stopped for. `Presence` is
+no longer `Clone` — it holds the registration it reports — so a product keeps it once, behind
+whatever it already shares, rather than copying it.
 
 ## The messages
 
@@ -343,10 +433,10 @@ that peer's journal and unknown marks; the record keeps the withdrawal's moment,
 clearing holds even while that peer's service is stopped for the whole withdrawal, and the
 same identifier runs again once the trust is back.
 
-There is no sender-side queue and no automatic retry. An action is attempted on the live
-connection and nowhere else; if the pair is not connected when a person asks, the ask is an
-ordinary reason to dial, and a failed dial is the failure the caller already knows, with the
-action held nowhere. A request the machine could not get onto the wire — no stream could be
+There is no sender-side queue and no automatic retry. An action runs on the live connection
+and nowhere else; if the pair is not connected when a person asks, the ask is an ordinary
+reason to dial, and a failed dial is the failure the caller already knows, with the action
+held nowhere. A request the machine could not get onto the wire — no stream could be
 opened, or the write did not finish — is reported as `not sent`, unless the receiver had
 already answered: that answer is read under a short courtesy bound and handed back, so a
 request the receiver answered is never reported as unsent. This layer keeps no mark for a
@@ -484,8 +574,8 @@ The harness (`harness/`, never published) is the test rig:
 - **Link.** Datagrams travel through an `AsyncUdpSocket` the test controls —
   the same seam a real socket uses. A script or a seed drops, delays, reorders,
   duplicates and re-addresses them, and every run leaves a trace that replays to
-  itself. A machine's apparent address can change mid-run. A connection attempt
-  drives the clock itself, so a link that drops everything ends at a
+  itself. A machine's apparent address can change mid-run. A dial drives the clock
+  itself, so a link that drops everything ends at a
   deterministic virtual instant instead of hanging the test, and one machine can
   serve several dialers at once.
 - **Clock.** Time moves only when the test moves it. `quinn` reads the clock and

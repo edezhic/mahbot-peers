@@ -99,6 +99,19 @@ impl MockClock {
         })
     }
 
+    /// The same clock and the same timers, and a runtime that never runs a task spawned
+    /// through it.
+    ///
+    /// A manager built over it has a liveness reader that was started and never heard from
+    /// again, which is the one way a machine with a keep-alive can be unable to measure a
+    /// peer's silence.
+    #[must_use]
+    pub(crate) fn quiet_runtime(&self) -> Arc<dyn Runtime> {
+        Arc::new(QuietRuntime {
+            clock: Arc::clone(&self.inner),
+        })
+    }
+
     /// Move time forward by `by`, firing everything due on the way in deadline
     /// order, and let the transport react. Each instant in between is processed
     /// once, so a delayed datagram lands at the moment it was scheduled for.
@@ -370,24 +383,69 @@ impl fmt::Debug for MockRuntime {
     }
 }
 
+/// The one timer both runtimes hand out: registered with the clock, so moving the clock is
+/// what fires it.
+fn timer(clock: &Arc<ClockInner>, instant: Instant) -> Pin<Box<dyn AsyncTimer>> {
+    let inner = Arc::new(TimerInner {
+        clock: Arc::downgrade(clock),
+        deadline: Mutex::new((instant, None)),
+    });
+    clock.state().timers.push(Arc::downgrade(&inner));
+    Box::pin(MockTimer { inner })
+}
+
+/// The one answer both runtimes give to a socket handed to them: datagrams travel the
+/// harness's link, never a real socket.
+fn no_udp_socket(_socket: std::net::UdpSocket) -> io::Result<Arc<dyn AsyncUdpSocket>> {
+    Err(io::Error::other(
+        "the harness delivers datagrams through its link: build endpoints with an abstract socket",
+    ))
+}
+
 impl Runtime for MockRuntime {
     fn new_timer(&self, instant: Instant) -> Pin<Box<dyn AsyncTimer>> {
-        let inner = Arc::new(TimerInner {
-            clock: Arc::downgrade(&self.clock),
-            deadline: Mutex::new((instant, None)),
-        });
-        self.clock.state().timers.push(Arc::downgrade(&inner));
-        Box::pin(MockTimer { inner })
+        timer(&self.clock, instant)
     }
 
     fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
         tokio::spawn(future);
     }
 
-    fn wrap_udp_socket(&self, _socket: std::net::UdpSocket) -> io::Result<Arc<dyn AsyncUdpSocket>> {
-        Err(io::Error::other(
-            "the harness delivers datagrams through its link: build endpoints with an abstract socket",
-        ))
+    fn wrap_udp_socket(&self, socket: std::net::UdpSocket) -> io::Result<Arc<dyn AsyncUdpSocket>> {
+        no_udp_socket(socket)
+    }
+
+    fn now(&self) -> Instant {
+        self.clock.state().now
+    }
+}
+
+/// The same clock and the same timers, and a runtime that never runs a task spawned through
+/// it.
+///
+/// A manager built over it has a liveness reader that was started and never heard from again,
+/// which is the one way a machine with a keep-alive can be unable to measure a peer's silence.
+pub(crate) struct QuietRuntime {
+    clock: Arc<ClockInner>,
+}
+
+impl fmt::Debug for QuietRuntime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("QuietRuntime")
+    }
+}
+
+impl Runtime for QuietRuntime {
+    fn new_timer(&self, instant: Instant) -> Pin<Box<dyn AsyncTimer>> {
+        timer(&self.clock, instant)
+    }
+
+    /// The task is dropped where it was handed in: the reader never makes a pass, so nothing
+    /// is measured and the manager must not conclude anything from the silence.
+    fn spawn(&self, _future: Pin<Box<dyn Future<Output = ()> + Send>>) {}
+
+    fn wrap_udp_socket(&self, socket: std::net::UdpSocket) -> io::Result<Arc<dyn AsyncUdpSocket>> {
+        no_udp_socket(socket)
     }
 
     fn now(&self) -> Instant {

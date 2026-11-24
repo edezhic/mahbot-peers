@@ -18,10 +18,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mahbot_peers::peer::{
-    ACTION_BUDGET, ACTION_WINDOW, Act, ActionAnswer, ActionKind, Authority, Capability,
-    EXECUTION_BUDGET, KEEPER_UNSTABLE_LIMIT, Keeper, MAX_ACTION_BODY_BYTES, MAX_ACTIONS_PER_WINDOW,
-    NoFloor,
+    ACTION_BUDGET, ACTION_WINDOW, Act, ActionAnswer, ActionError, ActionKind, Authority,
+    Capability, ConnectFailure, EXECUTION_BUDGET, MAX_ACTION_BODY_BYTES, MAX_ACTIONS_PER_WINDOW,
+    NoFloor, Recovery,
 };
+#[cfg(unix)]
+use mahbot_peers::peer::{ActionId, DIAL_BUDGET, TRUST_POLL};
 
 use crate::beacon::TestBeacon;
 use crate::clock::block_on;
@@ -32,6 +34,9 @@ use crate::sim::Sim;
 use super::super::connection::Managed;
 use super::super::peer::session;
 use super::super::rights::{label, person};
+#[cfg(unix)]
+use super::super::support::Ready;
+use super::super::support::counted_dial;
 use super::super::support::{
     field, io_error, main_binding, pair, single_ending, socket, spawn_keeper, wait_live, within,
 };
@@ -467,7 +472,7 @@ pub(crate) fn an_action_asked_while_the_pair_is_away_waits_for_the_dial() -> Res
 }
 
 /// A failed dial holds nothing: the ask is answered with the dial's own failure, no mark is
-/// written, and nothing is queued for a later attempt.
+/// written, and nothing is queued for a later dial.
 pub(crate) fn a_failed_dial_holds_nothing() -> Result<(), String> {
     block_on(async {
         let sim = Sim::new().map_err(io_error)?;
@@ -505,6 +510,95 @@ pub(crate) fn a_failed_dial_holds_nothing() -> Result<(), String> {
         if !marks.is_empty() {
             return Err(format!(
                 "a failed dial left {} marks on the sender's memory",
+                marks.len()
+            ));
+        }
+        if ready.main_messages.executions.count() != 0 {
+            return Err("an action nothing carried still ran on the receiver".to_owned());
+        }
+        sim.link().resume(ready.main.addr());
+        Ok(())
+    })
+}
+
+/// An action a person asks for against a peer that is not there is answered with the pair's
+/// own failure, and the ask costs one dial rather than a dial a second.
+///
+/// The pair's connection is taken away and the peer's address is silenced, so the ask's dial
+/// spends the connect budget and the beacon then says the peer is not registered: the answer
+/// is [`ActionError::Connect`] naming that failure — not a bare "nothing was ready" — and the
+/// pair made the one dial, which is what the layer's wait on the policy's own moment is for.
+pub(crate) fn an_action_to_a_peer_that_is_not_there_names_the_failure() -> Result<(), String> {
+    block_on(async {
+        let sim = Sim::new().map_err(io_error)?;
+        let beacon = TestBeacon::start(&sim).map_err(io_error)?;
+        let ready = ready(&sim, &beacon, Arc::new(NoFloor)).await?;
+        // The ask is the only dialer, so the dials the pair makes are the ones it spent.
+        ready.keeper.abort();
+        ready
+            .laptop_managed
+            .connections
+            .disconnect(&ready.main.peer_id());
+        sim.clock().advance(Duration::from_secs(1)).await;
+        sim.clock().settle().await;
+        // Nothing addressed to the peer arrives, and no registration names it either.
+        sim.link().silence(ready.main.addr());
+        let actions = Arc::clone(&ready.laptop_messages.actions);
+        let connections = Arc::clone(&ready.laptop_managed.connections);
+        let endpoint = ready.laptop_managed.endpoint.clone();
+        let peer = ready.main.peer_id();
+        let asked = tokio::spawn(async move {
+            actions
+                .request(
+                    &connections,
+                    &endpoint,
+                    &peer,
+                    id(1),
+                    ActionKind::COMMAND,
+                    b"a command",
+                )
+                .await
+        });
+        let answered = within(&sim, LONG, asked)
+            .await?
+            .map_err(|error| format!("the request's task did not finish: {error}"))?;
+        match &answered {
+            Err(ActionError::Connect(ConnectFailure::PeerUnknown { peer, cause }))
+                if *peer == ready.main.fingerprint() =>
+            {
+                if cause.is_empty() {
+                    return Err("the failure names no cause for the dial".to_owned());
+                }
+            }
+            other => {
+                return Err(format!(
+                    "an action to a peer that is not there was answered `{other:?}`, not the \
+                     pair's own failure"
+                ));
+            }
+        }
+        // One dial, not one a second: the ask waited on the policy's own moment instead of
+        // polling with a dial each time.
+        match ready
+            .laptop_managed
+            .connections
+            .recovery(&ready.main.peer_id())
+        {
+            Recovery::Waiting { dial: 1, .. } => {}
+            other => {
+                return Err(format!(
+                    "one ask left the pair reading `{other}`, not the one dial it made"
+                ));
+            }
+        }
+        let marks = ready
+            .laptop_messages
+            .actions
+            .unknown(&ready.main.peer_id())
+            .map_err(|error| error.to_string())?;
+        if !marks.is_empty() {
+            return Err(format!(
+                "an ask that never left left {} marks on the sender's memory",
                 marks.len()
             ));
         }
@@ -730,8 +824,9 @@ pub(crate) fn an_action_memory_that_cannot_be_read_ends_the_service() -> Result<
 }
 
 /// An action in flight is not the pair's traffic: a connection closed with a request still
-/// unanswered is a dial that carried nothing, so the keeper stops instead of re-dialling for
-/// ever.
+/// unanswered is a dial that carried nothing, so the episode is used up instead of
+/// re-dialling for ever — and the keeper keeps running, because the peer may stop doing
+/// it.
 pub(crate) fn an_action_in_flight_is_not_the_pairs_traffic() -> Result<(), String> {
     block_on(async {
         let sim = Sim::new().map_err(io_error)?;
@@ -748,65 +843,64 @@ pub(crate) fn an_action_in_flight_is_not_the_pairs_traffic() -> Result<(), Strin
         let keeper = spawn_keeper(&ready.main_managed, &ready.laptop);
         // The main's inbox is not served: the stream is accepted and nothing answers it.
         let mut asked = Vec::new();
-        within(&sim, Duration::from_secs(300), async {
-            let mut closed = 0usize;
-            while closed < usize::from(KEEPER_UNSTABLE_LIMIT) && !keeper.is_finished() {
-                let connection = wait_live(
-                    &sim,
-                    &ready.laptop_managed.connections,
-                    &ready.main.peer_id(),
+        let connection = wait_live(
+            &sim,
+            &ready.laptop_managed.connections,
+            &ready.main.peer_id(),
+        )
+        .await?;
+        // The sender's own side is ready before the request is made, so the request offers
+        // over this connection rather than dialling one of its own.
+        let _sent = wait_live(
+            &sim,
+            &ready.main_managed.connections,
+            &ready.laptop.peer_id(),
+        )
+        .await?;
+        let actions = Arc::clone(&ready.main_messages.actions);
+        let connections = Arc::clone(&ready.main_managed.connections);
+        let endpoint = ready.main_managed.endpoint.clone();
+        let peer = ready.laptop.peer_id();
+        asked.push(tokio::spawn(async move {
+            actions
+                .request(
+                    &connections,
+                    &endpoint,
+                    &peer,
+                    id(1),
+                    ActionKind::COMMAND,
+                    b"nobody answers this",
                 )
-                .await?;
-                // The sender's own side is ready before the request is made, so the request
-                // offers over this connection rather than dialling one of its own.
-                let _sent = wait_live(
-                    &sim,
-                    &ready.main_managed.connections,
-                    &ready.laptop.peer_id(),
-                )
-                .await?;
-                let actions = Arc::clone(&ready.main_messages.actions);
-                let connections = Arc::clone(&ready.main_managed.connections);
-                let endpoint = ready.main_managed.endpoint.clone();
-                let peer = ready.laptop.peer_id();
-                let round = id(closed as u64 + 1);
-                asked.push(tokio::spawn(async move {
-                    actions
-                        .request(
-                            &connections,
-                            &endpoint,
-                            &peer,
-                            round,
-                            ActionKind::COMMAND,
-                            b"nobody answers this",
-                        )
-                        .await
-                        .map_err(|error| error.to_string())
-                }));
-                within(&sim, LONG, connection.accept_bi())
-                    .await?
-                    .map_err(|error| error.to_string())?;
-                ready
-                    .laptop_managed
-                    .connections
-                    .disconnect(&ready.main.peer_id());
-                closed += 1;
-            }
-            Ok::<(), String>(())
-        })
-        .await??;
-        let end = within(&sim, Duration::from_secs(120), keeper)
+                .await
+                .map_err(|error| error.to_string())
+        }));
+        within(&sim, LONG, connection.accept_bi())
             .await?
-            .map_err(|error| format!("the keeper's task did not finish: {error}"))?;
-        match &end {
-            Keeper::Unstable { peer, .. } if *peer == ready.laptop.fingerprint() => {}
-            other => {
-                return Err(format!(
-                    "the keeper ended `{other}`, not unstable after {KEEPER_UNSTABLE_LIMIT} dials \
-                     whose only traffic was an unanswered action"
-                ));
-            }
+            .map_err(|error| error.to_string())?;
+        ready
+            .laptop_managed
+            .connections
+            .disconnect(&ready.main.peer_id());
+        // The close is one dial of the episode, with the connection that carried nothing
+        // as its cause: a request in flight is this machine's own act and not the pair's
+        // traffic, so a peer that keeps dropping after one is not mistaken for a live pair.
+        let counted = counted_dial(
+            &sim,
+            &ready.main_managed.connections,
+            &ready.laptop.peer_id(),
+        )
+        .await?;
+        if counted == 0 {
+            return Err("the close was not counted as a dial of the episode".to_owned());
         }
+        if keeper.is_finished() {
+            return Err(
+                "the keeper stopped after a connection whose only traffic was an unanswered \
+                 action"
+                    .to_owned(),
+            );
+        }
+        keeper.abort();
         for handle in asked {
             handle.abort();
         }
@@ -1067,4 +1161,275 @@ pub(crate) fn one_request_has_one_total_budget() -> Result<(), String> {
             ),
         }
     })
+}
+
+/// A record read the operating system refused defers an action's dial; it does not fail it.
+///
+/// The records directory is replaced by a regular file, so every record read under the laptop's
+/// root fails the way an operating-system fault does on a unix host, and the read the ask needs
+/// before anything is dialled meets it. Three outcomes are observed, in order. A fault still
+/// unread when the ask's last dial-length of [`ACTION_BUDGET`] begins is answered as
+/// [`ActionError::Connect`] carrying [`ConnectFailure::Deferred`] that names the record, and the
+/// pair is not stopped by it. A fault that clears inside the budget is not reported to the person
+/// as a trust failure: the ask waits a round, the next read finds trust, and the request goes on
+/// to the dial. And over a pair whose last dial met a network failure, the same fault is answered
+/// with that failure rather than the deferral, in the answer and in the state the product reads.
+#[cfg(unix)]
+pub(crate) fn a_transient_record_fault_defers_an_action() -> Result<(), String> {
+    block_on(async {
+        let sim = Sim::new().map_err(io_error)?;
+        let beacon = TestBeacon::start(&sim).map_err(io_error)?;
+        let ready = ready(&sim, &beacon, Arc::new(NoFloor)).await?;
+        let record = ready
+            .laptop
+            .storage()
+            .record_name(&ready.main.peer_id())
+            .map_err(io_error)?;
+        // The ask is the only dialer, so what the pair does is what the ask made it do.
+        ready.keeper.abort();
+        ready
+            .laptop_managed
+            .connections
+            .disconnect(&ready.main.peer_id());
+        sim.clock().advance(Duration::from_secs(1)).await;
+        sim.clock().settle().await;
+        // Every record read under the laptop's root meets an operating-system fault, and it
+        // stays on file for both asks below.
+        let hidden = ready
+            .laptop
+            .storage()
+            .hide_records_dir()
+            .map_err(io_error)?;
+        let asked = ask(&ready, id(1));
+        // A fault still unread when the ask's last dial-length begins is answered as the deferral
+        // it is, and the answer names the record. The clock is moved in keeper rounds rather than
+        // polled, and the drive runs past the moment the read gives up.
+        let spent = spend_budget(&sim, &asked).await?;
+        // The read gives up one dial short of the budget, so the answer lands on that moment: a
+        // reservation shorter than a dial lets the read spend the dial's time, and a longer one
+        // spends the person's. `spend_budget` moves the clock in keeper rounds, so what it
+        // measures is the first round at or after the read's own deadline.
+        let reserved = ACTION_BUDGET - DIAL_BUDGET;
+        let rounds = reserved.as_nanos().div_ceil(TRUST_POLL.as_nanos());
+        let expected = TRUST_POLL * u32::try_from(rounds).expect("the reservation is a few rounds");
+        if spent != expected {
+            return Err(format!(
+                "an ask answered a record fault after {spent:?}, not the {expected:?} its read \
+                 reserves: the reservation is not one dial"
+            ));
+        }
+        let answered = asked
+            .await
+            .map_err(|error| format!("the request's task failed: {error}"))?;
+        match &answered {
+            Err(error @ ActionError::Connect(ConnectFailure::Deferred { peer, detail })) => {
+                if *peer != ready.main.fingerprint() {
+                    return Err(format!(
+                        "the deferral names {peer}, not the peer the action was asked of"
+                    ));
+                }
+                if !detail.contains(&record) {
+                    return Err(format!("the deferral does not name the record: {detail}"));
+                }
+                // The sentence a person reads names this machine's read, never a trust decision
+                // and never a dial that may not have happened. `Deferred` is the outcome's name,
+                // not a word its sentence uses.
+                let words = error.to_string();
+                if words.contains("not trusted") || words.contains("deferred") {
+                    return Err(format!("a deferral's sentence reads `{words}`"));
+                }
+            }
+            other => {
+                return Err(format!(
+                    "a record fault still unread when the ask's last dial-length began was \
+                     answered `{other:?}`, not as a deferral naming the record"
+                ));
+            }
+        }
+        // A deferral is not a stop: the pair is not refused for a fault on this machine.
+        let state = ready
+            .laptop_managed
+            .connections
+            .recovery(&ready.main.peer_id());
+        if matches!(state, Recovery::Stopped { .. }) {
+            return Err(format!(
+                "a deferred fault stopped the pair: it reads `{state}`"
+            ));
+        }
+        // The second ask, under a fresh identifier so the first one's journal entry cannot
+        // interfere: two rounds pass with the fault still on file, and a deferred read is tried
+        // again rather than answered, so the ask is still running.
+        let mut asked = ask(&ready, id(2));
+        let early = sim.clock().drive(2 * TRUST_POLL, &mut asked).await;
+        if let Some(answered) = early {
+            let answered =
+                answered.map_err(|error| format!("the request's task failed: {error}"))?;
+            return Err(format!(
+                "an action answered a deferred record fault while the fault was still on file: {answered:?}"
+            ));
+        }
+        // The fault clears while the ask waits: the next read finds trust, so the request goes
+        // on and the person is not told the pair is refused. The link is watched from here, so
+        // the dial the ask makes after the fault is seen rather than assumed.
+        let traced = sim.link().trace().len();
+        hidden.restore().map_err(io_error)?;
+        let answered = within(&sim, LONG, asked)
+            .await?
+            .map_err(|error| format!("the request's task did not finish: {error}"))?;
+        if !sim
+            .link()
+            .trace()
+            .iter()
+            .skip(traced)
+            .any(|event| event.from == ready.laptop.addr() && event.to == ready.main.addr())
+        {
+            return Err(
+                "the ask never dialled after the record became readable: the fault cost the \
+                 dial it was asked for"
+                    .to_owned(),
+            );
+        }
+        match &answered {
+            Err(ActionError::Io { .. })
+            | Err(ActionError::Insecure { .. })
+            | Err(ActionError::Record(_))
+            | Err(ActionError::Connect(ConnectFailure::Deferred { .. }))
+            | Err(ActionError::Connect(ConnectFailure::NotTrusted { .. })) => {
+                return Err(format!(
+                    "a fault that cleared while the ask waited was still reported as a record or \
+                     trust failure: {answered:?}"
+                ));
+            }
+            _ => {}
+        }
+        // A deferral never stands in for the reason the pair is down. The pair's next dial is a
+        // real one that meets a silent peer, so the policy has a network failure to keep; then
+        // the record fault returns and is still unread when a fourth ask's last dial-length
+        // begins, and the answer is the reason the pair is down rather than the fault this machine
+        // met.
+        ready
+            .laptop_managed
+            .connections
+            .disconnect(&ready.main.peer_id());
+        sim.clock().advance(Duration::from_secs(1)).await;
+        sim.clock().settle().await;
+        sim.link().silence(ready.main.addr());
+        let asked = ask(&ready, id(3));
+        let first = within(&sim, LONG, asked)
+            .await?
+            .map_err(|error| format!("the request's task did not finish: {error}"))?;
+        if !matches!(&first, Err(ActionError::Connect(_))) {
+            return Err(format!(
+                "an ask that met a silent peer was answered `{first:?}`, not the failure its \
+                 dial met"
+            ));
+        }
+        let real = match ready
+            .laptop_managed
+            .connections
+            .recovery(&ready.main.peer_id())
+        {
+            Recovery::Waiting {
+                last: Some(last), ..
+            }
+            | Recovery::Exhausted { last, .. }
+                if !matches!(last, ConnectFailure::Deferred { .. }) =>
+            {
+                last
+            }
+            other => {
+                return Err(format!(
+                    "the ask that met a silent peer left the pair reading `{other}`, not a \
+                     network failure to keep"
+                ));
+            }
+        };
+        let hidden = ready
+            .laptop
+            .storage()
+            .hide_records_dir()
+            .map_err(io_error)?;
+        let asked = ask(&ready, id(4));
+        spend_budget(&sim, &asked).await?;
+        let answered = asked
+            .await
+            .map_err(|error| format!("the request's task failed: {error}"))?;
+        match &answered {
+            Err(ActionError::Connect(named)) if *named == real => {}
+            other => {
+                return Err(format!(
+                    "a record fault over a pair whose last dial met `{real}` was answered \
+                     `{other:?}`: the answer is not the reason the pair is down"
+                ));
+            }
+        }
+        // One pair, one reason: the state the product reads still names it too.
+        match ready
+            .laptop_managed
+            .connections
+            .recovery(&ready.main.peer_id())
+        {
+            Recovery::Waiting {
+                last: Some(last), ..
+            }
+            | Recovery::Exhausted { last, .. }
+                if last == real => {}
+            other => {
+                return Err(format!(
+                    "the answer named `{real}` while the state reads `{other}`"
+                ));
+            }
+        }
+        hidden.restore().map_err(io_error)?;
+        Ok(())
+    })
+}
+
+/// One ask of the laptop's action layer, spawned so the case can drive the clock while it waits.
+#[cfg(unix)]
+fn ask(ready: &Ready, id: ActionId) -> tokio::task::JoinHandle<Result<ActionAnswer, ActionError>> {
+    let actions = Arc::clone(&ready.laptop_messages.actions);
+    let connections = Arc::clone(&ready.laptop_managed.connections);
+    let endpoint = ready.laptop_managed.endpoint.clone();
+    let peer = ready.main.peer_id();
+    tokio::spawn(async move {
+        actions
+            .request(
+                &connections,
+                &endpoint,
+                &peer,
+                id,
+                ActionKind::COMMAND,
+                b"a command",
+            )
+            .await
+    })
+}
+
+/// Drive the clock in keeper rounds until `asked` finishes, and answer how much virtual time it
+/// took.
+///
+/// One request has one budget, so an ask that outlives it by more than the rounds it waited in is
+/// one the budget does not bound. The ask's first poll — where its deadline is taken — is pinned
+/// to this instant before anything is measured, so what this answers is measured from the ask's
+/// own start.
+#[cfg(unix)]
+async fn spend_budget(
+    sim: &Sim,
+    asked: &tokio::task::JoinHandle<Result<ActionAnswer, ActionError>>,
+) -> Result<Duration, String> {
+    tokio::task::yield_now().await;
+    let mut spent = Duration::ZERO;
+    while !asked.is_finished() {
+        if spent > ACTION_BUDGET + 2 * TRUST_POLL {
+            return Err(format!(
+                "an action was still waiting {spent:?} after a record fault it never read: the \
+                 budget is not the one the record read shares"
+            ));
+        }
+        sim.clock().advance(TRUST_POLL).await;
+        tokio::task::yield_now().await;
+        spent += TRUST_POLL;
+    }
+    Ok(spent)
 }

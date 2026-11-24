@@ -476,7 +476,34 @@ fn platform_capabilities() -> Vec<Capability> {
         messages_private,
         actions_private,
         actions_untraced,
+        record_fault(
+            "library.peer.connect.transient_record",
+            TRANSIENT_RECORD_CLAIM,
+            TRANSIENT_RECORD_HOW,
+        ),
+        record_fault(
+            "library.peer.connect.transient_record_live",
+            TRANSIENT_RECORD_LIVE_CLAIM,
+            TRANSIENT_RECORD_LIVE_HOW,
+        ),
+        record_fault(
+            "library.peer.actions.deferred_record",
+            DEFERRED_RECORD_CLAIM,
+            DEFERRED_RECORD_HOW,
+        ),
     ]
+}
+
+/// The three entries the record fault speaks for, on this host.
+///
+/// The fault is an operating-system refusal of a record's path, and a unix host is the one this
+/// suite can produce it on; [`RECORD_FAULT_WHY`] states why the same cannot be claimed elsewhere.
+fn record_fault(id: &'static str, claim: &'static str, how: &'static str) -> Capability {
+    if cfg!(unix) {
+        Capability::witnessed(id, claim).with_procedure(how)
+    } else {
+        Capability::unproducible(id, claim, RECORD_FAULT_WHY, how)
+    }
 }
 
 /// The claim about a peer record reachable by another account.
@@ -565,6 +592,27 @@ const ACTIONS_UNTRACED_HOW: &str = "In a scratch root, run the case `an_untracea
 
 /// What a host that can produce [`UNREADABLE_RECORD_CLAIM`] does.
 const UNREADABLE_RECORD_HOW: &str = "In a scratch root, run the case `an_unreadable_record_is_not_an_unpaired_machine` (`cargo test -p mahbot-peers-harness` on a unix host runs it): it pairs two machines, `chmod 644` on the peer's record file in the scratch root, and dials, which refuses with `not trusted: its record cannot be read` and names the record. `chmod 600` on the same file in the same scratch root makes the same dial connect.";
+
+/// The claim about a record fault the operating system refused just now.
+const TRANSIENT_RECORD_CLAIM: &str = "a record read the operating system refused — an I/O fault, not a refusal of the file — defers the dial instead of ending the pair: the keeper keeps running, the state names the record, the dial is not counted against the peer; and a pair whose last dial met a network failure keeps that reason through the fault, in the state and in the answer, whether the caller asked the policy for one dial or dialled once";
+
+/// The claim about the same fault while a connection is up.
+const TRANSIENT_RECORD_LIVE_CLAIM: &str = "a record read the operating system refused while a connection is up is a deferral and not a refusal: the dial a caller asks for is answered `ConnectFailure::Deferred` naming the record, the keeper's own rounds defer too rather than stopping the pair, so the connection stays the one the pair holds and still carries while the fault lasts, and it is still there and still carrying once the record is readable again";
+
+/// The claim about the same fault on a person's action.
+const DEFERRED_RECORD_CLAIM: &str = "a record read the operating system refused defers an action's dial instead of failing it: the ask waits a round and reads the record again rather than answering at once, a fault that clears while the ask is still reading — inside the budget less one dial — still reaches the dial, with the link showing the ask's own dial once the record is readable and no record or trust failure reported, a fault still unread when the budget's last dial-length begins is answered as `ConnectFailure::Deferred` naming the record and not as a trust decision, with the pair not stopped by it, and over a pair whose last dial met a network failure the same fault is answered with that reason instead of the deferral";
+
+/// Why the three record-fault cases cannot be produced on every host.
+const RECORD_FAULT_WHY: &str = "the case produces the fault by putting a regular file where the records directory belongs. A unix host answers a record read through it as an I/O fault. Whether a Windows host does the same is unverified: this workspace has no Windows host, and the reader answers only a missing path as \"no record\", so a host that reports this path as one that does not resolve would see a refusal instead of the deferral. A directory at a record's own path is not this fault and cannot stand in for it: the reader refuses a non-regular file as insecure before it reads a byte, on every platform, and that is a refusal rather than a deferral. The fault cannot be arranged on such a host without an access-list edit, and this suite builds none. The Windows reader and writer are type-checked for both Windows targets by `windows-check`, which any host builds";
+
+/// What a host that can produce [`TRANSIENT_RECORD_CLAIM`] does.
+const TRANSIENT_RECORD_HOW: &str = "In a scratch root, run the case `a_transient_record_fault_defers_the_dial` (`cargo test -p mahbot-peers-harness` on a unix host runs it): it pairs two machines, replaces the `peers` directory of one machine's scratch root with a regular file, and dials — the answer is `ConnectFailure::Deferred` naming the record, the keeper keeps running, the dial count does not advance, and the directory is put back when the case ends. Nothing in the scratch root is kept.";
+
+/// What a host that can produce [`TRANSIENT_RECORD_LIVE_CLAIM`] does.
+const TRANSIENT_RECORD_LIVE_HOW: &str = "In a scratch root, run the case `a_transient_record_fault_keeps_the_connection`: it pairs two machines, connects them, replaces the `peers` directory of one machine's scratch root with a regular file, and asks for a dial — the answer is `ConnectFailure::Deferred` naming the record, the pair keeps the connection it holds and still carries on it, no stop is written, and once the directory is back the same connection still carries. Nothing in the scratch root is kept.";
+
+/// What a host that can produce [`DEFERRED_RECORD_CLAIM`] does.
+const DEFERRED_RECORD_HOW: &str = "In a scratch root, run the case `a_transient_record_fault_defers_an_action`: it pairs two machines and replaces the laptop's `peers` directory with a regular file — an ask whose record fault is still unread when the budget's last dial-length begins is answered `ActionError::Connect` with `ConnectFailure::Deferred` naming the record and does not stop the pair; when the directory is put back while a second ask waits, the ask reads trust again and the link shows its own dial; and after a dial that met a silent peer, the fault is answered with that failure rather than the deferral. Nothing in the scratch root is kept.";
 
 /// The claim about the login names a unix ownership refusal adds to the numbers.
 const UNIX_NAMES_CLAIM: &str = "a unix ownership refusal names both accounts by login name and number, and reports the number alone when the platform has no name for it";
@@ -878,7 +926,7 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.peer.pairing.attempt_limit",
-        "three rejections close the pair on that machine, a fresh open of the same root still sees it closed, a ceremony is refused while it is closed, a connection attempt reports `NotTrusted` with the closure as its cause rather than a missing record, and a person's clear reopens it",
+        "three rejections close the pair on that machine, a fresh open of the same root still sees it closed, a ceremony is refused while it is closed, a dial reports `NotTrusted` with the closure as its cause rather than a missing record, and a person's clear reopens it",
     ),
     Capability::witnessed(
         "library.peer.pairing.flight_timeout",
@@ -950,7 +998,85 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.peer.connect.stops",
-        "after the remembered address and the beacon both fail the manager stops, reports `PeerUnknown` with the remembered address's dial failure as its cause, and dials nothing more as time passes",
+        "one call to the manager's connect makes one dial and no more: after the remembered address and the beacon both fail it reports `PeerUnknown` with the remembered address's dial failure as its cause, and moves nothing afterwards — the retry belongs to the keeper and the pair's policy, not to the call",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.recovery_state",
+        "the pair's recovery is readable at any time and names what it is doing: nothing yet (`Unwatched`), dialling, waiting until a stated moment after a stated failure, an episode used up with its last failure, or stopped with the reason — and a pair that was off comes back to `Connected` with nobody acting; the sentence a product may show states a condition and never a schedule, so a used-up episode says it is used up instead of predicting when the next dial will be",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.nowhere",
+        "a pair with no beacon configured and no remembered address stops with `Nowhere` and sends nothing: configuration, not a network state that can pass; the keeper stops on its first round, and a service path that meets the same state makes the same stop rather than counting it as a failed dial",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.nowhere_failure",
+        "a pair whose record holds no address and whose manager has no beacon reports `ConnectFailure::Nowhere` — configuration, not a network failure — from a direct `Connections::connect`, from a service's `Connections::ensure`, and from an action asked for that pair, which answers the same failure instead of a bare unprepared; a stop a service's ask only found rather than wrote is answered with its cause too, so no caller is told only that nothing happened",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.a_stop_reopens_when_its_cause_goes",
+        "a stop outlives nothing: a hint that reaches the peer re-opens a pair stopped with `Nowhere` — read with that connection gone, because a live pair answers connected whatever the policy says — an address another handle writes to the record re-opens it for good because the ask after a round reads the file rather than a cached record, an address the peer's own connection taught the record re-opens it, and a keeper the caller starts afterwards brings the pair up with nobody handing it an address",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.not_trusted_never_retried",
+        "a pair this machine does not trust is never retried: the live connection is closed, the keeper returns the refusal naming the cause, the state is stopped, and no dial is made however much time passes; when the record behind the stop is removed, the next ask answers and stores the cause the file now gives rather than the one the state remembered",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.ensure_stops_and_reopens",
+        "a service's dial to a pair this machine does not trust is answered with the refusal and the pair is stopped naming the same cause, so the answer and the readable state never name two reasons, and a trust a person restores is dialled by the next call: the restored pair is live and carries a datagram; a stop a keeper left for the withdrawal is re-opened by that next call, and a plain `Connections::connect` that reaches the peer re-opens it too, because the record and the handshake have both disproved its cause",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.watched",
+        "who makes the next dial is readable beside what the policy is doing: a pair a keeper runs for reads watched while its state is the wait the keeper will act on, and a keeper whose task is cancelled — mid-dial or mid-wait — leaves the pair reading `watched` false with the episode it had used up still on record, so a product can say that nothing will dial it next rather than looking as though a retry is coming",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.beacon_restart",
+        "a pair whose beacon went down recovers by itself when the beacon comes back: while it is down both sides report the beacon as unreachable rather than silence, and afterwards the pair reconnects and carries a datagram with no person and no restart",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.moved_address",
+        "a peer that restarted on a new port is found again through the beacon by the other machine's own re-check: the stale address is tried, the beacon answers the new one, the pair connects at it and carries a datagram, and the accepting side records the address authenticated data arrived from",
+    ),
+    Capability::witnessed(
+        "library.peer.presence.rearms",
+        "this machine's own registration comes back by itself when the beacon does: while the beacon is gone the state names it as unreachable with the count of failed registration dials, once it returns the registration is held again with no person and no restart, and a run that is dropped leaves the state idle rather than claiming a registration nothing refreshes",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.vanish_bound",
+        "the bound is stated in this machine's own terms and kept: with a keep-alive a peer that has gone silent is noticed within this machine's liveness bound — `VANISH_BOUND`, or twice the keep-alive when that is longer — plus the two keeper rounds that cover the manager's own liveness poll and the round that closes the connection, the connection is closed by this machine and dialled again, and the loss is not counted as a failure against the pair",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.vanish_bound_without_keep_alive",
+        "without a keep-alive the stated bound is the transport's own idle timeout plus the one keeper round it takes to see the close — nothing this machine sends would make a silent peer answer — and that bound is kept too: a pair that says nothing at all is noticed gone inside it, the connection ends with the transport's timeout rather than a goodbye, the loss is a redial and not a strike, and the pair comes back with nobody acting",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.quiet_pair_outlives_the_bound",
+        "a healthy pair that carries nothing is not declared gone by its own keeper: with the default transport, both keepers run over a quiet connection for longer than `vanish_bound()`, the connection is the same one afterwards, the state reads connected, the keeper is still running, and a datagram still crosses",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.shorter_timeout",
+        "a peer built with a shorter idle timeout than this machine's does not turn an ordinary quiet drop into a failure counted against the pair: the timeout is a redial and not a strike, and the pair comes back",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.unmeasured_silence",
+        "a machine that cannot measure a peer's silence does not conclude it: with a keep-alive but a liveness reader that cannot be heard from, `vanish_bound` answers `Vanish::Unmeasured` and no connection is closed or re-dialled however long the peer stays quiet, while a machine whose reader runs answers `Vanish::Measured` and states the fixed bound plus two keeper rounds",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.recheck_spread",
+        "the slow re-check is this machine's own and never longer than `RECOVERY_RECHECK`, so two machines that lost the same beacon do not come back at the same instant and the stated bound is still the bound: a used-up episode names a wait no longer than the bound, the same machine names the same wait every time, and two machines name different ones",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.fresh_wins",
+        "a connection that has stopped answering does not keep a working one out: a held connection that has shown no sign of life for the vanish bound loses the tie-break to a fresh one, which the pair keeps and which carries a datagram; the sign of life is sampled by the manager's own reader, so the rule holds for a pair nobody is watching and does not depend on how often anybody reads the connection",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.accept_burst",
+        "a burst of half-finished handshakes does not stop the machine accepting new ones: with several stalled handshakes in flight a properly paired peer still connects and carries a datagram",
+    ),
+    Capability::unproducible(
+        "library.peer.connect.outcomes_extensible",
+        "the outcome vocabulary the retry policy has to express — `ConnectFailure`, `NotTrustedCause`, `Recovery`, `StopCause`, `Registration` and `ManagerError` — is non-exhaustive, so a consumer compiled against an earlier version still builds when a variant is added and must match with a wildcard arm",
+        "a non-exhaustive enum is a compile-time property: the compiler refuses an exhaustive match in a downstream crate, so no case inside this workspace can observe it, and nothing here is a downstream crate",
+        "in a checkout of this crate, write `fn f(c: mahbot_peers::peer::ConnectFailure) { match c { mahbot_peers::peer::ConnectFailure::Nowhere { .. } => {} } }` in a separate crate that depends on it: the build fails with `non-exhaustive patterns`, which is the property; then add `_ => {}` and it builds",
     ),
     Capability::witnessed(
         "library.peer.connect.four_failures",
@@ -959,6 +1085,10 @@ const CAPABILITIES: &[Capability] = &[
     Capability::witnessed(
         "library.peer.connect.unwatchable_transport",
         "a transport whose idle timeout is not longer than the keeper's settle window is refused when the manager is built, with a typed error naming the timeout, so a caller cannot turn an ordinary silent drop into a strike by configuring this machine's transport; a keep-alive that is not shorter than its idle timeout — one that could never fire — is refused the same way, naming both; one second above the window with a keep-alive just below the timeout builds a manager",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.slow_keep_alive_raises_the_bound",
+        "a keep-alive slower than half of `VANISH_BOUND` is accepted and raises this machine's own liveness bound to twice the keep-alive, which `vanish_bound()` states, so a live quiet peer is never declared gone between two pings; with such a transport a keeper runs over a pair that carries nothing for longer than the fixed bound, the connection stays the one the pair holds, and the state reads connected",
     ),
     Capability::witnessed(
         "library.peer.connect.one_per_pair",
@@ -994,15 +1124,27 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.peer.connect.keeper_failed",
-        "a keeper whose attempt fails while the pair holds no connection stops at once with the failure itself — a peer the beacon does not know, after the remembered address timed out — and the words it reports say it stopped trying and repeat that failure, not that dials carried nothing",
+        "a keeper whose dial fails while the pair holds no connection does not stop: the failure keeps its own name in the pair's state — a peer the beacon does not know, after the remembered address timed out — the pause before each next dial is the gap that dial earned, read as the distance from the end of one dial to the start of the next, and the episode is used up at the stated cap, where the pair reads `Exhausted` with that cap's dial count; one re-check adds at most one dial and never restarts the episode",
     ),
     Capability::witnessed(
         "library.peer.connect.keeper_bound",
-        "a peer that accepts a fresh connection and closes it at once does not turn the keeper into a handshake loop: after the stated number of dials in a row that produced a connection which carried nothing and ended inside the settle window, it stops with an unstable pair naming what ended the last connection, and the words it reports say it stopped after dials carried nothing, distinct from the four failures",
+        "a peer that accepts a fresh connection and closes it at once does not turn the keeper into a handshake loop and does not end the pair either: after the stated number of dials that produced a connection which carried nothing and ended inside the settle window, the episode is used up, the pair waits a stated re-check, the keeper is still running, and when the peer stops closing the pair comes back with nobody acting",
     ),
     Capability::witnessed(
         "library.peer.connect.keeper_settle",
-        "the keeper's strikes are cleared by a connection the peer keeps past the settle window: two closes, a settled connection and two more closes leave the keeper running with a live connection, where a counter that never reset would have stopped it",
+        "a connection the pair used restarts the episode, so ordinary churn never adds up to the slow state: six closes across two settled connections are re-dialled inside the settle window and the pair never reads an episode used up",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.cancelled_dial",
+        "a dial whose task is dropped mid-handshake gives the pair its next dial back instead of leaving it marked as dialling: the state is one a dial is due from, and that holds even after the pair has already had and lost a connection the keeper judged, and whether the task dropped was a caller's dial or a keeper's; a pair left with no keeper reads unwatched, and one started again dials it",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.inbound_keeps_the_episode",
+        "an authenticated inbound connection from the peer does not restart a used-up episode: it takes the next dial number and the count stays at the cap, so a peer that accepts and drops and also dials in cannot escape the bound; and a one-shot `Connections::connect` on a pair no keeper runs for promises nothing — once its connection is gone the pair reads `Unwatched` when no dial had run before it, and `watched` says no keeper will make the next one",
+    ),
+    Capability::witnessed(
+        "library.peer.connect.one_episode_per_pair",
+        "a second keeper started for a pair one already watches does not hand it a second episode, whether it starts between dials or while one is in flight: the dial count stays where the running keeper left it — the dial that was running finishes as that episode's dial and not as the first of a new run — so a peer that keeps dropping a connection cannot be given a fresh run of dials by starting another keeper, and the pair keeps reading watched while either keeper lives",
     ),
     Capability::witnessed(
         "library.peer.connect.keeper_supersession",
@@ -1010,13 +1152,13 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::unproducible(
         "library.peer.connect.keeper_strike_cleared",
-        "a third strike booked while the accept lane adopts the connection the peer kept does not stop a connected pair: after booking the strike, and before it gives up, the keeper asks whether the pair is connected and clears the count",
-        "the rig cannot book the third strike before the adoption: its accept lane and the keeper share one simulated clock, and the keeper does not yield between booking a strike and asking again, so an adoption cannot be made to land in that gap",
-        "a case would need a hook that parks the keeper between the strike and the final liveness question, or a real network where an accept lands in that instant",
+        "a connection that dies carrying nothing is counted against the peer even when another dialer has connected by then, so a peer that accepts and drops cannot escape the bound by racing a second dial; a dial that fails outright while the pair is connected is not counted, because a pair that is connected has nothing to recover from",
+        "the rig cannot land the second adoption between the death of one connection and the keeper's judgement of it: its accept loop and the keeper share one simulated clock, and the keeper judges the connection in the same poll that sees it closed",
+        "on two machines on a real network, pair them and make the peer accept a connection and drop it inside the settle window while a second dial from this machine is in flight — a peer script that closes every accepted connection at once does it, and so does a breakpoint in `Connections::adopt` held between the close and the keeper's judgement; the pair's recovery then counts the dropped connection as a dial that carried nothing even though the second dial connected, which `Connections::recovery` shows as the dial count growing after a connection was kept",
     ),
     Capability::witnessed(
         "library.peer.connect.transient_adoption",
-        "a dial that fails while the accept lane has connected to the same peer does not stop the keeper: it asks whether the pair is connected before it reports the dial failure, and the pair it took carries a datagram",
+        "a dial that fails while an inbound connection has already been accepted does not stop the keeper: it asks whether the pair is connected before it reports the dial failure, and the pair it took carries a datagram",
     ),
     Capability::witnessed(
         "library.peer.connect.keeper_link_failure",
@@ -1024,7 +1166,7 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.peer.connect.keeper_carried",
-        "a connection that carried a datagram and then died inside the settle window is a link failure, not a strike: a peer that sends one datagram and closes each connection more times than the unstable limit leaves the keeper running",
+        "a connection that carried a datagram and then died inside the settle window is a link failure, not a strike: a peer that sends one datagram and closes each connection more times than the episode's cap of dials leaves the keeper running",
     ),
     Capability::witnessed(
         "library.peer.connect.keeper_after_restart",
@@ -1198,7 +1340,7 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.peer.connect.binding_not_traffic",
-        "a connection that only exchanged its binding carried nothing: the keeper counts it as a dial that carried nothing and stops as unstable instead of re-dialling, and the exchange left the claim it sent",
+        "a connection that only exchanged its binding carried nothing: the keeper counts it as a dial that carried nothing, so a peer that keeps doing it uses the episode up instead of the pair being re-dialled in a loop, and the exchange left the claim it sent",
     ),
     Capability::witnessed(
         "library.peer.connect.withdrawn_stops",
@@ -1379,8 +1521,20 @@ const CAPABILITIES: &[Capability] = &[
         "the beacon carries no message",
     ),
     Capability::witnessed(
+        "library.peer.messages.queued_causes_dial",
+        "a message waiting to be delivered causes a dial with no keeper and no caller dialling, and the ask keeps the episode rather than starting a fresh one: the queue's poll does not become a dial per second, the gaps between the dials it causes do not shrink and grow as the failures accumulate, and a peer that keeps dropping a connection while the message waits is still bounded by the episode's cap",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.queued_capped_by_the_episode",
+        "a message standing in the queue does not let a peer that accepts every connection and drops it escape the episode's bound: with the queue the only thing dialling, the peer's accept-and-drop costs it the episode's stated dials and no more, and the peer really took each of them",
+    ),
+    Capability::witnessed(
+        "library.peer.messages.already_taken_is_traffic",
+        "an `already taken` answer counts as the pair having carried traffic: by the peer's own account the message reached it, so the connection that carried that answer is a used connection and not a dial that carried nothing",
+    ),
+    Capability::witnessed(
         "library.peer.messages.offering_is_not_traffic",
-        "offering a message does not count as the pair's traffic for the keeper, while a message the peer took does",
+        "offering a message does not count as the pair's traffic for the keeper, so a connection closed with an offer still unanswered is one dial of the pair's recovery — counted, with the connection that carried nothing as its cause — and not a pair that was used",
     ),
     Capability::witnessed(
         "library.peer.messages.body_cannot_reach_a_capability",
@@ -1501,6 +1655,10 @@ const CAPABILITIES: &[Capability] = &[
         "one request has one total ACTION_BUDGET: a dial that spends its connect bound leaves the answer only the rest, so the request resolves at the budget's end rather than after another full one",
     ),
     Capability::witnessed(
+        "library.peer.actions.connect_failure",
+        "an action a person asks for against a peer that is not there is answered with the pair's own failure — `Connect` naming the peer and what the dial met — rather than a bare `unprepared`, and the ask makes one dial rather than a dial a second, so the wait is the retry policy's pace",
+    ),
+    Capability::witnessed(
         "library.peer.actions.audit_cap_stops",
         "a log at its own file cap — not merely past the room kept for a person — also stops the peer from acting, answers `not recorded`, and leaves the service up",
     ),
@@ -1590,7 +1748,7 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.peer.actions.offering_is_not_traffic",
-        "an action in flight does not count as the pair's traffic for the keeper",
+        "an action in flight does not count as the pair's traffic for the keeper, so a connection closed with the request still unanswered is one dial of the pair's recovery — counted, with the connection that carried nothing as its cause — and not a pair that was used",
     ),
     Capability::witnessed(
         "library.peer.actions.answered_is_traffic",
@@ -1710,7 +1868,7 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "harness.connect.dead_link_times_out",
-        "a connection attempt over a link that drops everything ends at a deterministic virtual instant instead of hanging",
+        "a dial over a link that drops everything ends at a deterministic virtual instant instead of hanging",
     ),
     Capability::witnessed(
         "harness.clock.drives_transport_timers",
@@ -1768,15 +1926,15 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "harness.connect.retry_after_abandoned",
-        "an attempt abandoned mid-handshake leaves nothing behind: the next attempt on the same pair refuses the aborted connection and completes",
+        "a dial abandoned mid-handshake leaves nothing behind: the next dial on the same pair refuses the aborted connection and completes",
     ),
     Capability::witnessed(
         "harness.connect.retry_after_timeout",
-        "an attempt that timed out can be retried on the same pair at once: the retry is a working connection, and the server keeps at most one filed connection per dialer",
+        "a dial that timed out can be retried on the same pair at once: the retry is a working connection, and the server keeps at most one filed connection per dialer",
     ),
     Capability::witnessed(
         "harness.connect.custom_endpoint",
-        "an endpoint the caller built serves one attempt: a closed endpoint is reported as closed instead of timing out",
+        "an endpoint the caller built serves one dial: a closed endpoint is reported as closed instead of timing out",
     ),
     Capability::witnessed(
         "harness.link.oversized_datagram_dropped",

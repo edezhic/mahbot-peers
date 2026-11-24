@@ -52,6 +52,10 @@ const ACTIONS_STORE: Store = Store {
     lock_path_for: Actions::lock_path_for,
 };
 
+/// Where the records directory is moved while a case hides it or links to it.
+#[cfg(unix)]
+const RECORDS_ELSEWHERE: &str = "peers-elsewhere";
+
 impl Root {
     pub(crate) fn create(id: RootId, parent: &Path) -> io::Result<Self> {
         let dir = tempfile::Builder::new()
@@ -153,6 +157,7 @@ impl Root {
     }
 
     /// The directory holding this root's records, as the record module spells it.
+    #[cfg(unix)]
     fn records_dir(&self) -> io::Result<PathBuf> {
         self.ensure_alive()?;
         Ok(RecordStore::dir_in(self.dir.path()))
@@ -177,9 +182,41 @@ impl Root {
     #[cfg(unix)]
     pub(crate) fn replace_records_dir_with_a_link(&self) -> io::Result<()> {
         let dir = self.records_dir()?;
-        let elsewhere = dir.with_file_name("peers-elsewhere");
+        let elsewhere = dir.with_file_name(RECORDS_ELSEWHERE);
         fs::rename(&dir, &elsewhere)?;
         std::os::unix::fs::symlink(&elsewhere, &dir)
+    }
+
+    /// Replace the records directory with a regular file of the same name, so every record
+    /// read under this root fails the way an operating-system fault does — the bytes are not
+    /// seen at all. A unix host answers that read as an I/O fault; whether a Windows host does
+    /// the same is unverified, which is why the cases built on it are unix-only.
+    #[cfg(unix)]
+    pub(crate) fn hide_records_dir(&self) -> io::Result<Hidden<'_>> {
+        let dir = self.records_dir()?;
+        fs::rename(&dir, dir.with_file_name(RECORDS_ELSEWHERE))?;
+        // The guard exists before the file does, so a write that fails puts the directory back
+        // instead of leaving the root without one.
+        let guard = Hidden {
+            root: self,
+            restored: false,
+        };
+        fs::write(&dir, b"")?;
+        Ok(guard)
+    }
+
+    /// Put the records directory back, with the records it held. [`Hidden`]'s operation.
+    #[cfg(unix)]
+    fn restore_records_dir(&self) -> io::Result<()> {
+        let dir = self.records_dir()?;
+        // A write that failed left no placeholder to remove; the rename is what puts the
+        // records back, so a missing file is not a reason to leave them elsewhere.
+        match fs::remove_file(&dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        fs::rename(dir.with_file_name(RECORDS_ELSEWHERE), &dir)
     }
 
     /// The name `peer`'s record has under this root, as the record module spells it, so
@@ -536,6 +573,33 @@ impl Root {
             ));
         }
         Ok(self.dir.path().join(relative))
+    }
+}
+
+/// The records directory put back when this value is dropped, so a case that ends on an error
+/// return does not leave it hidden.
+#[cfg(unix)]
+#[must_use = "dropping the guard puts the directory back at once"]
+pub(crate) struct Hidden<'a> {
+    root: &'a Root,
+    restored: bool,
+}
+
+#[cfg(unix)]
+impl Hidden<'_> {
+    /// Put the records directory back now.
+    pub(crate) fn restore(mut self) -> io::Result<()> {
+        self.restored = true;
+        self.root.restore_records_dir()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Hidden<'_> {
+    fn drop(&mut self) {
+        if !self.restored {
+            let _ = self.root.restore_records_dir();
+        }
     }
 }
 

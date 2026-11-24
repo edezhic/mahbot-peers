@@ -8,7 +8,10 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use mahbot_peers::identity::PeerId;
-use mahbot_peers::peer::{Account, Binding, Floor, Instance, Keeper, Label, Pair};
+use mahbot_peers::peer::{
+    Account, Binding, ConnectFailure, Connections, Floor, Instance, Label, Pair, Presence,
+    Recovery, StopCause,
+};
 use mahbot_peers::tls::PeerPolicy;
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::udp::RecvMeta;
@@ -47,6 +50,76 @@ pub(super) fn holds_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         && haystack
             .windows(needle.len())
             .any(|window| window == needle)
+}
+
+/// Run a machine's presence and wait until the beacon holds its registration.
+///
+/// A running machine keeps itself findable; a case that needs it registered before the
+/// next step asks here rather than guessing how many scheduler turns a handshake and a
+/// registration take.
+pub(super) async fn keep_findable(
+    sim: &Sim,
+    beacon: &TestBeacon,
+    machine: &Machine,
+) -> Result<tokio::task::JoinHandle<()>, String> {
+    let presence = Presence::new(beacon.client(machine)?);
+    let task = tokio::spawn(async move { presence.run().await });
+    let registry = beacon.registry();
+    let peer = machine.peer_id();
+    within(sim, Duration::from_secs(120), async {
+        loop {
+            let held = registry
+                .lock()
+                .expect("the beacon registry is not poisoned")
+                .snapshot()
+                .iter()
+                .any(|(id, _)| *id == peer);
+            if held {
+                return Ok::<(), String>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await??;
+    Ok(task)
+}
+
+/// Await the moment the pair's recovery counts one dial that met the connection which
+/// carried nothing, and answer how many dials the episode had made.
+///
+/// The state shows it for the length of the gap that follows, so a case that samples once a
+/// poll finds it; an episode that is used up at once is the same answer.
+pub(super) async fn counted_dial(
+    sim: &Sim,
+    connections: &Connections,
+    peer: &PeerId,
+) -> Result<u32, String> {
+    let mut spent = Duration::ZERO;
+    loop {
+        match connections.recovery(peer) {
+            // Only a failed dial writes a network failure, and it always counts the dial, so
+            // this pattern cannot match an episode that has dialled nothing.
+            Recovery::Waiting {
+                dial,
+                last: Some(ConnectFailure::NoDirectPath { .. }),
+                ..
+            } => return Ok(dial),
+            Recovery::Exhausted { dials, .. } => return Ok(dials),
+            _ => {}
+        }
+        if spent >= Duration::from_secs(120) {
+            return Err(format!(
+                "the pair never counted a dial that met a connection which carried nothing: \
+                 it reads `{}` after {spent:?}",
+                connections.recovery(peer)
+            ));
+        }
+        // The state shows the counted dial for the length of the gap that follows, so a
+        // step of a tenth of the first gap finds it without spending the case's poll budget.
+        sim.clock().advance(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        spent += Duration::from_millis(100);
+    }
 }
 
 /// The one service a case started, and how it ended, within `budget` of virtual time.
@@ -93,7 +166,10 @@ pub(super) fn pair(peer: &Machine, assistant: &Label) -> Pair {
 }
 
 /// Run the manager's keeper for `peer` on its own task, as a product does.
-pub(super) fn spawn_keeper(managed: &Managed, peer: &Machine) -> tokio::task::JoinHandle<Keeper> {
+pub(super) fn spawn_keeper(
+    managed: &Managed,
+    peer: &Machine,
+) -> tokio::task::JoinHandle<StopCause> {
     let connections = Arc::clone(&managed.connections);
     let endpoint = managed.endpoint.clone();
     let peer = peer.fingerprint();
@@ -102,7 +178,7 @@ pub(super) fn spawn_keeper(managed: &Managed, peer: &Machine) -> tokio::task::Jo
 
 /// The pieces one connected case needs, all live.
 ///
-/// The manager owns the endpoint and the accept lanes, so it lives as long as the case
+/// The manager owns the endpoint and the accept loop, so it lives as long as the case
 /// does; the message layers are the machines' own, and the keeper is the dialling
 /// side's, spawned once. The layers' services are the case's to start: a case that has
 /// to change a right or queue something first does it before the service runs.
@@ -113,7 +189,7 @@ pub(super) struct Ready {
     pub(super) laptop_managed: Managed,
     pub(super) main_messages: Messaging,
     pub(super) laptop_messages: Messaging,
-    pub(super) keeper: tokio::task::JoinHandle<Keeper>,
+    pub(super) keeper: tokio::task::JoinHandle<StopCause>,
 }
 
 /// Two paired machines, connected, with a message layer on each and nothing bound.

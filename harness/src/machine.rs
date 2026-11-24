@@ -24,6 +24,8 @@ use mahbot_peers::peer::{
 
 use crate::connect::Unclaimed;
 use crate::link::{Link, LinkedSocket};
+#[cfg(unix)]
+use crate::root::Hidden;
 use crate::root::Root;
 
 /// The name of one machine's root, unique across every simulation in a process.
@@ -415,7 +417,7 @@ pub struct Storage<'a> {
     root: &'a Root,
 }
 
-impl Storage<'_> {
+impl<'a> Storage<'a> {
     /// Open the root named by `root`, if this capability is that root's.
     ///
     /// The check exists because a root id can arrive from outside the handle — a
@@ -584,6 +586,20 @@ impl Storage<'_> {
     #[cfg(unix)]
     pub fn replace_records_dir_with_a_link(&self) -> io::Result<()> {
         self.root.replace_records_dir_with_a_link()
+    }
+
+    /// Replace the records directory with a regular file of the same name, so every record
+    /// read through this root fails the way an operating-system fault does: the bytes are not
+    /// seen at all, rather than a file being refused.
+    ///
+    /// This is the harness's way to an operating-system fault, so a case never names a path.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's refusal.
+    #[cfg(unix)]
+    pub(crate) fn hide_records_dir(&self) -> io::Result<Hidden<'a>> {
+        self.root.hide_records_dir()
     }
 
     /// The name `peer`'s record has under this root, as the record module spells it: a

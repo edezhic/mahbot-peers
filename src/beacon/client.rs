@@ -78,6 +78,13 @@ impl Beacon {
         &self.runtime
     }
 
+    /// The machine the beacon knows, for a caller that has to derive something of its own from
+    /// it.
+    #[must_use]
+    pub(crate) fn me(&self) -> PeerId {
+        self.me.peer_id()
+    }
+
     /// Open a session, pinning the beacon's key.
     ///
     /// # Errors

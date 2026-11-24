@@ -1,22 +1,22 @@
 //! The per-machine connection manager: dialling, accepting, one connection per
 //! pair, and the four failures.
 //!
-//! # Reconnecting
+//! # Recovery
 //!
-//! A machine dials the address authenticated data last arrived from, then asks the
-//! beacon once, then stops. There is no periodic re-check and no timer that starts
-//! an attempt: the next attempt happens only on a lost connection, on this machine's
-//! own start, when a person asks, or when a fresh address for that peer arrives in an
-//! introduction — that last one is handed to [`Connections::connect_with`], which
-//! tries it first. A peer that comes back online dials out itself, which is what
-//! re-establishes the pair; the side that stayed up does not poll for it.
+//! A pair that has been acquainted recovers by itself: [`Connections::keep_connected`] is run
+//! once per paired peer and never returns while the pair is trusted and there is somewhere to
+//! dial. The policy it follows — episodes, growing gaps, the slow re-check, which reasons start
+//! a new episode and which only make the next dial due — is
+//! [`crate::peer::recovery`]'s module note, which is the one place that contract is stated; this
+//! note does not restate it. The state is readable at any time through
+//! [`Connections::recovery`]: dialling, waiting until a stated moment, or stopped and why, and
+//! [`Connections::watched`] says whether a keeper will act on it.
 //!
-//! Recovery is the manager's: [`Connections::keep_connected`] watches the pair's
-//! live connection and dials again when it is gone, so a caller runs one per paired
-//! peer and does not dial itself. A connection that carried anything and then died
-//! is a link failure and is re-dialled without a bound; only dials that carried
-//! nothing are counted. When the keeper stops instead of dialling, it says which way
-//! it stopped: [`Keeper`], and what counts is stated on
+//! A bounded, visible, paced retry is not the silent loop the design rules out. What it rules
+//! out is a loop nobody can see and nothing bounds; this one is bounded by the episode, paced
+//! by the gap, and readable while it runs. A connection that carried anything and then died is
+//! a link failure, and the dial that follows it is due at once: recovery, not a loop. Only
+//! dials that carried nothing are paced by the gap. What counts is stated on
 //! [`Connections::keep_connected`].
 //!
 //! # The connection level travels with the connection
@@ -44,16 +44,17 @@
 //! third. A withdrawal written through any of them, or by the other process the
 //! self-update window keeps on this root, is therefore seen before the next dial,
 //! before the next handshake and — within one keeper round — while a connection is up,
-//! and the manager closes it. The round is [`TRUST_POLL`] while a connection is
-//! watched and [`KEEPER_SETTLE`] while a fresh dial is still being judged, so the bound
-//! is the larger of the two. Nothing here depends on the caller reloading, and nothing
-//! depends on the manager and the rights layer sharing a handle.
+//! and the manager closes it. The round is at most [`TRUST_POLL`] — the settle window
+//! only cuts it shorter — so that is the bound while a connection is up. Nothing here
+//! depends on the caller reloading, and nothing depends on the manager and the rights
+//! layer sharing a handle.
 //!
-//! The price is one small read per round per peer: a record is at most
-//! [`crate::peer::record::MAX_RECORD_BYTES`], usually under a kilobyte, and a keeper
-//! round is seconds apart.
+//! The price is one small read per reach: a round that only watches a connection costs one, and
+//! a round that dials one more when the dial is weighed. A record is at most
+//! [`crate::peer::record::MAX_RECORD_BYTES`], usually under a kilobyte, and a keeper round is
+//! seconds apart.
 //!
-//! # A quiet pair
+//! # A quiet pair, and how long a vanished peer goes unnoticed
 //!
 //! A keep-alive on either machine holds a silent pair: QUIC's idle timeout is the
 //! smaller of the two machines' and a ping resets it on both, so
@@ -62,15 +63,30 @@
 //! connection closes at the idle timeout and [`Connections::keep_connected`] dials it
 //! again — recovery, not a failure of the pair.
 //!
-//! The keeper judges a fresh connection by its own window, [`KEEPER_SETTLE`], not by
-//! the transport's idle timeout. A connection the keeper dialled that ends inside
-//! that window having carried nothing is a strike against the peer, and
-//! [`KEEPER_UNSTABLE_LIMIT`] of those in a row stop the keeper, so a transport whose
-//! idle timeout is not longer than the window would turn each ordinary silent drop
-//! into a strike and a run of them into a stop. That is why [`Connections::new`]
-//! refuses one. The check reads this machine's transport only: over the wire the
-//! effective timeout is the smaller of the two machines', so a peer built with a
-//! shorter one can still close a quiet connection inside this machine's window.
+//! How long a vanished peer goes unnoticed is stated, and it is this machine's own
+//! bound rather than an accident of the two machines' settings: with a keep-alive,
+//! [`Connections::vanish_bound`] answers [`Vanish::Measured`] — this machine's liveness
+//! bound, [`VANISH_BOUND`], or twice the keep-alive when that is longer, plus the two keeper
+//! rounds that cover the manager's own liveness poll (`LIVENESS_POLL`) and the round that
+//! acts on the silence — because this machine's own pings make a live peer answer and one
+//! that has not answered for the bound is gone; without a keep-alive, or while the reader
+//! cannot be heard from, it answers [`Vanish::Unmeasured`], whose bound is the transport's
+//! idle timeout plus one keeper round — the two machines' negotiated timeout, which this
+//! machine cannot tighten alone. The reading is a [`Vanish`] and not a bare duration so a
+//! product can tell a bound that is kept from one that is not measured. Either way the loss is
+//! the pair's recovery and not a failure counted against the peer: a connection that ends
+//! because it timed out is a peer that went quiet, which is exactly what a NAT mapping expiring
+//! or a laptop closing looks like, so it is re-dialled at once and never becomes a strike. That
+//! is what keeps a peer built with a shorter idle timeout than this machine's from turning an
+//! ordinary quiet drop into a refusal.
+//!
+//! The keeper still judges a fresh connection by its own window, [`KEEPER_SETTLE`]: a
+//! connection the keeper dialled that ends inside that window having carried nothing,
+//! and for any reason other than a timeout, is a strike against the peer. A transport
+//! whose idle timeout is not longer than the window would turn each ordinary silent
+//! drop into one, which is why [`Connections::new`] refuses it. The check reads this
+//! machine's transport only; the timeout rule above is what makes a shorter one on the
+//! peer harmless.
 //!
 //! # One connection per pair
 //!
@@ -83,56 +99,96 @@
 //! the one whose TLS exporter is smaller is kept, a value both sides compute
 //! identically.
 //!
-//! Liveness is read only to drop a connection that has already closed: it can
-//! carry nothing, so it is not a candidate. The choice between two live
-//! connections reads only the facts both sides share; when one side has observed a
-//! close the other has not, the two may briefly name different connections, and
-//! each closes the loser — the next dial re-establishes the pair.
+//! Liveness is read only to drop a connection that has already closed, and to keep a
+//! connection that has stopped answering from outranking one that works: a connection
+//! that has shown no sign of life for this machine's liveness bound — [`VANISH_BOUND`],
+//! or twice the keep-alive when that is slower — is not a candidate beside a fresh one,
+//! whatever the rule would otherwise say.
+//!
+//! That rule is about the peer going quiet, not about this machine's reading cadence, so
+//! the manager samples the sign of life itself instead of letting whoever asks date the
+//! peer's last datagram to the look: a reading taken only when a keeper or a caller looked
+//! would call a connection that has been silent for longer than the bound fresh. One reader
+//! of its own runs once a `LIVENESS_POLL` for the manager's whole life, and the manager keeps
+//! the moment of its last pass. Finding it out costs no traffic of the crate's own — the
+//! reader looks at the datagrams the peer has already sent, and a peer this machine is
+//! pinging answers — so the test cannot reset the accounting it is judged by. A reader that
+//! cannot be heard from — one that never started, or whose last pass is more than two polls
+//! ago — has measured nothing, and [`Connections::vanish_bound`] says so: the reading is
+//! [`Vanish::Unmeasured`], not merely a bound the code declines to apply. This paragraph is
+//! the one place the rule and its sampling are stated; `LIVENESS_POLL`, `Reader` and
+//! `Connections::start_liveness` give the period and the mechanics.
+//!
+//! The choice between two live connections reads only the facts both sides share; when one
+//! side has observed a close the other has not, the two may briefly name different
+//! connections, and each closes the loser — the next dial re-establishes the pair.
 //!
 //! A collision needs no second recovery path. Both machines run the manager: when
 //! the connection one side kept then dies, the machine whose dial lost re-dials, and
 //! the machine that kept it dials again because its connection is gone. Whichever
-//! dial wins, both keepers adopt the connection the rule keeps. A machine running the
-//! peer layer without a keeper is not a configuration this product has.
+//! dial wins, both keepers adopt the connection the rule keeps. A machine that runs the
+//! peer layer without a keeper dials only when a caller asks and nothing retries for it;
+//! [`Connections::recovery`] says so by answering [`Recovery::Unwatched`] for a pair
+//! nothing has dialled.
 //!
 //! # Accepting
 //!
 //! [`Connections::serve`] is the accept loop, and the caller runs it: the crate has
 //! no runtime of its own to spawn on, so the caller keeps the handle and decides
-//! when the loop stops. Run [`ACCEPT_LANES`] copies of it, so one peer that opens a
-//! connection and stalls cannot block every other peer for the whole connect
-//! budget. Accepting records the peer's authenticated source address — one small
-//! blocking file read, and a write only when the address changed — on the task that
-//! accepted it: this crate has no blocking pool to hand it to, and a product that
-//! must keep its reactor free runs the accept loop on a task it can block.
+//! when the loop stops. The loop does not wait for a handshake: it hands each incoming
+//! connection to a task of its own, so a burst of peers that open a connection and
+//! stall costs at most [`ACCEPT_IN_FLIGHT`] handshakes at once. When that many are in
+//! flight the loop stops pulling from the endpoint and looks again after one round of
+//! [`TRUST_POLL`], so a flood costs this machine a bounded number of tasks; the cost is
+//! that a full machine's next accept waits up to that round, never the length of a
+//! handshake. Accepting records the peer's authenticated source
+//! address — one small blocking file read, and a write only when the address changed —
+//! on the task that took the connection, not on the loop: this crate has no blocking
+//! pool to hand it to, and that task is the one place a blocking read costs nothing else.
 //!
 //! # The four failures
 //!
 //! The beacon cannot be reached; the beacon does not know the peer; the peer's
 //! address is known and no connection can be made; the peer is not trusted. Each
-//! is reported as itself, none as another, and none turns into a retry loop. "Not
-//! trusted" is decided here and only here: the far side's refusal text is
-//! diagnostic and may be forged, so it never drives trust or a retry.
+//! is reported as itself and none as another, and "not trusted" is decided here and
+//! only here: its refusal text is diagnostic and may be forged, so it drives neither
+//! trust nor a retry. One more answer, [`ConnectFailure::Nowhere`], is not a failure of
+//! the network at all, and [`ConnectFailure::Deferred`] is not a failure of the peer: it
+//! says this machine could not read the record just now. Which of them is retried and which
+//! never is [`crate::peer::recovery`]'s note, which is the one place that contract is stated.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use quinn::{Connection, ConnectionError, Endpoint, Incoming, Runtime};
 use rustls::pki_types::CertificateDer;
 
-use crate::beacon::{Beacon, timeout};
+use crate::beacon::{BEACON_REQUEST_TIMEOUT, Beacon, sleep, timeout};
 use crate::identity::{Fingerprint, Identity, PeerId};
 use crate::net::{SERVER_NAME, Transport};
 use crate::peer::binding;
-use crate::peer::record::RecordStore;
+use crate::peer::record::{PeerRecord, RecordError, RecordStore, Untrusted};
+use crate::peer::recovery::{ConnectFailure, NotTrustedCause, Recovery, StopCause, recheck};
 
 /// How long one dial or one handshake may take before it is reported as no path.
 const DEFAULT_CONNECT_BUDGET: Duration = Duration::from_secs(10);
+
+/// The longest one dial can take before it answers: the two addresses it may try first — the
+/// caller's hint and the one the record remembers — the beacon's own two exchanges, and the
+/// address the beacon names.
+///
+/// [`crate::peer::actions::ACTION_BUDGET`] holds this much back for the dial its record read waits
+/// for, so a dial a slow read delayed can still run to its own end. Public as one of the stated
+/// numbers a caller plans against: it is the part of an action's budget the read cannot touch, so
+/// a dial an action asked for may start as late as the budget less this much.
+pub const DIAL_BUDGET: Duration = Duration::from_secs(
+    (3 * DEFAULT_CONNECT_BUDGET.as_secs()) + (2 * BEACON_REQUEST_TIMEOUT.as_secs()),
+);
 
 /// How long a connection must stay up before the keeper counts it as one the peer
 /// keeps.
@@ -145,14 +201,35 @@ const DEFAULT_CONNECT_BUDGET: Duration = Duration::from_secs(10);
 /// [`Connections::keep_connected`] states what the window decides.
 pub const KEEPER_SETTLE: Duration = Duration::from_secs(10);
 
-/// How many dials in a row may produce a connection that ends before the pair
-/// carried anything and inside [`KEEPER_SETTLE`], before the keeper stops.
+/// How long a connection may go without a sign of life from the peer before this
+/// machine treats it as gone.
 ///
-/// One is an ordinary loss; a run of them is a peer that accepts and drops, and
-/// re-dialling at handshake rate is the silent retry loop the design rules out. It
-/// is public because the test rig drives cases by that number, and because a caller
-/// deciding what to do after a [`Keeper::Unstable`] stop may want it.
-pub const KEEPER_UNSTABLE_LIMIT: u8 = 3;
+/// A sign of life is a datagram the peer has sent on the connection: with a keep-alive
+/// this machine's own pings make a live peer answer, so a peer that has not answered for
+/// this long is gone, whatever either machine advertised. It decides two things. A
+/// connection that has shown no sign of life for this long does not outrank a fresh one
+/// in the tie-break, so a connection that is merely not yet declared dead cannot keep a
+/// working one out. And the keeper closes such a connection instead of waiting for the
+/// transport's idle timeout, which is how [`Connections::vanish_bound`] can name a bound
+/// that is this machine's rather than the two machines' negotiated one.
+///
+/// This is the floor, not the rule: a live quiet peer must not be declared gone between
+/// two pings, so a keep-alive slower than half of this raises the bound to twice the
+/// keep-alive — [`Connections::vanish_bound`] answers the one that applies. The default
+/// keep-alive is ten seconds, which is exactly half, so the default bound is this one. It
+/// is only applied when this machine has a keep-alive at all; without one nothing this
+/// machine sends would make a silent peer answer, and the bound is the transport's idle
+/// timeout instead.
+pub const VANISH_BOUND: Duration = Duration::from_secs(20);
+
+/// How many incoming connections may be in a handshake at once.
+///
+/// [`Connections::serve`] hands each incoming connection to a task of its own, so a
+/// stalled handshake never blocks the next accept. This is the cap on how many of those
+/// tasks may exist: a public address that is flooded with half-finished handshakes costs
+/// at most this many, and the accept loop stops pulling from the endpoint until one
+/// finishes.
+pub const ACCEPT_IN_FLIGHT: usize = 64;
 
 /// How often a keeper re-reads the pair's trust while a connection is up.
 ///
@@ -161,17 +238,19 @@ pub const KEEPER_UNSTABLE_LIMIT: u8 = 3;
 /// round asks the record again. Five seconds is short enough that a withdrawn machine
 /// stops being reachable promptly and long enough that a quiet pair costs one small
 /// file read per peer per round. It is public because a caller deciding how soon a
-/// withdrawal must take effect needs the bound — the larger of this and
-/// [`KEEPER_SETTLE`], which is the round while a fresh dial is still being judged.
+/// withdrawal must take effect needs the bound, and this is it: a round that watches a
+/// connection is at most this long, because [`KEEPER_SETTLE`] only cuts it shorter. A
+/// round that dials is the dial's own budget instead — nothing is up to withdraw.
 pub const TRUST_POLL: Duration = Duration::from_secs(5);
 
-/// How many accept loops a machine should run at once.
+/// How often the manager's own reader samples whether each live connection's peer is still
+/// answering.
 ///
-/// One loop awaiting a stalled peer's handshake would block every other peer for
-/// the whole connect budget on a public address; four lanes let three others make
-/// progress while one is stalled, without an unbounded task per incoming
-/// connection. The caller spawns them, because the crate has no runtime of its own.
-pub const ACCEPT_LANES: usize = 4;
+/// Shorter than a keeper round, which is what makes [`Connections::vanish_bound`]'s two rounds
+/// cover it. The rule the reader serves is stated once in the module's note on liveness. Not
+/// public: a product cannot act on a sampling period, and `vanish_bound` states the total it
+/// needs.
+const LIVENESS_POLL: Duration = Duration::from_secs(1);
 
 /// The TLS exporter label the same-starter tie-break reads. Both sides of one
 /// connection derive the same bytes under it.
@@ -207,6 +286,9 @@ struct Live {
 #[derive(Debug)]
 struct Watch {
     carried_from: Frames,
+    /// When the manager adopted this connection: the moment [`KEEPER_SETTLE`] is measured
+    /// from.
+    adopted: Instant,
     /// The frames the exchange wrote, once it has finished; `None` while it is still
     /// in flight.
     exchanged: Mutex<Option<Frames>>,
@@ -216,18 +298,70 @@ struct Watch {
     quiet: Mutex<Option<Frames>>,
     /// How many offer or action rounds are in flight now.
     rounds: AtomicU32,
+    /// The last sign of life the peer gave, sampled by the manager's own reader.
+    life: Mutex<Life>,
+    /// Whether the keeper has folded this connection's death into the pair's recovery. A
+    /// connection is judged once, so its loss cannot be counted twice.
+    judged: AtomicBool,
+}
+
+/// The manager's own liveness reader: whether it was started, and when it last looked.
+struct Reader {
+    started: bool,
+    pass: Option<Instant>,
+}
+
+/// The peer's last sign of life on one connection.
+///
+/// A datagram the peer has sent is the signal: keep-alives are answered, so a live peer
+/// answers this machine's pings, and a peer that has stopped answering sends nothing. Sampled
+/// by the manager's own reader, so the answer is the same whoever asks; the module's note on
+/// liveness says why it is sampled rather than read on demand.
+#[derive(Clone, Copy, Debug)]
+struct Life {
+    /// The datagrams the peer had sent when `at` was taken.
+    datagrams: u64,
+    /// When the peer was last seen to have sent one.
+    at: Instant,
+}
+
+impl Life {
+    /// Take a reading: a datagram the peer has sent since the last one moves `at` forward.
+    fn sample(&mut self, connection: &Connection, now: Instant) {
+        let sent = connection.stats().udp_rx.datagrams;
+        if sent > self.datagrams {
+            self.datagrams = sent;
+            self.at = now;
+        }
+    }
+
+    /// Whether the peer has shown a sign of life within `bound`.
+    ///
+    /// True when the manager's reader cannot be heard from — `heard` is false — because a
+    /// machine that cannot measure silence must not conclude silence: a reader that never ran
+    /// would otherwise make every healthy connection read as vanished once the bound passed,
+    /// and the pair would redial a working peer for ever, each loss counted as settled so the
+    /// episode cap never bounded it. The transport's own timeout still ends a connection that
+    /// is really gone.
+    fn shows_life(&self, now: Instant, bound: Duration, heard: bool) -> bool {
+        !heard || now.saturating_duration_since(self.at) < bound
+    }
 }
 
 impl Live {
     /// Adopt `connection`, taking the frame counters the keeper judges it from now.
-    fn new(connection: Connection, started_by: Started) -> Self {
+    fn new(connection: Connection, started_by: Started, now: Instant) -> Self {
+        let datagrams = connection.stats().udp_rx.datagrams;
         Self {
             watch: Arc::new(Watch {
                 carried_from: Frames::of(&connection),
+                adopted: now,
                 exchanged: Mutex::new(None),
                 taken: AtomicU64::new(0),
                 quiet: Mutex::new(None),
                 rounds: AtomicU32::new(0),
+                life: Mutex::new(Life { datagrams, at: now }),
+                judged: AtomicBool::new(false),
             }),
             connection,
             started_by,
@@ -414,18 +548,11 @@ impl Drop for Round<'_> {
     }
 }
 
-/// What one attempt to reach a peer produced, before it is folded into the four
-/// failures.
-enum Attempt {
+/// What one try in the module's order produced — the dials, and the beacon leg before
+/// them — before it is folded into the failures.
+enum Try {
     /// The pair's connection, ready to watch.
-    ///
-    /// `kept_this` says whether this attempt's own connection is the one kept; it is
-    /// false when that connection lost the tie-break to one the pair already held.
-    Kept {
-        connection: Connection,
-        kept_this: bool,
-        watch: Arc<Watch>,
-    },
+    Kept { connection: Connection },
     /// A handshake completed at `address`, but the tie-break dropped the connection
     /// and no other took its place: a dial that carried nothing, not a failed dial.
     /// [`Connections::connect_with`] answers with the pair's live connection when one
@@ -434,7 +561,7 @@ enum Attempt {
         address: SocketAddr,
         cause: &'static str,
     },
-    /// The attempt failed with one of the four failures.
+    /// The try failed with one of the four failures.
     Failed(ConnectFailure),
 }
 
@@ -445,13 +572,137 @@ fn open<'a>(pairs: &'a BTreeMap<PeerId, Live>, peer: &PeerId) -> Option<&'a Live
     live.connection.close_reason().is_none().then_some(live)
 }
 
+/// What one read of the pair's record answers; see [`Connections::standing`].
+// The record is carried whole so a caller that needs it does not read the file a second time.
+// The answer lives for the length of one call, and 320 bytes on a stack that has just read a
+// file is not a cost worth an allocation.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum RecordRead {
+    /// A person paired the two and nothing has taken it away. The record itself, so a caller
+    /// that needs it does not read the file a second time.
+    Trusted(PeerRecord),
+    /// The read failed in a way that may pass. Not a decision about the peer: the dial is
+    /// deferred, and this is the fault in the record's own words.
+    Deferred { detail: String },
+    /// A record a person must look at, in the read's own words: it never becomes trust, and
+    /// each layer answers it in its own vocabulary.
+    Unreadable(RecordError),
+    /// No record, or one this build must not trust.
+    Refused(NotTrustedCause),
+}
+
+impl RecordRead {
+    /// The failure this read answers a dial with, or `None` when it is trust.
+    fn refusal(&self, peer: Fingerprint) -> Option<ConnectFailure> {
+        match self {
+            Self::Trusted(_) => None,
+            Self::Deferred { detail } => Some(ConnectFailure::Deferred {
+                peer,
+                detail: detail.clone(),
+            }),
+            Self::Unreadable(error) => Some(ConnectFailure::NotTrusted {
+                peer,
+                cause: unreadable(error),
+            }),
+            Self::Refused(cause) => Some(ConnectFailure::NotTrusted {
+                peer,
+                cause: cause.clone(),
+            }),
+        }
+    }
+}
+
+/// The refusal a record this machine could not read is, in the read's own words.
+fn unreadable(error: &RecordError) -> NotTrustedCause {
+    NotTrustedCause::Unreadable {
+        detail: error.to_string(),
+    }
+}
+
+/// Wait `for_at_most`, and never longer than one keeper round.
+///
+/// A keeper looks again at least once a round whatever the policy's next moment is: an
+/// inbound connection, a withdrawal and a wake all arrive without a timer. The wait is the
+/// crate's one timer, and dropping the keeper ends it.
+async fn pause(connections: &Connections, for_at_most: Duration) {
+    sleep(&*connections.runtime, for_at_most.min(TRUST_POLL)).await;
+}
+
+/// How long this machine takes to notice that a peer has gone silent, and whether that bound is
+/// one it can measure.
+///
+/// Non-exhaustive: a new reading is a new answer, and a consumer compiled against an earlier
+/// version must still build.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Vanish {
+    /// The bound holds: this machine pings, and its own reader samples the peer's answers, so a
+    /// connection that has shown no sign of life for `bound` is closed and re-dialled.
+    Measured { bound: Duration },
+    /// Nothing here measures the peer's silence, so nothing is judged vanished and a connection
+    /// lives until the transport's own timeout ends it: `bound` is what that leaves. Either this
+    /// machine has no keep-alive — nothing it sends would make a silent peer answer — or its own
+    /// reader has not been heard from, and a machine that cannot measure silence must not
+    /// conclude it.
+    Unmeasured { bound: Duration },
+}
+
+impl Vanish {
+    /// The bound itself, whichever of the two it is.
+    #[must_use]
+    pub const fn bound(self) -> Duration {
+        match self {
+            Self::Measured { bound } | Self::Unmeasured { bound } => bound,
+        }
+    }
+
+    /// Whether this machine measures the peer's silence at all.
+    #[must_use]
+    pub const fn measured(self) -> bool {
+        matches!(self, Self::Measured { .. })
+    }
+}
+
+impl fmt::Display for Vanish {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Measured { bound } => write!(f, "a vanished peer is noticed within {bound:?}"),
+            Self::Unmeasured { bound } => write!(
+                f,
+                "a vanished peer is noticed within {bound:?}, by the transport's own timeout: \
+                 this machine does not measure the silence itself"
+            ),
+        }
+    }
+}
+
 /// The connection manager of one machine.
+///
+/// It runs three kinds of task on the injected runtime: one reader that samples whether each
+/// live connection's peer is still answering (the module's note on liveness states the rule),
+/// one binding exchange per connection it keeps, and one task per incoming connection it
+/// accepts. Everything else — the accept loop, a keeper, a presence loop — is a future the
+/// caller spawns and decides when to drop.
 pub struct Connections {
     me: PeerId,
     store: RecordStore,
     beacon: Option<Beacon>,
     runtime: Arc<dyn Runtime>,
-    pairs: Mutex<BTreeMap<PeerId, Live>>,
+    /// How this machine's transport bounds a silent connection; see
+    /// [`Self::vanish_bound`].
+    idle_timeout: Duration,
+    keep_alive: Option<Duration>,
+    /// The slow re-check this machine waits before dialling again, spread by its own key; see
+    /// [`recheck`].
+    recheck: Duration,
+    pairs: Arc<Mutex<BTreeMap<PeerId, Live>>>,
+    /// How each pair's recovery stands, and whether a dial is in flight for it.
+    retry: Mutex<BTreeMap<PeerId, Watched>>,
+    /// The manager's own liveness reader; see [`Self::start_liveness`] and
+    /// [`Self::reader_heard`].
+    reader: Arc<Mutex<Reader>>,
+    /// How many incoming connections are in a handshake now; see [`ACCEPT_IN_FLIGHT`].
+    in_flight: AtomicUsize,
 }
 
 impl fmt::Debug for Connections {
@@ -485,10 +736,12 @@ impl Connections {
     /// # Errors
     ///
     /// [`ManagerError::IdleTimeoutTooShort`] when `transport`'s idle timeout is not
-    /// longer than [`KEEPER_SETTLE`] — the module's *A quiet pair* note says why —
-    /// and [`ManagerError::KeepAliveNotBelowIdle`] when its keep-alive is not
-    /// shorter than its idle timeout, so it could never fire. Both read this
-    /// machine's transport only; each variant says what that leaves out.
+    /// longer than [`KEEPER_SETTLE`] — the module's *A quiet pair* note says why — and
+    /// [`ManagerError::KeepAliveNotBelowIdle`] when its keep-alive is not shorter than
+    /// its idle timeout, so it could never fire. Each check reads this machine's transport
+    /// only; each variant says what that leaves out. A keep-alive slower than half of
+    /// [`VANISH_BOUND`] is accepted and raises this machine's own liveness bound with it,
+    /// which is what [`Self::vanish_bound`] then states.
     pub fn new(
         me: &Identity,
         store: RecordStore,
@@ -514,8 +767,198 @@ impl Connections {
             store,
             beacon,
             runtime,
-            pairs: Mutex::new(BTreeMap::new()),
+            idle_timeout: transport.idle_timeout,
+            keep_alive: transport.keep_alive,
+            recheck: recheck(&me.peer_id()),
+            pairs: Arc::new(Mutex::new(BTreeMap::new())),
+            retry: Mutex::new(BTreeMap::new()),
+            reader: Arc::new(Mutex::new(Reader {
+                started: false,
+                pass: None,
+            })),
+            in_flight: AtomicUsize::new(0),
         })
+    }
+
+    /// How long this machine takes to notice that a peer has gone silent, and whether it can
+    /// measure that at all.
+    ///
+    /// A stated bound in this machine's own terms rather than the two machines' negotiated
+    /// idle timeout. With a keep-alive, this machine's own pings make a live peer answer, so a
+    /// peer that has not answered for the liveness bound is gone — that is [`VANISH_BOUND`], or
+    /// twice the keep-alive when that is longer, so a slower keep-alive never declares a live
+    /// quiet peer gone between two pings — and the keeper closes it and dials again. That
+    /// answer adds two keeper rounds: one for the liveness reader's own poll, which is shorter
+    /// than a round, and one for the round that acts on the silence. It holds whatever the peer
+    /// advertised.
+    ///
+    /// It is [`Vanish::Measured`] only while the manager's own reader can be heard from. A
+    /// reader that never started, or whose last pass is more than two polls ago, has measured
+    /// nothing, and nothing is then judged vanished: the connection lives until the transport's
+    /// own timeout ends it rather than every healthy connection being closed and re-dialled once
+    /// the bound passes. That is [`Vanish::Unmeasured`], the transport's idle timeout plus the
+    /// one keeper round it takes to see the close. Without a keep-alive it is unmeasured too:
+    /// nothing this machine sends would make a silent peer answer, and that one this machine
+    /// cannot tighten alone, because over the wire the effective timeout is the smaller of the
+    /// two machines'.
+    ///
+    /// Either way the loss is a redial and not a failure counted against the pair: a
+    /// connection that ended because it timed out is a peer that went quiet.
+    #[must_use]
+    pub fn vanish_bound(&self) -> Vanish {
+        match self.vanished_after() {
+            Some(bound) if self.reader_heard(self.runtime.now()) => Vanish::Measured {
+                bound: bound + 2 * TRUST_POLL,
+            },
+            _ => Vanish::Unmeasured {
+                bound: self.idle_timeout + TRUST_POLL,
+            },
+        }
+    }
+
+    /// Whether the manager's own reader has been heard from: its last pass is at most two polls
+    /// old. A reader that cannot be heard from has measured nothing.
+    fn reader_heard(&self, now: Instant) -> bool {
+        self.reader
+            .lock()
+            .expect("the reader state is not poisoned")
+            .pass
+            .is_some_and(|pass| {
+                now.saturating_duration_since(pass) <= LIVENESS_POLL.saturating_mul(2)
+            })
+    }
+
+    /// How long a connection may go without a sign of life from the peer before this machine
+    /// treats it as gone, if a keep-alive makes that readable at all.
+    ///
+    /// [`VANISH_BOUND`], or twice the keep-alive when that is longer: a live quiet peer
+    /// answers a ping within one keep-alive, and must not be declared gone between two.
+    fn vanished_after(&self) -> Option<Duration> {
+        self.keep_alive
+            .map(|keep_alive| VANISH_BOUND.max(keep_alive.saturating_mul(2)))
+    }
+
+    /// Whether `connection` has shown no sign of life for longer than this machine's liveness
+    /// bound; see [`Self::vanished_after`]. Always false without a keep-alive: nothing this
+    /// machine sends would make a silent peer answer.
+    fn vanished(&self, watch: &Watch, now: Instant) -> bool {
+        self.vanished_after().is_some_and(|bound| {
+            !watch
+                .life
+                .lock()
+                .expect("the life count is not poisoned")
+                .shows_life(now, bound, self.reader_heard(now))
+        })
+    }
+
+    /// How this machine's recovery of `peer` stands, readable at any time.
+    ///
+    /// [`Recovery::Connected`] when the pair has a live connection, [`Recovery::Unwatched`]
+    /// when nothing has happened for it, and otherwise what the retry policy is doing:
+    /// dialling, waiting until a stated moment, or stopped with the reason. It is not durable
+    /// and not an audit entry; see [`crate::peer::recovery`].
+    ///
+    /// Reading it also folds in a dial whose caller went away before anybody judged it — a
+    /// service that stopped, a cancelled keeper — so the answer is never a stale "dialling"
+    /// that nothing would dial out of. What it cannot say is who makes the next dial of a wait:
+    /// [`Self::watched`] is that answer, and it is a separate one because a pair a keeper
+    /// watches and one nobody watches are waiting for the same moment.
+    #[must_use]
+    pub fn recovery(&self, peer: &PeerId) -> Recovery {
+        if self.live(peer).is_some() {
+            return Recovery::Connected;
+        }
+        self.settle_stale(peer);
+        self.policy(peer)
+    }
+
+    /// Whether a keeper is running for `peer` now.
+    ///
+    /// A pair a keeper watches is dialled again by itself at the moment its
+    /// [`Recovery::Waiting`] or [`Recovery::Exhausted`] names; a pair nobody watches is
+    /// dialled only by a caller that asks — [`Self::ensure`], which is how a waiting message
+    /// and a requested action do. A stopped pair reads [`Recovery::Stopped`] either way, and a
+    /// keeper dropped mid-dial leaves the episode where it was: what it was doing is still
+    /// true, only nothing will do it next.
+    #[must_use]
+    pub fn watched(&self, peer: &PeerId) -> bool {
+        self.retry()
+            .get(peer)
+            .is_some_and(|watched| watched.keepers > 0)
+    }
+
+    /// What the retry policy says about `peer`, with the live connection not in front of it.
+    ///
+    /// [`Self::recovery`] answers [`Recovery::Connected`] for a pair that has one; this is
+    /// what the policy itself would say, which is what a caller about to dial needs. A dial in
+    /// flight is the pair dialling, whoever took it: the state can move on from
+    /// [`Recovery::Dialling`] while a dial runs — a dead connection judged under it — and
+    /// answering the state instead would send the next caller round again for a dial that is
+    /// already running.
+    fn policy(&self, peer: &PeerId) -> Recovery {
+        match self.retry().get(peer) {
+            Some(watched) => watched.report(),
+            None => Recovery::Unwatched,
+        }
+    }
+
+    /// Take this round's answer to "has [`Self::ensure`] anything to do now?": a dial that is
+    /// due, or a stop whose cause is due to be asked about again — at most once a round, so a
+    /// queue's poll does not cost a record read a second.
+    ///
+    /// It is named for the taking rather than for the question because it stamps the round it
+    /// answers: a second call inside the same round is told nothing is due while a stop's cause
+    /// is still being re-asked.
+    fn take_due(&self, peer: &PeerId, now: Instant) -> bool {
+        let mut retry = self.retry();
+        let Some(watched) = retry.get_mut(peer) else {
+            return true;
+        };
+        let state = watched.report();
+        state.due(now) || (matches!(state, Recovery::Stopped { .. }) && watched.stop_due(now))
+    }
+
+    /// A reason to start over arrived for `peer`: a fresh address for it, or a person asking
+    /// again. A fresh episode starts now.
+    ///
+    /// Public because a person asking again is news the product has and the crate cannot
+    /// observe: this is how a product hands in a "try now", and it is the same reason a hint
+    /// carrying a fresh address is news.
+    ///
+    /// A stopped pair is not woken — trust is a person's business, and a pair with nowhere to
+    /// dial has nothing to dial; [`Self::ensure`] re-opens a stop whose cause has gone, and
+    /// this call makes it ask at once rather than after the round it would otherwise have
+    /// waited. A connected, dialling or unwatched one is left alone: a connection that works is
+    /// not replaced because something arrived, and a pair no keeper watches has no episode for
+    /// news to start. A standing reason, like a message waiting, is not news and is handed in
+    /// without resetting the episode, so a peer that keeps dropping a connection cannot have
+    /// the queue re-arm it.
+    pub fn wake(&self, peer: &PeerId) {
+        // A dial nobody finished is settled first: a reason to start over cannot be weighed
+        // against a state that is only still "dialling" because its caller went away.
+        self.settle_stale(peer);
+        let now = self.runtime.now();
+        let mut retry = self.retry();
+        let watched = retry.entry(*peer).or_insert_with(Watched::unwatched);
+        // A person's act is news, so a stop's cause is asked about at once rather than after
+        // the round a queue's poll would otherwise have waited for.
+        watched.checked = None;
+        watched.state.wake(now);
+    }
+
+    /// Something wants `peer` up now — a message waiting to be delivered — and the next dial
+    /// is made due at once, keeping the episode.
+    ///
+    /// This is the reason a queued message may cause a dial without becoming a dial per
+    /// second: it moves one wait, it does not reset the count, so a peer that keeps accepting
+    /// a connection and dropping it is still bounded by the episode. The crate's own queue is
+    /// its only caller; a caller with a genuinely new reason to start over — a fresh address —
+    /// calls [`Self::wake`], and one that only wants to dial calls [`Self::ensure`], which is
+    /// paced the same way.
+    pub(crate) fn hurry(&self, peer: &PeerId) {
+        self.settle_stale(peer);
+        let now = self.runtime.now();
+        self.transition(*peer, |state| state.hurry(now));
     }
 
     /// The live connection to `peer`, if there is one.
@@ -568,6 +1011,18 @@ impl Connections {
         open(&pairs, peer).is_some_and(|live| Arc::ptr_eq(&live.watch, &traffic.watch))
     }
 
+    /// The last connection the manager adopted for `peer`, with the cell the keeper judges
+    /// it by, whether or not it has closed.
+    ///
+    /// A closed connection is not the pair's connection — [`Self::live`] is — but it is
+    /// still the one the keeper has to judge: a dial whose connection died before the
+    /// keeper looked must not escape the settle window.
+    fn judgeable(&self, peer: &PeerId) -> Option<(Connection, Arc<Watch>)> {
+        let pairs = self.pairs();
+        let live = pairs.get(peer)?;
+        Some((live.connection.clone(), Arc::clone(&live.watch)))
+    }
+
     /// The pair's live connection and its starter, or `None` when the recorded
     /// connection has closed. The rule is [`Self::live`]'s.
     fn current(&self, peer: &PeerId) -> Option<(Connection, Started)> {
@@ -592,18 +1047,30 @@ impl Connections {
     ///
     /// The order after the hint is the module's. `hint` is an address the peer sent
     /// in an introduction — its own, as the beacon observed it — and it is
-    /// self-asserted: the handshake still proves the key. It is the carrier for "a
-    /// fresh address for that peer arriving in an introduction".
+    /// self-asserted: the handshake still proves the key. It is the carrier for "a fresh
+    /// address for that peer", which is one of the reasons a fresh episode starts, so a hinted
+    /// call hands it in through [`Self::wake`] before it dials. It is not proof that the
+    /// address works — an introduction may be stale — so a pair that stopped because it had
+    /// nowhere to dial is re-opened by the dial that reaches the peer, not by the hint.
+    /// A call with no hint adds no reason of its own to the policy — only a hint starts a fresh
+    /// episode — but it still reads the record, and a read that fails this instant is folded in as
+    /// the deferral it is, which moves the next dial to the deferral's own moment. The answer is
+    /// then the state's own reason, so a fault never stands in for what the last dial met; a state
+    /// that names nothing — a dial already in flight, or a pair already connected — answers the
+    /// fault itself, because the dial this call asked for is what could not proceed. A dial that
+    /// fails folds nothing into the policy: a failed dial here is not a dial the policy made, and a
+    /// caller that wants the policy's pacing calls [`Self::ensure`]. A dial that is kept is folded
+    /// in as the pair's next dial, so a pair a keeper runs for does not keep a stale wait or a
+    /// used-up episode across a connection that works.
     ///
-    /// A connection the handshake proves is the peer's is adopted under the
-    /// tie-break and returned — which may be a different connection than the one
-    /// this call made, if the peer's own dial won, and which a concurrent accept may
-    /// replace a moment later. When this call's own dial loses the tie-break, the
-    /// answer is the connection the pair kept: the caller asked to reach the peer, and
-    /// the peer is reached. Only when the tie-break drops the dial and the pair holds
-    /// nothing does this report [`ConnectFailure::NoDirectPath`], with the tie-break's
-    /// cause. The handle is a connection, not a promise: the pair's live one is
-    /// [`Self::live`]. The address this call dialed is not written to the record; see
+    /// A connection the handshake proves is the peer's is adopted under the tie-break and returned
+    /// — which may be a different connection than the one this call made, if the peer's own dial
+    /// won, and which a concurrent accept may replace a moment later. When this call's own dial
+    /// loses the tie-break, the answer is the connection the pair kept: the caller asked to reach
+    /// the peer, and the peer is reached. Only when the tie-break drops the dial and the pair holds
+    /// nothing does this report [`ConnectFailure::NoDirectPath`], with the tie-break's cause. The
+    /// handle is a connection, not a promise: the pair's live one is [`Self::live`]. The address
+    /// this call dialed is not written to the record; see
     /// [`crate::peer::PeerRecord::last_address`].
     pub async fn connect_with(
         &self,
@@ -611,12 +1078,28 @@ impl Connections {
         peer: &Fingerprint,
         hint: Option<SocketAddr>,
     ) -> Result<Connection, ConnectFailure> {
-        match self.attempt(endpoint, peer, hint).await {
-            Attempt::Kept { connection, .. } => Ok(connection),
-            Attempt::Dropped { address, cause } => {
+        let peer_id = peer.peer_id();
+        if hint.is_some() {
+            // A hint is news: a fresh episode starts, because a caller has just shown this
+            // machine an address. `wake` settles a dial nobody finished first and clears a
+            // stop's re-ask stamp, so the reason to start over is not weighed against a state
+            // that only still reads "dialling" or against a cause this call should ask about.
+            self.wake(&peer_id);
+        }
+        match self.try_peer(endpoint, peer, hint, None).await {
+            Try::Kept { connection, .. } => {
+                // A dial the policy knows about: a pair a keeper runs for has this counted as
+                // its next dial, so a stale wait or a used-up episode does not outlive the
+                // connection. A pair no keeper runs for stays `Unwatched`: nothing will
+                // re-dial it, and the state must not claim otherwise.
+                self.adopted_here(peer_id);
+                Ok(connection)
+            }
+            Try::Dropped { address, cause } => {
                 // A dial the tie-break dropped is not a failed dial when the pair is
                 // connected: that connection is the answer.
                 if let Some(connection) = self.live(&peer.peer_id()) {
+                    self.adopted_here(peer_id);
                     return Ok(connection);
                 }
                 Err(ConnectFailure::NoDirectPath {
@@ -625,26 +1108,53 @@ impl Connections {
                     cause: cause.to_owned(),
                 })
             }
-            Attempt::Failed(failure) => Err(failure),
+            Try::Failed(failure) => Err(match failure {
+                // A deferral is not this dial's answer: the answer is the state a product reads,
+                // which keeps whatever reason it had — the fault itself when the state names none.
+                ConnectFailure::Deferred { .. } => {
+                    let (_, named) = self.state_and_reason(&peer_id);
+                    named.unwrap_or(failure)
+                }
+                other => other,
+            }),
         }
     }
 
-    /// One attempt to reach `peer`, in the module's order, before it is folded into
-    /// the four failures.
-    async fn attempt(
+    /// Fold this machine's own successful dial into the policy: the pair is connected, and a
+    /// stop is open again.
+    ///
+    /// The dial began with a record that said this machine trusts the peer and ended with the
+    /// peer answering, so both of a stop's causes are disproved by it.
+    fn adopted_here(&self, peer: PeerId) {
+        let now = self.runtime.now();
+        self.transition(peer, |state| {
+            state.trust_restored(now);
+            state.located(now);
+            state.adopted();
+        });
+    }
+
+    /// One try at reaching `peer`, in the module's order, before it is folded into the
+    /// failures.
+    ///
+    /// `standing` is this machine's trust in the peer, read by a caller that had to read the
+    /// record anyway; `None` asks here. Either way the answer is one read of the file.
+    async fn try_peer(
         &self,
         endpoint: &Endpoint,
         peer: &Fingerprint,
         hint: Option<SocketAddr>,
-    ) -> Attempt {
+        standing: Option<RecordRead>,
+    ) -> Try {
         let peer_id = peer.peer_id();
-        if let Err(cause) = self.standing_now(&peer_id) {
-            return Attempt::Failed(ConnectFailure::NotTrusted { peer: *peer, cause });
+        let standing = match standing {
+            Some(standing) => standing,
+            None => self.standing(&peer_id),
+        };
+        if let Some(failure) = standing.refusal(*peer) {
+            return Try::Failed(failure);
         }
-        let remembered = self
-            .store
-            .get(&peer_id)
-            .and_then(|record| record.last_address());
+        let remembered = self.remembered(&peer_id);
         let mut addresses = Vec::with_capacity(2);
         if let Some(hint) = hint {
             addresses.push(hint);
@@ -656,13 +1166,17 @@ impl Connections {
         }
         let mut tried = Vec::new();
         for address in addresses {
-            match self.dial(endpoint, address, peer).await {
+            match self.try_address(endpoint, address, peer).await {
                 Ok(connection) => return self.here(peer, address, connection),
                 Err(cause) => tried.push((address, cause)),
             }
         }
         let Some(beacon) = &self.beacon else {
-            return Attempt::Failed(ConnectFailure::BeaconUnreachable {
+            // Nothing to ask and nothing to try: configuration, not a network state.
+            if tried.is_empty() {
+                return Try::Failed(ConnectFailure::Nowhere { peer: *peer });
+            }
+            return Try::Failed(ConnectFailure::BeaconUnreachable {
                 peer: *peer,
                 cause: cause(&tried, "no beacon is configured"),
             });
@@ -670,7 +1184,7 @@ impl Connections {
         let session = match beacon.connect().await {
             Ok(session) => session,
             Err(error) => {
-                return Attempt::Failed(ConnectFailure::BeaconUnreachable {
+                return Try::Failed(ConnectFailure::BeaconUnreachable {
                     peer: *peer,
                     cause: cause(&tried, &format!("the beacon: {error}")),
                 });
@@ -679,21 +1193,21 @@ impl Connections {
         let address = match session.lookup(&peer_id).await {
             Ok(Some(address)) => address,
             Ok(None) => {
-                return Attempt::Failed(ConnectFailure::PeerUnknown {
+                return Try::Failed(ConnectFailure::PeerUnknown {
                     peer: *peer,
                     cause: cause(&tried, "the peer is not registered"),
                 });
             }
             Err(error) => {
-                return Attempt::Failed(ConnectFailure::BeaconUnreachable {
+                return Try::Failed(ConnectFailure::BeaconUnreachable {
                     peer: *peer,
                     cause: cause(&tried, &format!("the beacon: {error}")),
                 });
             }
         };
-        match self.dial(endpoint, address, peer).await {
+        match self.try_address(endpoint, address, peer).await {
             Ok(connection) => self.here(peer, address, connection),
-            Err(error) => Attempt::Failed(ConnectFailure::NoDirectPath {
+            Err(error) => Try::Failed(ConnectFailure::NoDirectPath {
                 peer: *peer,
                 address,
                 cause: error.to_string(),
@@ -704,21 +1218,17 @@ impl Connections {
     /// Adopt this machine's own dial.
     ///
     /// A handshake that completed but whose connection the tie-break dropped is
-    /// [`Attempt::Dropped`], not a dial failure: the address answered, and the
+    /// [`Try::Dropped`], not a dial failure: the address answered, and the
     /// keeper treats it as a dial that carried nothing rather than giving up.
-    fn here(&self, peer: &Fingerprint, address: SocketAddr, connection: Connection) -> Attempt {
+    fn here(&self, peer: &Fingerprint, address: SocketAddr, connection: Connection) -> Try {
         match self.adopt(peer.peer_id(), connection, Started::Here) {
             Ok((connection, kept_this, watch)) => {
                 if kept_this {
                     self.start_exchange(peer.peer_id(), &connection, &watch, Started::Here);
                 }
-                Attempt::Kept {
-                    connection,
-                    kept_this,
-                    watch,
-                }
+                Try::Kept { connection }
             }
-            Err(cause) => Attempt::Dropped { address, cause },
+            Err(cause) => Try::Dropped { address, cause },
         }
     }
 
@@ -728,7 +1238,7 @@ impl Connections {
     /// this checks the record again, applies the tie-break, and records the address
     /// the kept connection came from. Every failure here ends its own connection: a
     /// refused stranger and a handshake that timed out are ordinary events on a
-    /// public address, and the loop moves on.
+    /// public address, and the next incoming connection is taken regardless.
     async fn accept(&self, incoming: Incoming) {
         let Some(Ok(connection)) = timeout(&*self.runtime, DEFAULT_CONNECT_BUDGET, async move {
             incoming.await
@@ -742,9 +1252,24 @@ impl Connections {
             return;
         };
         let peer = presented.peer_id();
-        if let Err(cause) = self.standing_now(&peer) {
-            connection.close(0u32.into(), refusal_text(&cause));
-            return;
+        let standing = self.standing(&peer);
+        match standing {
+            RecordRead::Trusted(_) => {}
+            // A read this machine could not complete is not a refusal: the connection is
+            // closed with the fault's own reason, and the peer's next dial meets a record
+            // that may be readable again.
+            RecordRead::Deferred { .. } => {
+                connection.close(0u32.into(), DEFERRED_CAUSE.as_bytes());
+                return;
+            }
+            RecordRead::Unreadable(error) => {
+                connection.close(0u32.into(), cause_text(&unreadable(&error)));
+                return;
+            }
+            RecordRead::Refused(cause) => {
+                connection.close(0u32.into(), cause_text(&cause));
+                return;
+            }
         }
         // The tie-break runs before the address write: the write is a hint that
         // saves a beacon trip, and delaying the adoption by it would let the keeper
@@ -758,165 +1283,691 @@ impl Connections {
         {
             self.note_address(&peer, kept.remote_address());
             self.start_exchange(peer, &kept, &watch, Started::There);
+            // An authenticated connection from the peer is a reason to stop waiting: the
+            // pair is connected, so the episode stops dialling and watches instead. It is
+            // also an address, so a pair that stopped because it had nowhere to dial is open
+            // again — it consumes a dial number rather than starting a fresh episode.
+            self.transition(peer, |state| {
+                state.adopted();
+                state.located(self.runtime.now());
+            });
         }
     }
 
     /// Serve incoming connections on `endpoint` until it closes.
     ///
-    /// This is the accept loop, and the caller runs it: the crate has no runtime of
+    /// This is the accept loop, and the caller runs it once: the crate has no runtime of
     /// its own to spawn on, so the caller keeps the handle and decides when the loop
     /// stops — closing the endpoint is what ends it, because quinn's `accept` answers
-    /// nothing else. Run [`ACCEPT_LANES`] copies, so one peer that opens a
-    /// connection and stalls cannot block every other peer for the whole connect
-    /// budget. The manager holds one live connection per pair; an incoming one that
-    /// loses the tie-break is closed here.
+    /// nothing else.
     ///
-    /// Accepting writes the peer's authenticated source address when it changed — a
-    /// small blocking file operation — so run the loop on a task that may block; the
-    /// module's *Accepting* note says why.
+    /// The loop does not wait for a handshake. Each incoming connection is handed to a
+    /// task of its own, so a burst of peers that open a connection and stall costs at most
+    /// [`ACCEPT_IN_FLIGHT`] handshakes at once rather than one after another; at the cap the
+    /// loop stops pulling from the endpoint and looks again after one round of [`TRUST_POLL`],
+    /// so a full machine's next accept waits up to that round and never the length of a
+    /// handshake.
+    ///
+    /// The loop itself only takes and hands over. The address write that accepting needs
+    /// happens on the task that took the connection, so a caller can run this loop on the
+    /// reactor it serves.
     pub async fn serve(self: Arc<Self>, endpoint: Endpoint) {
-        while let Some(incoming) = endpoint.accept().await {
-            self.accept(incoming).await;
+        loop {
+            // The cap is checked before the next connection is taken, so a full machine does
+            // not hold a handshake outside `accept`'s own budget.
+            while self.in_flight.load(Ordering::SeqCst) >= ACCEPT_IN_FLIGHT {
+                pause(&self, TRUST_POLL).await;
+            }
+            let Some(incoming) = endpoint.accept().await else {
+                return;
+            };
+            self.in_flight.fetch_add(1, Ordering::SeqCst);
+            let this = Arc::clone(&self);
+            let place = InFlight(Arc::clone(&self));
+            self.runtime.spawn(Box::pin(async move {
+                // The place is given back however the task ends, including an abort.
+                let _place = place;
+                this.accept(incoming).await;
+            }));
         }
     }
 
-    /// Keep the pair with `peer` connected until an attempt fails with the pair
-    /// holding no connection, or a run of dials carries nothing.
+    /// Keep the pair with `peer` connected until nothing can dial it again by itself.
     ///
-    /// The manager owns recovery: the caller runs this once per paired peer and does
-    /// not dial. A pair that stays up is never re-dialled: the keeper watches the
-    /// connection in rounds of [`TRUST_POLL`], asking the record each round whether
-    /// this machine still trusts the peer, and dials again in [`Self::connect`]'s order
-    /// once the connection is gone.
+    /// The manager owns recovery: the caller runs this once per paired peer and does not
+    /// dial. A pair that stays up is never re-dialled: the keeper watches the connection
+    /// in rounds of [`TRUST_POLL`], asking the record each round whether this machine
+    /// still trusts the peer, and dials again in [`Self::connect`]'s order once the
+    /// connection is gone. A pair that is down is dialled in episodes — the gaps grow,
+    /// the episode is capped, and once it is used up the pair is dialled once a
+    /// [`crate::peer::RECOVERY_RECHECK`] — so a peer that keeps refusing is dialled at a
+    /// decreasing rate rather than at handshake rate, and the state is readable through
+    /// [`Self::recovery`] the whole time.
+    ///
+    /// It returns when it reaches a stop, and says which: [`StopCause::NotTrusted`] when this
+    /// machine does not trust the peer or cannot read the record that would say it does, and
+    /// [`StopCause::Nowhere`] when there is no beacon and no remembered address. Everything
+    /// else — a beacon that is down, a peer that is not registered, a path that does not
+    /// work — is a state that can pass, and the keeper waits for it to. [`Self::recovery`]
+    /// keeps reporting the same reason after the keeper has returned, and a stop is not
+    /// permanent while its cause is: [`Self::ensure`] re-opens it and dials once, and running
+    /// the keeper again restores self-recovery — nothing inside the crate does that by itself,
+    /// and [`Self::watched`] is how a product knows it is the one that has to. Dropping the
+    /// future ends the watching too, and nothing then dials the pair by itself: a pair waiting
+    /// out a gap keeps its state and its count and reads [`Self::watched`] false. A keeper
+    /// dropped mid-dial is settled by the next reader — the dial's connection is judged as the
+    /// keeper would have judged it, which leaves a wait or a used-up episode behind when the
+    /// dial produced one, and [`Recovery::Unwatched`] when it produced nothing to judge.
     ///
     /// A connection that carried anything — a QUIC datagram or stream frame either
     /// way, beyond the manager's own binding exchange and the layers' own rounds — and
-    /// then died is a link failure: the keeper re-dials it however many
-    /// times it happens and however long it lived, with no bound, because that is
-    /// recovery and not a loop. A connection that only exchanged its binding and then
-    /// died carried nothing, because the exchange is the manager's handshake and not
-    /// the pair's use: the frames it wrote are measured and subtracted, and a connection
-    /// that dies before that measurement lands is judged as carrying nothing too. That
-    /// window is the whole [`crate::peer::EXCHANGE_BUDGET`], so a pair's own traffic
-    /// inside it is discounted with the exchange's — the price of a bound the keeper can
-    /// keep without a second handshake. A connection that outlives [`KEEPER_SETTLE`] is
-    /// settled the same way: the pair got to use it, so its loss is ordinary churn and
-    /// clears the count.
+    /// then died is a link failure: the next dial is due at once, however many
+    /// times it happens and however long it lived, because that is recovery and not a
+    /// loop. A connection that only exchanged its binding and then died carried
+    /// nothing, because the exchange is the manager's handshake and not the pair's use:
+    /// the frames it wrote are measured and subtracted, and a connection that dies
+    /// before that measurement lands is judged as carrying nothing too. That window is
+    /// the whole [`crate::peer::EXCHANGE_BUDGET`], so a pair's own traffic inside it is
+    /// discounted with the exchange's — the price of a bound the keeper can keep
+    /// without a second handshake. A connection that outlives [`KEEPER_SETTLE`] is
+    /// settled the same way: the pair got to use it, so its loss is ordinary churn.
     ///
     /// The message and action layers' requests are measured with the exchange: a request
     /// in flight, and one that finished, are not the pair's traffic, so a peer that keeps
     /// dropping a connection after one unanswered request is not mistaken for a live pair.
     /// A request the peer accepted is: it is the peer acting, so the connection carried
-    /// something and its loss is a link failure.
+    /// something and its loss is a link failure. So is a message the peer answered
+    /// `already taken`: the peer's own account says it took that one before.
     ///
-    /// Only a dial whose connection ends before the pair carried anything and inside
-    /// [`KEEPER_SETTLE`] is bounded: [`KEEPER_UNSTABLE_LIMIT`] of those in a row stop
-    /// the keeper with [`Keeper::Unstable`], whose cause says what ended the last one,
-    /// so a peer that takes a connection and drops it is not re-dialled for ever. A
-    /// dial that fails outright stops it at once with [`Keeper::Failed`] — unless the
-    /// accept lane connected meanwhile, because a pair that is connected now is never
-    /// stopped: before giving up, for whatever reason, the keeper asks whether the
-    /// pair is connected.
-    pub async fn keep_connected(&self, endpoint: &Endpoint, peer: &Fingerprint) -> Keeper {
+    /// Only a dial whose connection ends before the pair carried anything, inside
+    /// [`KEEPER_SETTLE`] and for a reason other than a timeout, is a strike. A timeout is
+    /// the peer going quiet — a NAT mapping expiring, a laptop closing — so it is a
+    /// redial at once and never a strike, which is what keeps a peer built with a shorter
+    /// idle timeout than this machine's from turning an ordinary quiet drop into a
+    /// refusal. A run of strikes is bounded by
+    /// [`crate::peer::RECOVERY_DIALS`] like any other failed dial, so a peer that
+    /// takes a connection and drops it is not re-dialled in a loop; a strike is counted
+    /// even when another dialer has connected by then, because a dial that produced a
+    /// connection which died at once is exactly the signature the bound is for. A dial
+    /// that fails outright while the pair is connected is the other way round and is not
+    /// counted: a pair that is connected has nothing to recover from.
+    pub async fn keep_connected(&self, endpoint: &Endpoint, peer: &Fingerprint) -> StopCause {
         let peer_id = peer.peer_id();
-        let mut strikes = 0u8;
+        // For as long as this future lives the pair has a keeper, and a state that says a
+        // dial is coming is one somebody will make. Dropping the future — a caller's task
+        // cancelled — ends that, and the pair must stop claiming a retry. A caller asking
+        // again is a person's answer to whatever stopped the keeper, so the episode starts
+        // fresh here — but only for the pair's first keeper: a second one is not a new start
+        // and must not hand a peer that keeps dropping a connection a second episode.
+        let _kept = Kept::new(self, peer_id, self.runtime.now());
         loop {
-            // A pair whose trust is withdrawn is not one to keep: close what is live
-            // and stop, naming the withdrawal rather than a lost path. The record is
-            // read from disk, so a withdrawal written through another handle — or by
-            // the other process on this root — stops the keeper too.
-            if let Err(cause) = self.standing_now(&peer_id) {
-                if let Some(live) = self.live(&peer_id) {
-                    live.close(0u32.into(), refusal_text(&cause));
-                }
-                return Keeper::Failed(ConnectFailure::NotTrusted { peer: *peer, cause });
-            }
-            // A connected pair is never stopped and never dialled over: watch it, and
-            // come back to the record each round, because a withdrawal is a file and
-            // leaves no trace on the wire.
-            if let Some(live) = self.live(&peer_id) {
-                strikes = 0;
-                let _ = timeout(&*self.runtime, TRUST_POLL, live.closed()).await;
-                continue;
-            }
-            let (counted, cause) = match self.attempt(endpoint, peer, None).await {
-                Attempt::Kept {
-                    connection,
-                    kept_this,
-                    watch,
-                } => {
-                    // A dial that lost the tie-break to a connection the pair already
-                    // holds carried nothing; the pair is connected and is watched
-                    // next time round.
-                    if !kept_this {
-                        strikes = 0;
-                        continue;
-                    }
-                    match timeout(&*self.runtime, KEEPER_SETTLE, connection.closed()).await {
-                        // The peer kept it past the window: settled.
-                        None => {
-                            strikes = 0;
-                            continue;
-                        }
-                        // A connection that carried anything is a link failure, however
-                        // briefly it lived.
-                        Some(error) => (!carried(&connection, &watch), close_cause(&error)),
-                    }
-                }
-                Attempt::Dropped { cause, .. } => (true, cause.to_owned()),
-                Attempt::Failed(failure) => {
-                    // The accept lane may have connected while this dial failed: a
-                    // connected pair is never stopped.
-                    if self.live(&peer_id).is_some() {
-                        strikes = 0;
-                        continue;
-                    }
-                    return Keeper::Failed(failure);
-                }
-            };
-            if !counted || self.live(&peer_id).is_some() {
-                // This dial produced nothing the pair had not already got, or the
-                // pair is connected now.
-                strikes = 0;
-                continue;
-            }
-            strikes = strikes.saturating_add(1);
-            if strikes >= KEEPER_UNSTABLE_LIMIT {
-                // Ask once more, as late as possible: an adoption that landed while
-                // the strike was booked must not be reported as giving up on the pair.
-                if self.live(&peer_id).is_some() {
-                    strikes = 0;
+            // A pair whose trust is gone is not one to keep: close what is live and stop,
+            // naming the trust rather than a lost path. The record is read from disk, so a
+            // withdrawal written through another handle — or by the other process on this
+            // root — stops the keeper too.
+            let standing = self.standing(&peer_id);
+            match standing {
+                RecordRead::Trusted(_) => {}
+                RecordRead::Deferred { .. } => {
+                    // A local read that failed this instant is not the peer's fault and not a
+                    // decision: the pair keeps its place and its live connection — nothing is
+                    // trusted on a file nobody could read, and nothing is torn down for it
+                    // either — and the next round asks again. The deferral itself is already
+                    // folded in; `standing` is the one place that does it.
+                    self.deferral_pause(None).await;
                     continue;
                 }
-                return Keeper::Unstable { peer: *peer, cause };
+                RecordRead::Unreadable(error) => {
+                    return self.refused(&peer_id, unreadable(&error));
+                }
+                RecordRead::Refused(cause) => {
+                    return self.refused(&peer_id, cause);
+                }
+            }
+            if let Some((connection, watch)) = self.judgeable(&peer_id)
+                && (!watch.judged.load(Ordering::SeqCst) || connection.close_reason().is_none())
+            {
+                self.watch(&peer_id, *peer, &connection, &watch).await;
+                continue;
+            }
+            if !self.somewhere_to_dial(&peer_id) {
+                // Nothing to dial and nothing that could tell this machine where the peer
+                // is: configuration, not a network state that can pass.
+                self.transition(peer_id, |state| state.stop(StopCause::Nowhere));
+                return StopCause::Nowhere;
+            }
+            let (state, _) = self.ensure(endpoint, peer).await;
+            match state {
+                // A dial is running — this call's, or one another caller took — and the round
+                // that notices an inbound connection, a withdrawal or a wake is what comes
+                // next. Every arm of this loop waits, so no state can make it a hot loop.
+                Recovery::Dialling { .. } | Recovery::Connected | Recovery::Unwatched => {
+                    pause(self, TRUST_POLL).await;
+                }
+                Recovery::Waiting { until, .. } | Recovery::Exhausted { until, .. } => {
+                    // One timer, and it is the sooner of the policy's moment and the round
+                    // that notices an inbound connection, a withdrawal or a wake.
+                    pause(self, until.saturating_duration_since(self.runtime.now())).await;
+                }
+                // A stop is answered here rather than dialled through. The keeper's own two
+                // stops return from the branch that wrote them, so a stop that reaches here was
+                // written by something else — another keeper for the same pair, or a service
+                // path — and it is that writer's decision, not a reason to dial.
+                Recovery::Stopped { cause } => return cause,
             }
         }
     }
 
-    /// Whether this machine trusts `peer` now, and why not, from one read of the
-    /// record on disk.
+    /// Close what is live for `peer` and stop the pair for a refusal the record answered.
     ///
-    /// The one place the manager's reaches ask the question, so a dial, an accepted
-    /// connection and a keeper's round cannot disagree about it. It reads the file once:
-    /// a reach that trusts the peer and one that refuses it both cost one small read.
-    /// A record that cannot be read is not trusted, and it says so with the read's own
-    /// refusal: the manager fails closed, and the cause points a person at the record
-    /// rather than at a pairing that was never made.
-    fn standing_now(&self, peer: &PeerId) -> Result<(), NotTrustedCause> {
+    /// The cause travels to the peer in [`cause_text`]'s words — which file, and which fault,
+    /// is this machine's business — and the stop keeps it for the caller.
+    fn refused(&self, peer: &PeerId, cause: NotTrustedCause) -> StopCause {
+        if let Some(live) = self.live(peer) {
+            live.close(0u32.into(), cause_text(&cause));
+        }
+        let stop = StopCause::NotTrusted(cause);
+        self.transition(*peer, |state| state.stop(stop.clone()));
+        stop
+    }
+
+    /// Make one dial to `peer`, if the retry policy says one is due.
+    ///
+    /// This is how a service with something to deliver — a message waiting, an action a
+    /// person asked for — dials without waiting for a keeper, and how the keeper dials. It
+    /// is paced by the same policy: a call that finds the pair connected, already dialling
+    /// or waiting out a gap makes no dial and answers the state, so a queue that asks once a
+    /// second does not dial once a second and does not open a beacon session per poll. The
+    /// dial itself is [`Self::connect`]'s, with no fresh address.
+    ///
+    /// The answer is the policy's own state after the call, and the failure this call has to
+    /// report — `None` when the pair is up and `None` when nothing was due and nothing had to be
+    /// decided, except that a stopped pair always answers its cause, whether this call wrote the
+    /// stop or found it. A caller with something to report, like an action a person asked for,
+    /// says why it could not reach the peer; one that only needs the connection reads the state.
+    /// [`Self::recovery`] is the same answer with a live connection and with "no keeper" in front
+    /// of it; this one is what a caller about to dial needs, because the policy's moment is what
+    /// paces the next call.
+    ///
+    /// A record that refuses trust is a decision, so it stops the pair with the cause this read
+    /// found: nothing would dial it again by itself while the file says that, and a keeper would
+    /// stop it on its next round anyway. The answer and the readable state therefore name the
+    /// same reason. It is not permanent: the next call re-reads the record once the stop's cause
+    /// has been re-asked, re-opens the stop when a person has restored trust or an address has
+    /// arrived, and dials — which is what makes a restoration the next call's answer. A fault
+    /// this machine met this instant is the other way round: the pair is not stopped, the state
+    /// keeps whatever reason it had, and the answer is that reason — the deferral itself when
+    /// no dial has run — and the file is read again.
+    ///
+    /// Because a stop's cause is re-asked at most once a round, the crate's own queue waits a
+    /// round after a refusal before asking again, and a poll every second does not become a
+    /// record read every second. A pair whose next dial is not due is answered from the policy
+    /// without asking the record at all, so a queue that calls this once a round costs one read
+    /// per gap rather than one per round. The price is that a service path does not re-ask the
+    /// record while it waits: a withdrawal is answered when the next dial is due, where a keeper
+    /// notices within a round.
+    pub async fn ensure(
+        &self,
+        endpoint: &Endpoint,
+        peer: &Fingerprint,
+    ) -> (Recovery, Option<ConnectFailure>) {
+        let peer_id = peer.peer_id();
+        if self.live(&peer_id).is_some() {
+            return (Recovery::Connected, None);
+        }
+        // A dial whose connection died before anybody judged it is settled first, so the
+        // policy never answers "dialling" for a dial that is over.
+        self.settle_stale(&peer_id);
+        let now = self.runtime.now();
+        // Nothing is due and nothing has to be decided: answer from the policy without asking
+        // the record, which is what makes a queue's poll cost one read per gap rather than one
+        // per round. A stop is the exception, because its cause can go with nothing dialling,
+        // and it is re-asked at most once a round.
+        if !self.take_due(&peer_id, now) {
+            return self.answer(&peer_id, None);
+        }
+        // One read of the record answers both questions: whether this machine trusts the peer,
+        // and — from the copy that read refreshed — whether there is now somewhere to dial. An
+        // address another handle or the other process wrote is a real address, not a cached
+        // one. The same answer is handed to the dial, so one dial costs one read.
+        let standing = self.standing(&peer_id);
+        let reachable = self.somewhere_to_dial(&peer_id);
+        match &standing {
+            RecordRead::Trusted(_) => {
+                // A stop whose cause has gone is not a stop: a person restored trust, or an
+                // address arrived for a pair that had nowhere to dial. The keeper returned
+                // when it stopped, so this is the path that starts it over.
+                self.transition(peer_id, |state| {
+                    state.trust_restored(now);
+                    if reachable {
+                        state.located(now);
+                    }
+                });
+            }
+            RecordRead::Deferred { .. } => {
+                // `standing` already folded the deferral into the state, so nothing is written
+                // here; the answer is the state's own reason, read with it so the two agree.
+                return self.state_and_reason(&peer_id);
+            }
+            RecordRead::Unreadable(error) => {
+                // A refusal is a decision and not a network state that passes: nothing will dial
+                // this pair by itself while the record says it, so the state is stopped with the
+                // cause this read found — a keeper would stop it on its next round anyway — and
+                // the answer and the readable state cannot name two reasons. The next call
+                // re-opens it once a person has changed the record. Nothing is live here, so
+                // `refused` has nothing to close.
+                self.refused(&peer_id, unreadable(error));
+                return self.answer(&peer_id, None);
+            }
+            RecordRead::Refused(cause) => {
+                self.refused(&peer_id, cause.clone());
+                return self.answer(&peer_id, None);
+            }
+        }
+        // Beginning the dial and marking it in flight are one step under the one lock, and a
+        // dial already in flight is never replaced, so two callers cannot both dial.
+        let started = {
+            let now = self.runtime.now();
+            let mut retry = self.retry();
+            let watched = retry.entry(peer_id).or_insert_with(Watched::unwatched);
+            if watched.dialing.is_some() {
+                None
+            } else {
+                watched.state.begin(now).map(|dial| {
+                    let token = watched.token;
+                    watched.token = watched.token.wrapping_add(1);
+                    watched.dialing = Some(token);
+                    watched.dial = dial;
+                    (dial, token)
+                })
+            }
+        };
+        let Some((_, token)) = started else {
+            return self.answer(&peer_id, None);
+        };
+        // Dropped however the future ends, so a dial nobody finished is given back and the
+        // next reader settles it. A dial that runs to its end gives the claim back with its
+        // outcome, in [`Self::fold`].
+        let dialing = Dialling {
+            connections: self,
+            peer: peer_id,
+            token,
+        };
+        let outcome = self.try_peer(endpoint, peer, None, Some(standing)).await;
+        let failure = match outcome {
+            // A dial that lost the tie-break to a connection the pair already holds carried
+            // nothing and is not a failure: the pair is connected.
+            Try::Kept { .. } => {
+                self.fold(&dialing, Recovery::adopted);
+                return self.answer(&peer_id, None);
+            }
+            Try::Dropped { address, cause } => ConnectFailure::NoDirectPath {
+                peer: *peer,
+                address,
+                cause: cause.to_owned(),
+            },
+            Try::Failed(failure) => failure,
+        };
+        // Read before the recovery map is taken: the connection map is not held while the
+        // recovery map is, so a reader of the state cannot wait behind a dial. `adopt` is the
+        // one place that holds both, and it takes the connection map first; nothing takes them
+        // in the other order, which is what keeps the pair of them from deadlocking. A
+        // connection that arrives in the instant between this read and the fold is not lost —
+        // its own adoption is what the pair holds — only this dial's count is spent.
+        let connected = self.live(&peer_id).is_some();
+        let now = self.runtime.now();
+        self.fold(&dialing, |state| {
+            if connected {
+                // The pair came up while this dial was being judged: nothing is counted
+                // against it.
+                state.adopted();
+            } else if matches!(failure, ConnectFailure::Nowhere { .. }) {
+                // Nowhere to dial is configuration, not a network state: it is the one stop a
+                // service path makes, and an address or a beacon re-opens it. A stop already
+                // on file is not replaced by it — a keeper that read the record knows more
+                // than this dial does, and the answer follows the state.
+                if !matches!(state, Recovery::Stopped { .. }) {
+                    state.stop(StopCause::Nowhere);
+                }
+            } else {
+                state.failed(now, failure.clone(), self.recheck);
+            }
+        });
+        self.answer(&peer_id, (!connected).then_some(failure))
+    }
+
+    /// Give a dial's claim back and fold its outcome into the policy, under one lock.
+    ///
+    /// One step, because a reader that found the state still [`Recovery::Dialling`] with the
+    /// claim gone would settle this call's dial as an abandoned one and lose the episode it
+    /// counted. The claim is this dial's own, so a dial that began after it cannot have its
+    /// own claim cleared here.
+    fn fold(&self, dialing: &Dialling<'_>, change: impl FnOnce(&mut Recovery)) {
+        let mut retry = self.retry();
+        let watched = retry.entry(dialing.peer).or_insert_with(Watched::unwatched);
+        if watched.dialing == Some(dialing.token) {
+            watched.dialing = None;
+        }
+        change(&mut watched.state);
+    }
+
+    /// The answer one call to the manager gives: the policy's state, and the failure this call
+    /// has to report — `None` when it has none, or when a connection arrived while the record was
+    /// being read or the dial was running.
+    ///
+    /// A stop always names its cause, whether this call wrote it or found it: a caller that
+    /// asked for one delivery is owed the reason, and the conversion from a cause to a failure
+    /// lives in the policy rather than in the layers above it.
+    ///
+    /// Nothing else is derived here. A call that only read the policy — a queue polling while
+    /// the pair waits out a gap — has met nothing and is answered nothing, rather than the
+    /// failure that earned the gap; a call that met something passes it, and a stop on file
+    /// still wins over it.
+    ///
+    /// [`Self::ensure`] has two arms that do not come through here: its deferral arm answers
+    /// [`Self::state_and_reason`], because the deferral is already in the state and the answer is
+    /// the state's own reason rather than a failure passed in; and a pair that already has a live
+    /// connection is answered [`Recovery::Connected`] with no failure before the record is read.
+    fn answer(
+        &self,
+        peer: &PeerId,
+        met: Option<ConnectFailure>,
+    ) -> (Recovery, Option<ConnectFailure>) {
+        if self.live(peer).is_some() {
+            return (Recovery::Connected, None);
+        }
+        let state = self.policy(peer);
+        // A stop is the standing answer whatever this call met on the way: a transient record
+        // fault does not replace the cause the pair stopped for, and a cause whose detail has
+        // moved on is still the stop the caller has to see.
+        let failure = match &state {
+            Recovery::Stopped { cause } => Some(cause.clone().failure(peer.fingerprint())),
+            _ => met,
+        };
+        (state, failure)
+    }
+
+    /// The pair's state, and the reason that state names for being down — `None` when it names
+    /// none: a dial in flight, or a pair already connected.
+    ///
+    /// The state a product reads is the truth, so a caller holding a deferrable fault answers this
+    /// reason rather than the fault: a pair whose last dial met a network failure keeps that
+    /// reason, and a deferral never stands in for it. A caller with nothing in hand — an ask whose
+    /// budget is spent — reads the same reason. The state comes back with it so a caller that
+    /// shows both reads it once and the two cannot disagree.
+    pub(crate) fn state_and_reason(&self, peer: &PeerId) -> (Recovery, Option<ConnectFailure>) {
+        let state = self.recovery(peer);
+        let answer = state.down(peer.fingerprint());
+        (state, answer)
+    }
+
+    /// Wait out a deferrable fault: one keeper round, which is the gap the policy named for the
+    /// next dial, and never past `deadline` when the caller has one, so a fault costs the person's
+    /// one budget no more than the rounds it took.
+    ///
+    /// The one way this crate waits for a record it could not read.
+    pub(crate) async fn deferral_pause(&self, deadline: Option<Instant>) {
+        let round = deadline.map_or(TRUST_POLL, |deadline| {
+            deadline.saturating_duration_since(self.runtime.now())
+        });
+        pause(self, round).await;
+    }
+
+    /// Watch one connection for a round: judge the peer's life and — for a connection the
+    /// pair has not yet judged — the settle window.
+    ///
+    /// Trust is not judged here: the keeper asks the record at the top of every round, and
+    /// this watches one connection between those reads.
+    ///
+    /// The round is [`TRUST_POLL`], cut short by the end of [`KEEPER_SETTLE`] so a fresh
+    /// connection is judged by the moment the window closes rather than up to a round after
+    /// it. A connection that has already been judged is watched for its close only: its
+    /// loss is a link failure and not a strike.
+    ///
+    /// A connection that closed before this round still reaches here, because the manager
+    /// keeps the entry of the last connection it adopted: a dial whose connection died
+    /// before the keeper looked is judged like any other, which is what bounds a peer that
+    /// accepts and drops.
+    async fn watch(
+        &self,
+        peer: &PeerId,
+        fingerprint: Fingerprint,
+        connection: &Connection,
+        watch: &Watch,
+    ) {
+        let now = self.runtime.now();
+        let judged = watch.judged.load(Ordering::SeqCst);
+        let settle = if judged {
+            Duration::ZERO
+        } else {
+            Self::settle_left(watch, now)
+        };
+        // A peer that has not answered for the whole bound is gone, and this machine's own
+        // pings are what would have made it answer; see [`Self::vanish_bound`].
+        if self.vanished(watch, now) {
+            connection.close(0u32.into(), VANISHED_CAUSE.as_bytes());
+            if !watch.judged.swap(true, Ordering::SeqCst) {
+                let now = self.runtime.now();
+                self.transition(*peer, |state| state.settled(now));
+            }
+            return;
+        }
+        if let Some(error) = connection.close_reason() {
+            self.judge(peer, fingerprint, connection, watch, &error, settle);
+            return;
+        }
+        let round = if settle.is_zero() {
+            TRUST_POLL
+        } else {
+            settle.min(TRUST_POLL)
+        };
+        let Some(error) = timeout(&*self.runtime, round, connection.closed()).await else {
+            // Still open: past the settle window the pair has plainly got to use it.
+            if settle.is_zero() && !watch.judged.swap(true, Ordering::SeqCst) {
+                let now = self.runtime.now();
+                self.transition(*peer, |state| state.settled(now));
+            }
+            return;
+        };
+        self.judge(peer, fingerprint, connection, watch, &error, settle);
+    }
+
+    /// Fold one connection's death into the pair's recovery.
+    ///
+    /// A connection the pair got use of, one lost to a peer that went quiet, and one that
+    /// had already outlived the settle window are all ordinary churn: the next dial is due
+    /// at once. Only a connection that ends before carrying anything, inside the window and
+    /// for a reason other than a timeout, is a strike — and a strike is one dial of the
+    /// episode like any other, so a peer that accepts and drops is bounded.
+    fn judge(
+        &self,
+        peer: &PeerId,
+        fingerprint: Fingerprint,
+        connection: &Connection,
+        watch: &Watch,
+        error: &ConnectionError,
+        settle: Duration,
+    ) {
+        // Whoever judges first writes the outcome. A second caller — the keeper's round and
+        // a reader settling the same dial — must not overwrite it: settling twice would
+        // reset the episode the first judgement counted.
+        if watch.judged.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let now = self.runtime.now();
+        if carried(connection, watch)
+            || matches!(error, ConnectionError::TimedOut)
+            || settle.is_zero()
+        {
+            self.transition(*peer, |state| state.settled(now));
+            return;
+        }
+        // Counted even when the pair holds another connection by now: a dial that produced
+        // a connection which died at once is the accept-and-drop signature, and a second
+        // dialer that happened to win the race does not make it a pair that works. A dial
+        // that fails outright is the other way round — see [`Self::ensure`] — because a
+        // pair that is connected has nothing to recover from.
+        self.transition(*peer, |state| {
+            state.failed(
+                now,
+                ConnectFailure::NoDirectPath {
+                    peer: fingerprint,
+                    address: connection.remote_address(),
+                    cause: close_cause(error),
+                },
+                self.recheck,
+            );
+        });
+    }
+
+    /// How much of [`KEEPER_SETTLE`] is left for a connection adopted at `watch.adopted`.
+    fn settle_left(watch: &Watch, now: Instant) -> Duration {
+        KEEPER_SETTLE.saturating_sub(now.saturating_duration_since(watch.adopted))
+    }
+
+    /// Judge `connection` if it has closed and nobody has judged it yet.
+    ///
+    /// A connection that died before the keeper looked must not escape the settle window: the
+    /// window is measured from its adoption to the moment somebody looks, so a connection that
+    /// died inside it and is judged later is settled rather than counted. A keeper looks at
+    /// least every [`TRUST_POLL`], which is shorter than the window, so a connection it dialled
+    /// is judged inside it; a caller with no keeper has no episode to count, and a connection
+    /// it dialled is not a dial the policy made. A connection this machine dropped itself —
+    /// losing a tie-break, a withdrawal — is not judged here: that is not a dial that failed.
+    fn judge_dead(&self, peer: &PeerId, connection: &Connection, watch: &Watch) {
+        if watch.judged.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(error) = connection.close_reason() else {
+            return;
+        };
+        let now = self.runtime.now();
+        let settle = Self::settle_left(watch, now);
+        self.judge(peer, peer.fingerprint(), connection, watch, &error, settle);
+    }
+
+    /// Fold a dial whose caller went away before anybody judged it into the policy.
+    ///
+    /// The keeper judges a connection when it watches it, but a caller that dials without a
+    /// keeper — a service, an action, a keeper whose own task was cancelled — has nobody to do
+    /// that, and a dial nobody finished must not leave the pair reading "dialling" for ever. So
+    /// the next reader settles it: the dead connection is judged as the keeper would have judged
+    /// it, which may leave a wait or a used-up episode behind because that is what the dial
+    /// produced, and a state the judgement did not move is given back as the policy's next wait
+    /// when a keeper will act on it and as [`Recovery::Unwatched`] when none will, because a
+    /// pair nothing watches must not promise a retry.
+    fn settle_stale(&self, peer: &PeerId) {
+        // The recovery map is read and released before the connection map is taken: `adopt`
+        // holds the connection map while it takes the recovery one, and taking them in the
+        // other order here would deadlock the pair.
+        let keeper = {
+            let retry = self.retry();
+            match retry.get(peer) {
+                Some(watched)
+                    if watched.dialing.is_none()
+                        && matches!(watched.state, Recovery::Dialling { .. }) =>
+                {
+                    watched.keepers > 0
+                }
+                _ => return,
+            }
+        };
+        // One look at the connection map: a live connection means the dial is not over, and a
+        // closed one is what the dial left behind.
+        let dead = {
+            let pairs = self.pairs();
+            match pairs.get(peer) {
+                None => None,
+                Some(live) => match live.connection.close_reason() {
+                    None => return,
+                    Some(_) => Some((live.connection.clone(), Arc::clone(&live.watch))),
+                },
+            }
+        };
+        if let Some((connection, watch)) = dead {
+            self.judge_dead(peer, &connection, &watch);
+        }
+        // Whether or not there was a connection to judge — it may have been judged already —
+        // the state must stop claiming a dial. A state the judgement already moved is left
+        // alone: a connection that died after its dial is a strike the policy counted, not an
+        // abandoned dial.
+        let now = self.runtime.now();
+        let mut retry = self.retry();
+        if let Some(watched) = retry.get_mut(peer)
+            && watched.dialing.is_none()
+            && matches!(watched.state, Recovery::Dialling { .. })
+        {
+            if keeper {
+                watched.state.settled(now);
+            } else {
+                watched.state = Recovery::Unwatched;
+            }
+        }
+    }
+
+    /// Fold one change into `peer`'s recovery state, recording a state for a pair that has none.
+    fn transition(&self, peer: PeerId, change: impl FnOnce(&mut Recovery)) {
+        let mut retry = self.retry();
+        change(&mut retry.entry(peer).or_insert_with(Watched::unwatched).state);
+    }
+
+    /// The address the record remembers for `peer`, if it remembers one.
+    fn remembered(&self, peer: &PeerId) -> Option<SocketAddr> {
+        self.store
+            .get(peer)
+            .and_then(|record| record.last_address())
+    }
+
+    /// Whether this machine has anywhere to dial `peer`: a beacon that could look it up, or an
+    /// address the record remembers. One predicate, because the keeper's check before a dial
+    /// and [`Self::ensure`]'s answer for a stopped pair must not disagree about the one stop a
+    /// service path writes.
+    fn somewhere_to_dial(&self, peer: &PeerId) -> bool {
+        self.beacon.is_some() || self.remembered(peer).is_some()
+    }
+
+    /// What one read of `peer`'s record means for this machine's trust, from the record on disk.
+    ///
+    /// The one place the crate decides what a record read means: a dial, an accepted connection,
+    /// a keeper's round and the action layer all ask here, so they cannot disagree about it. It
+    /// costs one small read. A fault that may pass is folded into the pair's state once, here, so
+    /// the answer and the readable state cannot disagree.
+    ///
+    /// A record this build must not trust — insecure, malformed, or too large — is answered with
+    /// the read's own refusal: the manager fails closed, the cause points a person at the record
+    /// rather than at a pairing that was never made, and the pair's recovery stops.
+    ///
+    /// A fault that may pass is the other answer. A read the operating system refused this
+    /// instant still trusts nothing — nothing is trusted on a file nobody could read — but it is
+    /// this machine's fault and not the peer's, so it is deferred rather than counted, and a live
+    /// connection stays up.
+    pub(crate) fn standing(&self, peer: &PeerId) -> RecordRead {
         let limits = self.store.limits();
         let record = match self.store.reread(peer) {
             Ok(record) => record,
-            Err(error) => {
-                return Err(NotTrustedCause::Unreadable {
-                    detail: error.to_string(),
-                });
+            Err(error) if error.deferrable() => {
+                let detail = error.to_string();
+                let now = self.runtime.now();
+                let failure = ConnectFailure::Deferred {
+                    peer: peer.fingerprint(),
+                    detail: detail.clone(),
+                };
+                self.transition(*peer, |state| state.deferred(now, failure));
+                return RecordRead::Deferred { detail };
             }
+            Err(error) => return RecordRead::Unreadable(error),
         };
-        match record {
-            Some(record) if record.trusted(&limits) => Ok(()),
-            Some(record) if record.is_withdrawn() => Err(NotTrustedCause::Withdrawn),
-            Some(record) if record.is_closed(&limits) => Err(NotTrustedCause::Closed),
-            _ => Err(NotTrustedCause::NoRecord),
+        let Some(record) = record else {
+            return RecordRead::Refused(NotTrustedCause::NoRecord);
+        };
+        // One predicate decides whether the record is trust and, when it is not, which of the
+        // three reasons it is: a fourth reason becomes a compile error here rather than falling
+        // into "no record".
+        match record.untrusted(&limits) {
+            None => RecordRead::Trusted(record),
+            Some(Untrusted::Withdrawn(_)) => RecordRead::Refused(NotTrustedCause::Withdrawn),
+            Some(Untrusted::Closed(_)) => RecordRead::Refused(NotTrustedCause::Closed),
+            Some(Untrusted::NotPaired(_)) => RecordRead::Refused(NotTrustedCause::NoRecord),
         }
     }
 
@@ -928,6 +1979,65 @@ impl Connections {
     /// the write, and the task it runs on, are the module's "Accepting" note.
     fn note_address(&self, peer: &PeerId, address: SocketAddr) {
         let _ = self.store.record_address(peer, address);
+    }
+
+    /// Start the manager's liveness reader, once per manager, and only when this machine has a
+    /// keep-alive: without one nothing this machine sends would make a silent peer answer, so
+    /// the reading is never asked for.
+    ///
+    /// Started on the first adoption rather than in [`Self::new`], so a manager that never gets a
+    /// connection never runs a reader with nothing to sample. The reader holds the connection
+    /// map weakly, so it ends when the manager is dropped — the moment nothing can ask it again.
+    /// Every pass is stamped in [`Self::reader_heard`]'s record, including a pass with no
+    /// connections, because a running reader is what makes the bound a reading rather than a
+    /// promise.
+    fn start_liveness(&self) {
+        if self.keep_alive.is_none() {
+            return;
+        }
+        {
+            let mut reader = self
+                .reader
+                .lock()
+                .expect("the reader state is not poisoned");
+            if reader.started {
+                return;
+            }
+            reader.started = true;
+        }
+        let pairs = Arc::downgrade(&self.pairs);
+        let reader = Arc::clone(&self.reader);
+        let runtime = Arc::clone(&self.runtime);
+        let polled = Arc::clone(&runtime);
+        runtime.spawn(Box::pin(async move {
+            loop {
+                sleep(&*polled, LIVENESS_POLL).await;
+                let Some(pairs) = pairs.upgrade() else {
+                    return;
+                };
+                let now = polled.now();
+                // The map is held only to take a copy: sampling happens outside it, so a
+                // second of reading never stands between a caller and `live` or `traffic`.
+                let sampling: Vec<(Connection, Arc<Watch>)> = {
+                    let pairs = pairs.lock().expect("the connection map is not poisoned");
+                    pairs
+                        .values()
+                        .map(|live| (live.connection.clone(), Arc::clone(&live.watch)))
+                        .collect()
+                };
+                for (connection, watch) in sampling {
+                    watch
+                        .life
+                        .lock()
+                        .expect("the life count is not poisoned")
+                        .sample(&connection, now);
+                }
+                reader
+                    .lock()
+                    .expect("the reader state is not poisoned")
+                    .pass = Some(now);
+            }
+        }));
     }
 
     /// Run this machine's half of the binding exchange on a kept connection, on its
@@ -982,38 +2092,45 @@ impl Connections {
     /// plan's reconnection, not a new acquaintance — and a withdrawn trust closes what
     /// is live as well as refusing what comes next. Answers whether there was a live
     /// connection to close.
+    ///
+    /// The connection stays in the manager's map as the last one it adopted, closed, so
+    /// the keeper judges its loss like any other: a connection closed this way before it
+    /// carried anything is one dial of the pair's recovery, and one that had carried
+    /// something ends the run of dials.
     pub fn disconnect(&self, peer: &PeerId) -> bool {
-        let mut pairs = self.pairs();
-        match pairs.remove(peer) {
-            Some(live) => {
-                live.connection
-                    .close(0u32.into(), RECONNECT_CAUSE.as_bytes());
-                true
-            }
-            None => false,
-        }
+        let pairs = self.pairs();
+        // A connection that has already closed is not one there is to close, which is what
+        // the answer promises.
+        let Some(live) = open(&pairs, peer) else {
+            return false;
+        };
+        live.connection
+            .close(0u32.into(), RECONNECT_CAUSE.as_bytes());
+        true
     }
 
-    /// Dial one address and prove the handshake is the peer this machine asked
-    /// for.
-    async fn dial(
+    /// Try one address and prove the handshake is the peer this machine asked for.
+    ///
+    /// One *dial* is [`Self::try_peer`], which may try several addresses; this is the one
+    /// address inside it, and its error is [`AddressError`] for that reason.
+    async fn try_address(
         &self,
         endpoint: &Endpoint,
         address: SocketAddr,
         peer: &Fingerprint,
-    ) -> Result<Connection, DialError> {
+    ) -> Result<Connection, AddressError> {
         let connecting = endpoint
             .connect(address, SERVER_NAME)
-            .map_err(|error| DialError::Dial(error.to_string()))?;
+            .map_err(|error| AddressError::Open(error.to_string()))?;
         let connection = match timeout(&*self.runtime, DEFAULT_CONNECT_BUDGET, connecting).await {
             Some(Ok(connection)) => connection,
-            Some(Err(error)) => return Err(DialError::Handshake(error.to_string())),
-            None => return Err(DialError::TimedOut),
+            Some(Err(error)) => return Err(AddressError::Handshake(error.to_string())),
+            None => return Err(AddressError::TimedOut),
         };
-        let presented = presented(&connection).ok_or(DialError::NoIdentity)?;
+        let presented = presented(&connection).ok_or(AddressError::NoIdentity)?;
         if presented != *peer {
             connection.close(0u32.into(), b"not the peer this machine asked for");
-            return Err(DialError::WrongPeer {
+            return Err(AddressError::WrongPeer {
                 expected: *peer,
                 presented,
             });
@@ -1023,14 +2140,27 @@ impl Connections {
 
     /// Keep one connection for the pair, by the rule the module states.
     ///
-    /// The answer is the pair's connection and `kept_this`: whether the connection
-    /// this call passed in is the one kept.
+    /// The answer is the connection the pair kept and whether it is the one this call
+    /// passed in.
+    ///
+    /// One thing outranks the rule: a connection that has shown no sign of life for this
+    /// machine's liveness bound — [`VANISH_BOUND`], or twice the keep-alive when that is
+    /// slower, exactly as the keeper's round applies it — is not a candidate beside a fresh
+    /// one. A connection whose peer has vanished looks alive until the transport declares it
+    /// dead, and the rule — which reads only who started what — would otherwise keep it and
+    /// close a connection that works. The test reads the datagrams the peer has already
+    /// sent, sampled by the manager's own reader, as the module's note on liveness requires.
+    /// It needs a keep-alive to mean anything — without one nothing this machine sends makes
+    /// a silent peer answer — and is applied only when this machine has one, exactly as the
+    /// keeper's round applies it.
     fn adopt(
         &self,
         peer: PeerId,
         connection: Connection,
         started_by: Started,
     ) -> Result<(Connection, bool, Arc<Watch>), &'static str> {
+        self.start_liveness();
+        let now = self.runtime.now();
         let preferred = if self.me < peer {
             Started::Here
         } else {
@@ -1038,12 +2168,20 @@ impl Connections {
         };
         let mut pairs = self.pairs();
         let Some(existing) = pairs.remove(&peer) else {
-            let live = Live::new(connection, started_by);
+            let live = Live::new(connection, started_by, now);
             let answer = (live.connection.clone(), true, live.watch.clone());
             pairs.insert(peer, live);
             return Ok(answer);
         };
-        let keep_new = if existing.connection.close_reason().is_some() {
+        // A connection that died before the keeper looked is judged here, before its entry
+        // is replaced: a dial whose connection died must not escape the settle window just
+        // because another dial finished first. A connection this call is about to drop
+        // because the rule prefers the new one is not judged — losing the tie-break is not
+        // a failure of the pair.
+        self.judge_dead(&peer, &existing.connection, &existing.watch);
+        let gone =
+            existing.connection.close_reason().is_some() || self.vanished(&existing.watch, now);
+        let keep_new = if gone {
             true
         } else if started_by != existing.started_by {
             started_by == preferred
@@ -1057,13 +2195,18 @@ impl Connections {
             return Err(TIE_BREAK_CAUSE);
         };
         let (kept, dropped) = if keep_new {
-            (Live::new(connection, started_by), existing)
+            (Live::new(connection, started_by, now), existing)
         } else {
-            (existing, Live::new(connection, started_by))
+            (existing, Live::new(connection, started_by, now))
         };
-        dropped
-            .connection
-            .close(0u32.into(), SUPERSEDED_CAUSE.as_bytes());
+        // A connection that has already closed keeps the reason it ended with: closing it
+        // through the handle would rewrite that reason as a local close, and the keeper may not
+        // have judged it yet.
+        if dropped.connection.close_reason().is_none() {
+            dropped
+                .connection
+                .close(0u32.into(), SUPERSEDED_CAUSE.as_bytes());
+        }
         if kept.connection.close_reason().is_some() {
             return Err(ADOPTION_LOST_CAUSE);
         }
@@ -1076,6 +2219,157 @@ impl Connections {
         self.pairs
             .lock()
             .expect("the connection map is not poisoned")
+    }
+
+    fn retry(&self) -> MutexGuard<'_, BTreeMap<PeerId, Watched>> {
+        self.retry.lock().expect("the recovery map is not poisoned")
+    }
+}
+
+/// One pair's recovery state, and what the manager knows about the dials around it.
+///
+/// `dialing` is what tells a state of [`Recovery::Dialling`] that means "a dial is running"
+/// from one that means "a dial nobody finished": only the second is settled by the next
+/// reader. It is a token rather than a flag because a dial gives its claim back with its
+/// outcome in [`Connections::fold`] and its guard is dropped afterwards: a dial that begins
+/// in that instant — nothing forbids it once the claim is gone — must not have its own claim
+/// cleared by the older dial's end. It lives beside the state under the one lock so the two
+/// cannot disagree.
+struct Watched {
+    state: Recovery,
+    /// The dial in flight for this pair, if there is one, by its token.
+    dialing: Option<u64>,
+    /// Which dial of the episode is in flight; only meaningful while `dialing` is `Some`.
+    dial: u32,
+    /// The token the next dial takes; never reused.
+    token: u64,
+    /// How many keepers are running for the pair. A wait nobody watches is not a retry, and a
+    /// caller may run the keeper more than once, so this counts rather than flags.
+    keepers: usize,
+    /// When a stop's cause was last asked about; see [`Connections::stop_due`].
+    checked: Option<Instant>,
+}
+
+impl Watched {
+    /// A pair nothing has happened to yet.
+    fn unwatched() -> Self {
+        Self {
+            state: Recovery::Unwatched,
+            dialing: None,
+            dial: 0,
+            token: 0,
+            keepers: 0,
+            checked: None,
+        }
+    }
+
+    /// What the policy says about the pair, with a dial in flight reported as dialling.
+    ///
+    /// A stop is a decision and outranks a dial in flight: a service path's dial can end in
+    /// one, and the stop is the answer from then on.
+    fn report(&self) -> Recovery {
+        // `Unwatched` cannot hold a claim: a fresh entry has none, `begin` replaces the state
+        // with `Dialling` when it takes one, and the only writer of `Unwatched` is the
+        // abandoned-dial settlement, which runs with the claim already given back.
+        if self.dialing.is_some()
+            && matches!(
+                self.state,
+                Recovery::Waiting { .. } | Recovery::Exhausted { .. }
+            )
+        {
+            return Recovery::Dialling { dial: self.dial };
+        }
+        self.state.clone()
+    }
+
+    /// Whether a stopped pair's cause is due to be asked about again: at most once a round, so
+    /// a queue calling [`Connections::ensure`] every second does not cost a record read a
+    /// second.
+    fn stop_due(&mut self, now: Instant) -> bool {
+        if let Some(checked) = self.checked
+            && now.saturating_duration_since(checked) < TRUST_POLL
+        {
+            return false;
+        }
+        self.checked = Some(now);
+        true
+    }
+}
+
+/// One dial in flight, given back however its future ends.
+///
+/// A dial lives across awaits — a handshake, a beacon lookup — and the caller's task can be
+/// dropped at any of them: a service that stops, a keeper's task cancelled, a caller's own
+/// budget spent. Clearing the claim is what lets the next reader give the pair its next dial
+/// instead of leaving it marked as dialling for ever. The token is this dial's own, so a dial
+/// that begins after this one has been given its wait cannot have its claim cleared by the
+/// older dial's end.
+struct Dialling<'a> {
+    connections: &'a Connections,
+    peer: PeerId,
+    token: u64,
+}
+
+impl Drop for Dialling<'_> {
+    fn drop(&mut self) {
+        let mut retry = self.connections.retry();
+        if let Some(watched) = retry.get_mut(&self.peer)
+            && watched.dialing == Some(self.token)
+        {
+            watched.dialing = None;
+        }
+    }
+}
+
+/// One keeper's hold on a pair: a state that says a dial is coming is one somebody will make
+/// for as long as this exists, and no longer.
+///
+/// Dropping the keeper — a caller's task cancelled — must stop the pair claiming a retry, so
+/// the count is given back however the future ends. It is a count because a caller may run the
+/// keeper for one pair more than once; the pair is watched while any of them lives.
+struct Kept<'a> {
+    connections: &'a Connections,
+    peer: PeerId,
+}
+
+impl Kept<'_> {
+    /// Take a keeper's place for `peer`, starting a fresh episode if this is the pair's first
+    /// keeper.
+    ///
+    /// A caller that runs the keeper again is a person's answer to whatever stopped the last
+    /// one, so what stopped it is re-derived from the record and the configuration on the
+    /// first round rather than remembered. A second keeper for a pair already watched is not
+    /// that answer: it must not reset an episode a peer that keeps dropping a connection is
+    /// spending.
+    fn new(connections: &Connections, peer: PeerId, now: Instant) -> Kept<'_> {
+        let mut retry = connections.retry();
+        let watched = retry.entry(peer).or_insert_with(Watched::unwatched);
+        if watched.keepers == 0 {
+            watched.state.restarted(now);
+            watched.checked = None;
+        }
+        watched.keepers = watched.keepers.saturating_add(1);
+        Kept { connections, peer }
+    }
+}
+
+impl Drop for Kept<'_> {
+    fn drop(&mut self) {
+        if let Some(watched) = self.connections.retry().get_mut(&self.peer) {
+            watched.keepers = watched.keepers.saturating_sub(1);
+        }
+    }
+}
+
+/// One incoming connection's place in [`ACCEPT_IN_FLIGHT`], given back however its task ends.
+///
+/// A plain decrement at the end of the task would leak a place when the task is aborted —
+/// a runtime shutting down — and enough leaks would stop the accept loop for good.
+struct InFlight(Arc<Connections>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -1130,8 +2424,9 @@ fn carried(connection: &Connection, watch: &Watch) -> bool {
 /// One text per cause, and the same text wherever the manager closes: an accepted
 /// connection and a live one the keeper stops both say why they are closed. The texts
 /// are generic because they travel to the peer — which file, and which fault, is this
-/// machine's business and is in the [`NotTrustedCause`] the caller is given.
-fn refusal_text(cause: &NotTrustedCause) -> &'static [u8] {
+/// machine's business and is in the [`NotTrustedCause`] the caller is given. A deferral is
+/// not a cause: it is closed with [`DEFERRED_CAUSE`], which says what this machine met.
+fn cause_text(cause: &NotTrustedCause) -> &'static [u8] {
     match cause {
         NotTrustedCause::Withdrawn => NOT_TRUSTED_CAUSE.as_bytes(),
         NotTrustedCause::Closed => b"the pair is closed on this machine until a person clears it",
@@ -1143,8 +2438,8 @@ fn refusal_text(cause: &NotTrustedCause) -> &'static [u8] {
 /// What ended a connection, in words a person reads.
 ///
 /// The class is not a decision — the keeper counts any connection that ended before
-/// it carried anything and inside [`KEEPER_SETTLE`] — it is the detail that explains
-/// why the keeper stopped.
+/// it carried anything and inside [`KEEPER_SETTLE`], whatever ended it, and a timeout
+/// is not counted at all — it is the detail that says what happened to it.
 fn close_cause(error: &ConnectionError) -> String {
     match error {
         ConnectionError::ApplicationClosed(_) | ConnectionError::ConnectionClosed(_) => {
@@ -1197,11 +2492,23 @@ const RECONNECT_CAUSE: &str = "the pair is reconnecting";
 /// pair.
 const NOT_TRUSTED_CAUSE: &str = "this machine's trust in the pair is withdrawn";
 
+/// What a connection is closed with when this machine could not read the peer's record just
+/// now.
+///
+/// Not a refusal: the peer that sees it counts a dial of its own, which is the fault's cost and
+/// passes with the fault.
+const DEFERRED_CAUSE: &str = "this machine could not read the peer's record just now";
+
+/// What the keeper closes a connection with when the peer has stopped answering for this
+/// machine's liveness bound — see [`Connections::vanish_bound`]: the pair will dial again,
+/// and the far side learns why.
+const VANISHED_CAUSE: &str = "the peer stopped answering";
+
 /// The cause of a failed beacon leg, naming the addresses tried before it.
 ///
 /// The four failures are classes; this is the detail a reader acts on, so a
 /// remembered address that did not answer is named rather than folded away.
-fn cause(tried: &[(SocketAddr, DialError)], detail: &str) -> String {
+fn cause(tried: &[(SocketAddr, AddressError)], detail: &str) -> String {
     if tried.is_empty() {
         return detail.to_owned();
     }
@@ -1213,55 +2520,11 @@ fn cause(tried: &[(SocketAddr, DialError)], detail: &str) -> String {
     text
 }
 
-/// Why the pair could not be connected.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ConnectFailure {
-    /// The beacon leg failed: no beacon is configured, the beacon did not answer,
-    /// or it refused the lookup. `cause` names which, and the remembered addresses
-    /// that did not answer before it, because the four failures are classes and the
-    /// cause is the detail a reader acts on.
-    BeaconUnreachable { peer: Fingerprint, cause: String },
-    /// The beacon has no address for the peer: it is not registered. `cause` names
-    /// the addresses tried before the beacon, because the remembered dial's detail
-    /// is what a reader acts on.
-    PeerUnknown { peer: Fingerprint, cause: String },
-    /// The peer's address is known and no connection could be made — or a dial's
-    /// handshake completed but the tie-break dropped it while the pair held nothing.
-    /// `cause` is diagnostic: the text may have been written by the far side, or name
-    /// the tie-break that dropped the dial.
-    NoDirectPath {
-        peer: Fingerprint,
-        address: SocketAddr,
-        cause: String,
-    },
-    /// This machine does not trust the peer. Decided locally and only locally;
-    /// `cause` names the local state it is.
-    NotTrusted {
-        peer: Fingerprint,
-        cause: NotTrustedCause,
-    },
-}
-
-/// Why this machine does not trust a peer: no record at all, a pair its person closed
-/// after repeated failed comparisons, a trust its person withdrew, or a record that is
-/// there and cannot be read.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum NotTrustedCause {
-    /// No record says a person paired this machine with the peer.
-    NoRecord,
-    /// The pair is closed on this machine until a person clears it.
-    Closed,
-    /// A person withdrew this machine's trust in the peer; a person must restore it.
-    Withdrawn,
-    /// The peer's record is there and could not be read: unreadable, reachable by
-    /// another account, or not a record this build can read. Distinct from
-    /// [`Self::NoRecord`], because the file a person must look at is the one that is
-    /// there and not a pairing that was never made. `detail` is the record's own
-    /// refusal, which names the file and, where one command repairs it, the command.
-    Unreadable { detail: String },
-}
-
 /// Why a connection manager could not be built.
+///
+/// Non-exhaustive: a new refusal is a new answer, and a product compiled against an earlier
+/// version must still build.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ManagerError {
     /// The transport's idle timeout is not longer than [`KEEPER_SETTLE`]; the
@@ -1284,8 +2547,8 @@ pub enum ManagerError {
     },
 }
 
-/// What both refusals say about their reach: they read this machine's transport,
-/// while over the wire the effective timeout is the smaller of the two machines'.
+/// What both refusals say about their reach: they read this machine's transport, while over
+/// the wire the effective timeout is the smaller of the two machines'.
 const LOCAL_TRANSPORT_ONLY: &str = concat!(
     "; the check reads this machine's transport only, while over the wire the ",
     "effective timeout is the smaller of the two machines'",
@@ -1314,92 +2577,13 @@ impl fmt::Display for ManagerError {
 
 impl std::error::Error for ManagerError {}
 
-/// Why a keeper stopped.
-///
-/// Either way the keeper is finished: this machine's next start or a person starts
-/// it again. A fresh address for the peer does not start a keeper; it is handed to
-/// [`Connections::connect_with`], which makes one dial.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Keeper {
-    /// An attempt failed with one of the four failures while the pair held no
-    /// connection. Not necessarily a dial: "not trusted" is decided before an address
-    /// is chosen.
-    Failed(ConnectFailure),
-    /// The run of dials that carried nothing reached [`KEEPER_UNSTABLE_LIMIT`], so
-    /// the keeper stopped instead of handshaking in a loop. `cause` says what ended
-    /// the last connection, or which tie-break dropped it.
-    Unstable { peer: Fingerprint, cause: String },
-}
-
-impl fmt::Display for Keeper {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Failed(failure) => write!(f, "this machine stopped trying: {failure}"),
-            Self::Unstable { peer, cause } => write!(
-                f,
-                "this machine stopped trying {peer} after {KEEPER_UNSTABLE_LIMIT} dials in a row \
-                 produced a connection that ended before the pair carried anything ({cause})"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for Keeper {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Failed(failure) => Some(failure),
-            Self::Unstable { .. } => None,
-        }
-    }
-}
-
-impl fmt::Display for ConnectFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::BeaconUnreachable { peer, cause } => {
-                write!(
-                    f,
-                    "the beacon is not available, so {peer} cannot be looked up: {cause}"
-                )
-            }
-            Self::PeerUnknown { peer, cause } => {
-                write!(f, "the beacon does not know {peer}: {cause}")
-            }
-            Self::NoDirectPath {
-                peer,
-                address,
-                cause,
-            } => write!(f, "no direct path to {peer} at {address}: {cause}"),
-            Self::NotTrusted { peer, cause } => match cause {
-                NotTrustedCause::NoRecord => write!(
-                    f,
-                    "{peer} is not trusted: no record says a person paired this machine with it"
-                ),
-                NotTrustedCause::Closed => write!(
-                    f,
-                    "{peer} is not trusted: the pair is closed on this machine until a person clears it"
-                ),
-                NotTrustedCause::Withdrawn => write!(
-                    f,
-                    "{peer} is not trusted: a person withdrew this machine's trust in it"
-                ),
-                NotTrustedCause::Unreadable { detail } => write!(
-                    f,
-                    "{peer} is not trusted: its record cannot be read — {detail}"
-                ),
-            },
-        }
-    }
-}
-
-impl std::error::Error for ConnectFailure {}
-
-/// Why one dial failed. Never reported outward as-is: [`Connections::connect`]
-/// folds it into one of the three failures a dial can decide — a dial is never
-/// `NotTrusted`, which is decided before an address is chosen.
+/// Why one address did not become the pair's connection. Never reported outward as-is:
+/// [`Connections::connect`] folds it into one of the three failures a dial can decide — a
+/// dial is never `NotTrusted`, which is decided before an address is chosen. The word *dial*
+/// is the pair's, one whole try; this is one of the addresses inside it.
 #[derive(Clone, Debug)]
-enum DialError {
-    Dial(String),
+enum AddressError {
+    Open(String),
     Handshake(String),
     TimedOut,
     NoIdentity,
@@ -1409,10 +2593,10 @@ enum DialError {
     },
 }
 
-impl fmt::Display for DialError {
+impl fmt::Display for AddressError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Dial(error) => write!(f, "cannot dial: {error}"),
+            Self::Open(error) => write!(f, "the connection could not be opened: {error}"),
             Self::Handshake(error) => write!(f, "handshake: {error}"),
             Self::TimedOut => f.write_str("no handshake within the connect budget"),
             Self::NoIdentity => f.write_str("the handshake proved no key"),

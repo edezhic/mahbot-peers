@@ -20,9 +20,9 @@ use std::time::Duration;
 use mahbot_peers::identity::PeerId;
 use mahbot_peers::peer::access::MAX_LABEL_BYTES;
 use mahbot_peers::peer::{
-    Account, Binding, Capability, ConnectFailure, Connections, Fact, FactError, Instance, Keeper,
-    Label, LabelError, NoFloor, NotTrustedCause, Pair, Question, RecordError, Refusal, Speaker,
-    Timestamp,
+    Account, Binding, Capability, ConnectFailure, Connections, Fact, FactError, Instance, Label,
+    LabelError, NoFloor, NotTrustedCause, Pair, Question, RECOVERY_DIALS, RecordError, Recovery,
+    Refusal, Speaker, StopCause, Timestamp,
 };
 use mahbot_peers::tls::PeerPolicy;
 
@@ -363,8 +363,9 @@ pub(crate) fn a_malformed_fact_changes_nothing() -> Result<(), String> {
     })
 }
 
-/// A connection that only exchanged its binding carried nothing, so the keeper counts
-/// it as a dial that carried nothing and stops instead of re-dialling for ever.
+/// A connection that only exchanged its binding carried nothing, so the keeper counts it
+/// as a dial that carried nothing: the episode is used up instead of re-dialling for ever,
+/// and the pair is still being watched rather than given up on.
 pub(crate) fn a_binding_only_connection_carried_nothing() -> Result<(), String> {
     block_on(async {
         let sim = Sim::new().map_err(io_error)?;
@@ -383,7 +384,15 @@ pub(crate) fn a_binding_only_connection_carried_nothing() -> Result<(), String> 
         let mut measured = false;
         within(&sim, Duration::from_secs(600), async {
             loop {
-                if keeper.is_finished() {
+                // The episode is used up when the dials that carried nothing reach the cap:
+                // that is what bounds a peer that accepts and drops, and it is what this case
+                // waits for now that the keeper no longer ends.
+                if keeper.is_finished()
+                    || matches!(
+                        managed_laptop.connections.recovery(&main.peer_id()),
+                        Recovery::Exhausted { .. }
+                    )
+                {
                     return Ok::<(), String>(());
                 }
                 if let Some(live) = managed_laptop.connections.live(&main.peer_id()) {
@@ -418,18 +427,29 @@ pub(crate) fn a_binding_only_connection_carried_nothing() -> Result<(), String> 
             }
         })
         .await??;
-        let end = keeper
-            .await
-            .map_err(|error| format!("the keeper's task did not finish: {error}"))?;
-        match &end {
-            Keeper::Unstable { peer, .. } if *peer == main.fingerprint() => {}
-            other => {
-                return Err(format!(
-                    "the keeper ended `{other}`, not unstable after connections that carried \
-                     nothing"
-                ));
-            }
+        // The dials carried nothing, so the pair's episode is used up — and the keeper is
+        // still running, because a peer that might stop dropping it is not given up on.
+        if keeper.is_finished() {
+            return Err("the keeper stopped after connections that carried nothing".to_owned());
         }
+        let state = managed_laptop.connections.recovery(&main.peer_id());
+        let Recovery::Exhausted { dials, last, .. } = &state else {
+            return Err(format!(
+                "the pair reads `{state}`, not an episode used up after connections that carried \
+                 nothing"
+            ));
+        };
+        if *dials != RECOVERY_DIALS {
+            return Err(format!(
+                "the episode was used up after {dials} dials, not {RECOVERY_DIALS}"
+            ));
+        }
+        if !matches!(last, ConnectFailure::NoDirectPath { .. }) {
+            return Err(format!(
+                "the used-up episode names `{last}`, not the connection that carried nothing"
+            ));
+        }
+        keeper.abort();
         // The exchange really ran: the laptop holds the fact the deciding machine sent.
         let claim = wait_claim(&sim, &claims, &main.peer_id(), None).await?;
         if claim.fact().assistant() != &admin {
@@ -507,10 +527,7 @@ pub(crate) fn a_withdrawn_machine_is_not_reached() -> Result<(), String> {
             return Err("the withdrawn pair still has a live connection".to_owned());
         }
         match &end {
-            Keeper::Failed(ConnectFailure::NotTrusted {
-                cause: NotTrustedCause::Withdrawn,
-                ..
-            }) => {}
+            StopCause::NotTrusted(NotTrustedCause::Withdrawn) => {}
             other => {
                 return Err(format!(
                     "the keeper ended `{other}`, not a refusal naming the withdrawal"
@@ -602,10 +619,7 @@ pub(crate) fn a_withdrawal_is_seen_by_another_store() -> Result<(), String> {
             .await?
             .map_err(|error| format!("the keeper's task did not finish: {error}"))?;
         match &end {
-            Keeper::Failed(ConnectFailure::NotTrusted {
-                cause: NotTrustedCause::Withdrawn,
-                ..
-            }) => {}
+            StopCause::NotTrusted(NotTrustedCause::Withdrawn) => {}
             other => {
                 return Err(format!(
                     "the keeper ended `{other}`, not a refusal naming the withdrawal"

@@ -26,7 +26,7 @@
 //!
 //! # No queue, and no automatic retry
 //!
-//! An action is attempted on the live connection and nowhere else. There is no sender-side
+//! An action runs on the live connection and nowhere else. There is no sender-side
 //! queue, no retention and no store-and-forward, because holding an action until a connection
 //! appears is a retry wearing another name. If the pair is not connected when a person asks,
 //! [`Actions::request`] dials — the plan allows exactly that — and if the dial fails the caller
@@ -155,9 +155,10 @@ use crate::peer::EXCHANGE_BUDGET;
 use crate::peer::FramingFault;
 use crate::peer::access::Pair;
 use crate::peer::audit::{Act, AuditError, AuditLog, Entry};
-use crate::peer::connect::{ConnectFailure, Connections, Traffic};
+use crate::peer::connect::{Connections, DIAL_BUDGET, RecordRead, Traffic};
 use crate::peer::moment::Moment;
-use crate::peer::record::{RecordError, RecordStore, Timestamp, Untrusted};
+use crate::peer::record::{RecordError, RecordStore, Timestamp};
+use crate::peer::recovery::{ConnectFailure, NotTrustedCause, Recovery};
 use crate::peer::rights::{Admission, Floor, Rights, RightsError, Step};
 use crate::peer::stream::{self, ReadFault};
 use crate::peer::window::Windows;
@@ -211,14 +212,33 @@ pub const ACTION_WINDOW: Duration = Duration::from_secs(60);
 /// How many actions one peer may send per [`ACTION_WINDOW`].
 pub const MAX_ACTIONS_PER_WINDOW: u32 = 30;
 
-/// The one bound on one request's network attempt, measured by the injected runtime.
+/// The one bound on one request, measured by the injected runtime.
 ///
-/// Reaching the pair, opening the stream, writing the frame and reading the answer share this
-/// budget, so a caller waits at most this long for one action's outcome. A receiver's own
-/// `unknown` answer for a slow execution arrives only if the dial and the stream open left
-/// [`EXECUTION_BUDGET`] of the budget; when they did not, the sender stops waiting first and
-/// marks the action unknown itself, which is the same answer.
+/// One request has one bound, and everything the crate waits for on the person's behalf is
+/// inside it, reading the record included: reaching the pair, opening the stream, writing the
+/// frame and reading the answer share this budget, so a caller waits at most this long for one
+/// action's outcome. A record fault that clears costs at most the rounds it took, and the read
+/// never spends the budget's last dial-length — the time one dial can take, from the caller's
+/// hint and the remembered address, through the beacon, to the address the beacon names. A dial
+/// started in that length runs to its own end, so the read cannot be why the dial did not happen;
+/// a fault still unread when it begins is answered with the pair's own reason, which is the
+/// deferral when the state names none other.
+///
+/// What the crate writes *after* the work is not a wait and is not cut short by the budget: an
+/// outcome that may have happened is remembered whatever the clock says, and a memory that
+/// could not be written is reported as the fault it is. A receiver's own `unknown` answer for a
+/// slow execution arrives only if the dial and the stream open left [`EXECUTION_BUDGET`] of the
+/// budget; when they did not, the sender stops waiting first and marks the action unknown
+/// itself, which is the same answer.
 pub const ACTION_BUDGET: Duration = Duration::from_secs(90);
+
+// The record read reserves one dial of the budget, so a budget that is not longer than a dial
+// would leave nothing to reserve: the reservation refuses at compile time rather than reading
+// the whole budget and cutting the dial it promised.
+const _: () = assert!(
+    DIAL_BUDGET.as_nanos() < ACTION_BUDGET.as_nanos(),
+    "the action budget is not longer than the dial its record read reserves"
+);
 
 /// How long the machine's own code has to say whether it ran and what came back.
 pub const EXECUTION_BUDGET: Duration = Duration::from_secs(60);
@@ -687,32 +707,33 @@ impl Actions {
 
     /// Ask `peer` to run one action, and answer what became of it.
     ///
-    /// The record is re-read first: a peer this machine no longer remembers, one whose trust it
+    /// The record is read first: a peer this machine no longer remembers, one whose trust it
     /// withdrew, or a pair closed by three failed comparisons is refused before anything is
     /// sent. A body over [`MAX_ACTION_BODY_BYTES`] is refused, and an identifier already marked
     /// unknown for this peer is answered [`ActionAnswer::Unknown`] without being offered again.
     ///
     /// The pair's live connection is used when it has one; otherwise this call dials — the ask
-    /// is an ordinary reason to dial — and a failed dial is returned as
-    /// [`ActionError::Connect`] with nothing held anywhere. A request this machine could not get
-    /// onto the wire — no stream could be opened, or the write did not finish — is
-    /// [`ActionError::NotSent`], unless the receiver had already answered: that answer is read
-    /// under a short courtesy bound and handed back. The network attempt — reaching the pair,
-    /// opening the stream, writing the frame and reading the answer — shares one
-    /// [`ACTION_BUDGET`], so it is one bound a caller can plan against; the record read and the
-    /// memory writes on either side of it are local file work. Once the frame may be whole on the
-    /// wire and no answer comes back — or the answer is one this build cannot read, or the
-    /// receiver answers that it could not tell — the action is marked unknown durably and
-    /// answered [`ActionAnswer::Unknown`]. The crate never offers it again while the mark is
-    /// kept. When the memory cannot be read or written, the caller is answered
-    /// [`ActionError::Untraced`], which names both the outcome and the storage fault.
+    /// is an ordinary reason to dial, paced by the pair's retry policy — and a pair the manager
+    /// has stopped dialling is returned as [`ActionError::Connect`] with nothing held anywhere.
+    /// A request this machine could not get onto the wire — no stream could be opened, or the
+    /// write did not finish — is [`ActionError::NotSent`], unless the receiver had already
+    /// answered: that answer is read under a short courtesy bound and handed back. The record
+    /// read and the network work — reaching the pair, opening the stream, writing the frame and
+    /// reading the answer — share one [`ACTION_BUDGET`], so it is one bound a caller can plan
+    /// against; that bound's own documentation says what a record fault costs and how it is
+    /// answered. Once the frame may be whole on the wire and no answer comes back — or the
+    /// answer is one this build cannot read, or the receiver answers that it could not tell — the
+    /// action is marked unknown durably and answered [`ActionAnswer::Unknown`]. The crate never
+    /// offers it again while the mark is kept. When the memory cannot be read or written, the caller
+    /// is answered [`ActionError::Untraced`], which names both the outcome and the storage fault.
     ///
     /// # Errors
     ///
     /// The record's three refusals ([`ActionError::NotPaired`], [`ActionError::Withdrawn`],
-    /// [`ActionError::Closed`]), [`ActionError::Body`], the dial's own failure, a request that
-    /// may not have left, [`ActionError::Untraced`] when the unknown trace could not be kept,
-    /// and the log's and the decision's own refusals.
+    /// [`ActionError::Closed`]), a record whose bytes cannot be read, [`ActionError::Body`], the
+    /// dial's own failure — including the deferral a fault still unread when the budget's last
+    /// dial-length begins becomes — a request that may not have left, [`ActionError::Untraced`]
+    /// when the unknown trace could not be kept, and the log's and the decision's own refusals.
     pub async fn request(
         &self,
         connections: &Connections,
@@ -723,21 +744,42 @@ impl Actions {
         body: &[u8],
     ) -> Result<ActionAnswer, ActionError> {
         let action = Action::new(id, kind, body)?;
-        let limits = self.rights.records().limits();
-        let Some(record) = self.rights.records().reread(peer)? else {
-            return Err(ActionError::NotPaired { peer: *peer });
+        // One budget for the whole request: the deadline is taken once and every wait below
+        // shares it, so a call that reaches a dead connection cannot spend a second one.
+        let deadline = self.runtime.now() + ACTION_BUDGET;
+        // The read stops one dial short, so the dial this call asked for still fits in what is
+        // left and the read cannot be why the dial did not happen. The ordering is a compile-time
+        // check, so this cannot fall back to reading the whole budget.
+        let reading = deadline
+            .checked_sub(DIAL_BUDGET)
+            .expect("DIAL_BUDGET is shorter than ACTION_BUDGET, checked at compile time");
+        // The record is read through the manager, which is the one place a read is classified: a
+        // fault that may pass is deferred there and folded into the pair's state.
+        let record = loop {
+            match connections.standing(peer) {
+                RecordRead::Trusted(record) => break record,
+                RecordRead::Unreadable(error) => return Err(error.into()),
+                RecordRead::Refused(cause) => return Err(unpaired(*peer, cause)),
+                RecordRead::Deferred { detail } => {
+                    let failure = ConnectFailure::Deferred {
+                        peer: peer.fingerprint(),
+                        detail,
+                    };
+                    if self.runtime.now() >= reading {
+                        // The state is the truth, and the answer is derived from it, so a pair
+                        // whose last dial met something else keeps that reason.
+                        let (_, named) = connections.state_and_reason(peer);
+                        return Err(ActionError::Connect(named.unwrap_or(failure)));
+                    }
+                    connections.deferral_pause(Some(reading)).await;
+                }
+            }
         };
-        if let Some(why) = record.untrusted(&limits) {
-            return Err(why.into());
-        }
         let now = self.moment.now();
         let since = record.last_withdrawn_at();
         if self.store.is_unknown(peer, id, now, since)? {
             return Ok(ActionAnswer::Unknown);
         }
-        // One attempt, one bound: the dial, the offer and the answer share this deadline, so a
-        // call that reaches a dead connection cannot spend a second full budget waiting.
-        let deadline = self.runtime.now() + ACTION_BUDGET;
         let traffic = self
             .reachable(connections, endpoint, peer, deadline)
             .await?;
@@ -1149,6 +1191,16 @@ impl Actions {
     /// will speak on. The search shares the call's [`ACTION_BUDGET`] through `deadline`; a
     /// connection that never becomes ready within it is reported as [`ActionError::Unprepared`]
     /// rather than offered, and nothing is held.
+    ///
+    /// The ask is a reason to dial, so it starts a fresh episode once — and the dial itself is
+    /// [`Connections::ensure`]'s, which is paced by the pair's retry policy: a pair that has
+    /// just failed is waited out until the policy's own moment rather than polled. A dial this
+    /// call made and that failed answers with its failure at once, as does a record that refuses
+    /// trust. A fault this machine met this instant is deferred and waited out like a gap when the
+    /// state names nothing else; when the pair's last dial met a reason, that reason is the answer
+    /// at once, because the state a product reads is the truth. Only a wait that never became a
+    /// dial runs out the budget — then the policy's own account of why the pair is down is the
+    /// answer rather than a bare "nothing was ready".
     async fn reachable(
         &self,
         connections: &Connections,
@@ -1157,18 +1209,48 @@ impl Actions {
         deadline: Instant,
     ) -> Result<Traffic, ActionError> {
         let left = deadline.saturating_duration_since(self.runtime.now());
+        let mut asked = false;
         let traffic = timeout(&*self.runtime, left, async {
             loop {
                 let Some(traffic) = connections.traffic(peer) else {
-                    connections
-                        .connect(endpoint, &peer.fingerprint())
-                        .await
-                        .map_err(ActionError::Connect)?;
-                    // A dial that returns without a live pair must not spin: wait one poll, as
-                    // the not-live branch does, so the loop is bounded by the budget rather
-                    // than by a hot handshake.
-                    if connections.traffic(peer).is_none() {
-                        sleep(&*self.runtime, ACTION_POLL).await;
+                    if !asked {
+                        connections.wake(peer);
+                        asked = true;
+                    }
+                    // The dial this call made is reported in the manager's own words, and a
+                    // pair that will not be dialled again is answered with its reason now:
+                    // waiting out the budget for a dial nothing will make is not a better
+                    // answer than the one the manager already has. A deferral is not that
+                    // reason: the policy has moved the next dial to its own moment, which the
+                    // wait below reads, and answering it would end a wait the policy is about
+                    // to turn into a dial.
+                    let (state, failed) = connections.ensure(endpoint, &peer.fingerprint()).await;
+                    // The deferral guard below is the one branch no case can stage: it needs the
+                    // record to fail between this layer's own read and the manager's, inside one
+                    // poll — which the rig cannot arrange, and no operator procedure can reproduce
+                    // either. It is here for the second writer on the root that can do it; the
+                    // reason a wait that ends without a dial then reports is the state's own, read
+                    // by `Connections::state_and_reason`.
+                    if let Some(failure) = failed
+                        && !matches!(failure, ConnectFailure::Deferred { .. })
+                    {
+                        return Err(ActionError::Connect(failure));
+                    }
+                    match state {
+                        // The policy is waiting out a gap: wait its own moment rather than
+                        // polling, so a pair that is down costs the policy's pace and not a
+                        // request a second.
+                        Recovery::Waiting { until, .. } | Recovery::Exhausted { until, .. } => {
+                            sleep(
+                                &*self.runtime,
+                                until.saturating_duration_since(self.runtime.now()),
+                            )
+                            .await;
+                        }
+                        // A dial that returns without a live pair must not spin: wait one
+                        // poll, so the loop is bounded by the budget rather than by a hot
+                        // handshake.
+                        _ => sleep(&*self.runtime, ACTION_POLL).await,
                     }
                     continue;
                 };
@@ -1195,10 +1277,17 @@ impl Actions {
             }
         })
         .await;
-        match traffic {
-            Some(result) => result,
-            None => Err(ActionError::Unprepared { peer: *peer }),
-        }
+        let Some(result) = traffic else {
+            // The budget is spent. When the policy knows why the pair is down, that is the honest
+            // answer: a person asked for an action, and "no direct path" or "the peer is not
+            // registered" is what they need to see rather than "nothing was ready".
+            let (_, named) = connections.state_and_reason(peer);
+            return match named {
+                Some(failure) => Err(ActionError::Connect(failure)),
+                None => Err(ActionError::Unprepared { peer: *peer }),
+            };
+        };
+        result
     }
 }
 
@@ -1247,7 +1336,7 @@ async fn offer(
         // The write did not finish — it failed, or it timed out — so the frame may or may not
         // have been whole. The receiver may also have answered before resetting the stream, so
         // read what it wrote before calling the request unsent. This is a courtesy, not a second
-        // attempt: an answer that had not already arrived never will, so the read gets only what
+        // try: an answer that had not already arrived never will, so the read gets only what
         // the budget has left — one poll, when the write itself timed out.
         Some(Err(_)) | None => {
             return read_answer(runtime, &mut recv, ACTION_STREAM_BUDGET.min(left()))
@@ -1305,16 +1394,22 @@ impl<F: Future + Unpin> Future for CatchUnwind<F> {
     }
 }
 
-/// Which refusal names a record [`PeerRecord::trusted`] rejects.
+/// The refusal a record that does not vouch for the pair is answered with.
 ///
-/// The decision is `trusted`'s alone — one predicate for the handshake, the decision and this
-/// layer — and this only says which of the three reasons it was.
-impl From<Untrusted> for ActionError {
-    fn from(why: Untrusted) -> Self {
-        match why {
-            Untrusted::Withdrawn(peer) => Self::Withdrawn { peer },
-            Untrusted::Closed(peer) => Self::Closed { peer },
-            Untrusted::NotPaired(peer) => Self::NotPaired { peer },
+/// [`RecordRead::Refused`] is only ever "no record", "closed" or "withdrawn": the manager's one
+/// read puts a record it could not read in [`RecordRead::Unreadable`], which carries the typed
+/// fault and is answered with it. The unreadable cause is mapped here too, so this stays one
+/// total mapping of [`NotTrustedCause`] and a new cause cannot be answered by accident.
+fn unpaired(peer: PeerId, cause: NotTrustedCause) -> ActionError {
+    match cause {
+        NotTrustedCause::NoRecord => ActionError::NotPaired { peer },
+        NotTrustedCause::Closed => ActionError::Closed { peer },
+        NotTrustedCause::Withdrawn => ActionError::Withdrawn { peer },
+        NotTrustedCause::Unreadable { detail } => {
+            ActionError::Connect(ConnectFailure::NotTrusted {
+                peer: peer.fingerprint(),
+                cause: NotTrustedCause::Unreadable { detail },
+            })
         }
     }
 }
@@ -1375,8 +1470,9 @@ pub enum ActionError {
     Closed { peer: PeerId },
     /// The body is longer than [`MAX_ACTION_BODY_BYTES`].
     Body { bytes: usize, limit: usize },
-    /// The dial that the ask was an ordinary reason for failed, in the manager's own words.
-    /// Nothing was held anywhere: this layer has no queue.
+    /// The dial that the ask was an ordinary reason for failed, or the pair was still down when
+    /// the ask's budget ran out — the manager's own words either way, never a bare "nothing was
+    /// ready". Nothing was held anywhere: this layer has no queue.
     Connect(ConnectFailure),
     /// The request may not have left this machine: the pair's connection could not open a
     /// stream, or the write did not finish. A stream that never opened certainly wrote nothing;

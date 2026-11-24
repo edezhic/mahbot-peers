@@ -1,7 +1,7 @@
 //! The peer layer: what a machine remembers, how two become acquainted, how they
 //! stay connected, what a connected machine may do, and what it asks of another.
 //!
-//! Twelve pieces, each with one job:
+//! Thirteen pieces, each with one job:
 //!
 //! - [`record`] is the durable memory: one file per peer under the storage root,
 //!   private to the account the product runs as, published atomically, and additive
@@ -18,13 +18,17 @@
 //!   written only after both people confirmed. It is the one place a peer becomes
 //!   trusted.
 //! - [`connect`] is the per-machine connection manager: the remembered address
-//!   first, the beacon second, then stop; one connection per pair with an
-//!   asymmetric tie-break both sides compute the same way; four failures, each
-//!   reported as itself; and a keeper that re-dials a lost connection, re-dials one
-//!   that carried traffic, and stops when an attempt fails or a peer keeps dropping
-//!   the ones it takes.
+//!   first, the beacon second; one connection per pair with an asymmetric tie-break
+//!   both sides compute the same way, and a fresh connection preferred over one that
+//!   has stopped answering; four failures, each reported as itself; and a keeper that
+//!   recovers the pair in paced episodes rather than stopping at the first failed dial.
+//! - [`recovery`] is the one retry policy for a pair: episodes with growing gaps, a
+//!   stated cap, a slow re-check once an episode is used up, the reasons that start a
+//!   new one, the two states that are never retried, and the state a product reads to
+//!   show what is happening.
 //! - [`presence`] keeps a machine's registration at the beacon alive while it
-//!   runs, so a peer that remembers its address can still find it after a move.
+//!   runs, so a peer that remembers its address can still find it after a move, and
+//!   takes the registration up again by itself when a beacon that was down returns.
 //! - [`messages`] is what one machine says to another: a body queued durably at the
 //!   sender, offered over the pair's live direct connection, decided by the receiver
 //!   through the rights layer, deduplicated by envelope, delivered at least once,
@@ -57,7 +61,8 @@
 //! result, a message or an action, never stores one, and is never a path.
 //!
 //! Every type is re-exported here, so a caller names one path. A constant is too when a
-//! caller acts on it — how many accept loops to run, how long the keeper's windows are,
+//! caller acts on it — how many handshakes may be in flight at once, how long the keeper's
+//! windows are, how the retry policy's gaps grow and when it stops trying quickly,
 //! how long an exchange or a machine-to-machine flight may take, how many symbols a person
 //! is shown, how much a message may carry, how long a message and a taken identifier are
 //! kept, how often one may be offered and how many a peer's queue may hold, how much an
@@ -96,6 +101,7 @@ pub mod moment;
 pub mod pair;
 pub mod presence;
 pub mod record;
+pub mod recovery;
 pub mod rights;
 
 mod address;
@@ -124,8 +130,8 @@ pub use audit::{
 };
 pub use binding::EXCHANGE_BUDGET;
 pub use connect::{
-    ACCEPT_LANES, ConnectFailure, Connections, KEEPER_SETTLE, KEEPER_UNSTABLE_LIMIT, Keeper,
-    ManagerError, NotTrustedCause, Started, TRUST_POLL, Traffic,
+    ACCEPT_IN_FLIGHT, Connections, DIAL_BUDGET, KEEPER_SETTLE, ManagerError, Started, TRUST_POLL,
+    Traffic, VANISH_BOUND, Vanish,
 };
 pub use inbox::{Inbox, InboxError};
 pub use messages::{
@@ -138,8 +144,12 @@ pub use pair::{
     COMPARISON_SYMBOLS, Ceremony, Comparison, Opening, Outcome, PAIR_FLIGHT_TIMEOUT, PairError,
     Person, Role, Turn,
 };
-pub use presence::Presence;
+pub use presence::{Presence, Registration};
 pub use record::{Attempt, Limits, Malformed, PeerRecord, RecordError, RecordStore, Timestamp};
+pub use recovery::{
+    ConnectFailure, NotTrustedCause, RECOVERY_DIALS, RECOVERY_FIRST_GAP, RECOVERY_RECHECK,
+    Recovery, StopCause,
+};
 pub use rights::{
     Closed, Decision, Floor, NoFloor, Question, Refusal, Restored, Rights, RightsError, Speaker,
     Step,

@@ -126,17 +126,18 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use quinn::{Connection, RecvStream, Runtime, SendStream};
+use quinn::{Connection, Endpoint, RecvStream, Runtime, SendStream};
 
 use crate::beacon::{sleep, timeout};
 use crate::hex;
 use crate::identity::PeerId;
 use crate::identity::access::Insecurity;
 use crate::peer::audit::{Act, AuditError, AuditLog, DropReason, Dropped, Entry, RefusedReason};
-use crate::peer::connect::{Connections, Traffic};
+use crate::peer::connect::{Connections, TRUST_POLL, Traffic};
 use crate::peer::messages::store::{MessageStore, Outcome};
 use crate::peer::moment::Moment;
 use crate::peer::record::{RecordError, RecordStore, Timestamp, Untrusted};
+use crate::peer::recovery::ConnectFailure;
 use crate::peer::rights::{Admission, Floor, Refusal, Rights, RightsError, Writing};
 use crate::peer::stream::{self, ReadFault};
 use crate::peer::sweep::Due;
@@ -650,9 +651,16 @@ impl Messages {
     pub(crate) async fn offer_loop(
         self: Arc<Self>,
         connections: Arc<Connections>,
+        endpoint: &Endpoint,
         peer: PeerId,
     ) -> Result<(), MessageError> {
         let mut swept = Due::default();
+        // Whether this waiting spell has already asked for a dial. A message that is waiting
+        // asks once — the ask keeps the episode, so a peer that keeps dropping a connection
+        // is still bounded by it — and asking again every round would turn the queue's poll
+        // into a dial per second. The flag clears when the queue is empty, not when a
+        // connection comes and goes: the same waiting message is not news.
+        let mut asked = false;
         loop {
             let now = self.moment.now();
             if swept.due(now) {
@@ -662,7 +670,31 @@ impl Messages {
                 }
             }
             let Some(traffic) = connections.traffic(&peer) else {
-                sleep(&*self.runtime, MESSAGE_POLL).await;
+                // A message waiting to be delivered is a reason to dial, and the dial is
+                // paced by the pair's retry policy: a queue that asks every second does not
+                // dial every second and does not open a beacon session per poll. What the
+                // poll does cost while the pair is down is this machine's own queue: a full
+                // read and decode of the file to learn its head, not the peer's record, which
+                // `ensure` asks only when the policy is due.
+                let mut wait = MESSAGE_POLL;
+                match self.store.head(&peer) {
+                    Ok(Some(_)) => {
+                        if !asked {
+                            connections.hurry(&peer);
+                            asked = true;
+                        }
+                        let (_, refused) = connections.ensure(endpoint, &peer.fingerprint()).await;
+                        if matches!(refused, Some(ConnectFailure::NotTrusted { .. })) {
+                            // A record that refuses trust is a decision, not a network state:
+                            // asking again every round would only re-read the same file. One
+                            // round is when a person's restoration could have landed.
+                            wait = TRUST_POLL;
+                        }
+                    }
+                    Ok(None) => asked = false,
+                    Err(error) => return Err(error),
+                }
+                sleep(&*self.runtime, wait).await;
                 continue;
             };
             if !traffic.exchange_done() {
@@ -693,6 +725,9 @@ impl Messages {
             let message = match self.store.head(&peer) {
                 Ok(Some(message)) => message,
                 Ok(None) => {
+                    // Nothing is waiting any more, so the next message is news and may ask
+                    // for a dial again.
+                    asked = false;
                     sleep(&*self.runtime, MESSAGE_POLL).await;
                     continue;
                 }
@@ -808,15 +843,15 @@ impl Messages {
         let count = message.envelope().count();
         let act = match answer {
             // The peer took it: the pair's use, however the frames are counted, because the
-            // round's own measurement ends after the answer arrived.
-            Some(Answer::Taken) => {
+            // round's own measurement ends after the answer arrived. An answer that it took
+            // this identifier before counts the same way — by the peer's own account the
+            // message reached it — so a take whose answer the sender never sees still counts
+            // whenever the answer it does see says so. Nothing is recorded for either: the
+            // queue's removal is the record.
+            Some(Answer::Taken | Answer::AlreadyTaken) => {
                 traffic.took();
                 None
             }
-            // The peer says it took this identifier before: nothing is recorded, because by
-            // its account nothing was lost. It is the same answer a message whose removal met
-            // another writer meets on the next round.
-            Some(Answer::AlreadyTaken) => None,
             Some(Answer::Refused) => Some(refused_act(peer, id, count, RefusedReason::Rights)),
             Some(Answer::Unreadable) => {
                 Some(refused_act(peer, id, count, RefusedReason::Unreadable))

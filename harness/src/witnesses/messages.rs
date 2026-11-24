@@ -22,9 +22,10 @@ use mahbot_peers::peer::audit::{MAX_FILE_BYTES, RESERVED_FOR_PERSON_BYTES};
 use mahbot_peers::peer::messages::MAX_MESSAGES_BYTES;
 use mahbot_peers::peer::{
     Act, Answer, Authority, Capability, Decision, DropReason, Dropped, EXCHANGE_BUDGET, Envelope,
-    Floor, Gap, KEEPER_UNSTABLE_LIMIT, Keeper, MAX_BODY_BYTES, MAX_OFFERS_PER_WINDOW, MAX_QUEUE,
-    MESSAGE_BUDGET, MESSAGE_RETENTION, MESSAGE_WINDOW, Message, MessageError, NoFloor, Pair,
-    Question, QueueState, Refusal, RefusedReason, Speaker, Step, TAKEN_RETENTION, Timestamp,
+    Floor, Gap, KEEPER_SETTLE, MAX_BODY_BYTES, MAX_OFFERS_PER_WINDOW, MAX_QUEUE, MESSAGE_BUDGET,
+    MESSAGE_RETENTION, MESSAGE_WINDOW, Message, MessageError, NoFloor, Pair, Question, QueueState,
+    RECOVERY_DIALS, Recovery, Refusal, RefusedReason, Speaker, Started, Step, TAKEN_RETENTION,
+    Timestamp,
 };
 use quinn::Connection;
 
@@ -35,12 +36,12 @@ use crate::machine::Machine;
 use crate::messages::{Messaging, NOW, wait_for, wait_for_state};
 use crate::sim::Sim;
 
-use super::connection::Managed;
+use super::connection::{Managed, closing_peer};
 use super::peer::session;
 use super::rights::{fill_log, label, paired_machines, person};
 use super::support::{
-    binding, field, holds_bytes, io_error, main_binding, offer_frame, pair, ready, single_ending,
-    spawn_keeper, wait_live, within,
+    binding, counted_dial, field, holds_bytes, io_error, main_binding, offer_frame, pair, ready,
+    single_ending, spawn_keeper, wait_live, within,
 };
 
 /// Offer one message by hand, as the sender's own service would.
@@ -3297,8 +3298,8 @@ pub(crate) fn the_beacon_never_carries_a_message() -> Result<(), String> {
 }
 
 /// Offering a message is not the pair's traffic: a connection closed with an offer still
-/// unanswered is a dial that carried nothing, so the keeper stops instead of re-dialling
-/// for ever.
+/// unanswered is a dial that carried nothing, so the episode is used up instead of
+/// re-dialling for ever — and the keeper keeps running.
 pub(crate) fn offering_a_message_is_not_the_pairs_traffic() -> Result<(), String> {
     block_on(async {
         let sim = Sim::new().map_err(io_error)?;
@@ -3329,32 +3330,28 @@ pub(crate) fn offering_a_message_is_not_the_pairs_traffic() -> Result<(), String
             .map_err(|error| error.to_string())?;
         main_messages.serve(&main_managed.connections, &laptop);
         let keeper = spawn_keeper(&main_managed, &laptop);
-        let mut closed = 0usize;
-        within(&sim, Duration::from_secs(300), async {
-            while closed < usize::from(KEEPER_UNSTABLE_LIMIT) && !keeper.is_finished() {
-                let connection =
-                    wait_live(&sim, &laptop_managed.connections, &main.peer_id()).await?;
-                // The offer has started: the sender opened a stream and wrote it. The
-                // connection goes while it waits for an answer nobody will send.
-                within(&sim, MESSAGE_BUDGET, connection.accept_bi())
-                    .await?
-                    .map_err(|error| error.to_string())?;
-                laptop_managed.connections.disconnect(&main.peer_id());
-                closed += 1;
-            }
-            Ok::<(), String>(())
-        })
-        .await??;
-        let end = within(&sim, Duration::from_secs(120), keeper)
+        let connection = wait_live(&sim, &laptop_managed.connections, &main.peer_id()).await?;
+        // The offer has started: the sender opened a stream and wrote it. The connection
+        // goes while it waits for an answer nobody will send.
+        within(&sim, MESSAGE_BUDGET, connection.accept_bi())
             .await?
-            .map_err(|error| format!("the keeper's task did not finish: {error}"))?;
-        match &end {
-            Keeper::Unstable { peer, .. } if *peer == laptop.fingerprint() => Ok(()),
-            other => Err(format!(
-                "the keeper ended `{other}`, not unstable after {closed} dials whose only traffic \
-                 was an unanswered offer"
-            )),
+            .map_err(|error| error.to_string())?;
+        laptop_managed.connections.disconnect(&main.peer_id());
+        // The close is one dial of the episode, with the connection that carried nothing
+        // as its cause — not the pair's traffic, and not a silent loop either.
+        let counted = counted_dial(&sim, &main_managed.connections, &laptop.peer_id()).await?;
+        if counted == 0 {
+            return Err("the close was not counted as a dial of the episode".to_owned());
         }
+        if keeper.is_finished() {
+            return Err(
+                "the keeper stopped after a connection whose only traffic was an unanswered \
+                 offer"
+                    .to_owned(),
+            );
+        }
+        keeper.abort();
+        Ok(())
     })
 }
 
@@ -3380,7 +3377,7 @@ pub(crate) fn a_taken_message_is_the_pairs_traffic() -> Result<(), String> {
         // One more drop than the keeper tolerates of dials that carried nothing: each of
         // these connections carried a message the peer took.
         let mut delivered = 0usize;
-        for round in 0..=KEEPER_UNSTABLE_LIMIT {
+        for round in 0..=RECOVERY_DIALS {
             connected
                 .laptop_messages
                 .messages
@@ -3431,6 +3428,409 @@ pub(crate) fn a_taken_message_is_the_pairs_traffic() -> Result<(), String> {
             return Err(format!(
                 "the keeper stopped after {delivered} dials that each carried a taken message"
             ));
+        }
+        keeper.abort();
+        Ok(())
+    })
+}
+
+/// A message waiting to be delivered is a reason to dial: with no keeper on either machine and
+/// nobody calling `Connections::connect`, the queue alone gets the pair a live connection and
+/// the message arrives.
+///
+/// It is also not a reason to dial once a second. The queue asks every round, so the pacing is
+/// shown over a minute of virtual time: with the receiver's address silenced no dial can
+/// succeed, one more message keeps the queue asking, and the case counts the dials the pair
+/// made — the first at once, then a gap that doubles from one second to sixteen, so a handful
+/// in the minute and never one a second.
+///
+/// The link is counted too, but only to show the dials went on the wire: one dial is not one
+/// datagram, because a QUIC handshake to a peer that answers nothing retransmits its first
+/// flight until the connect budget runs out. So the dial count is the pair's own, and the
+/// trace's datagram count is not asserted against the poll.
+pub(crate) fn a_queued_message_causes_a_dial() -> Result<(), String> {
+    block_on(async {
+        let sim = Sim::new().map_err(io_error)?;
+        let beacon = TestBeacon::start(&sim).map_err(io_error)?;
+        let (main, laptop) = paired_machines(&sim)?;
+        // Both bound, so the sender's own gate is open and the receiver has a pair to take
+        // under.
+        main.rights()?
+            .bind(&laptop.peer_id(), main_binding(&label("admin")?)?, NOW)
+            .map_err(|error| error.to_string())?;
+        laptop
+            .rights()?
+            .bind(
+                &main.peer_id(),
+                binding(
+                    "laptop-account",
+                    "laptop-instance",
+                    &label("laptop-assistant")?,
+                )?,
+                NOW,
+            )
+            .map_err(|error| error.to_string())?;
+        let main_managed = Managed::start(&sim, &beacon, &main, &main.records())?;
+        let laptop_managed = Managed::start(&sim, &beacon, &laptop, &laptop.records())?;
+        let main_messages = Messaging::open(&sim, &main, Arc::new(NoFloor))?;
+        let laptop_messages = Messaging::open(&sim, &laptop, Arc::new(NoFloor))?;
+        // Only the receiver's service runs at first, and no keeper runs anywhere: the queue is
+        // the one thing that may dial, so a connection here is the queue's doing.
+        laptop_messages.serve(&laptop_managed.connections, &main);
+        if main_managed.connections.live(&laptop.peer_id()).is_some() {
+            return Err("the pair had a connection before anything asked for one".to_owned());
+        }
+        let body = b"the queue asks for a connection".to_vec();
+        main_messages
+            .messages
+            .send(&laptop.peer_id(), NOW, &body)
+            .map_err(|error| error.to_string())?;
+        main_messages.serve(&main_managed.connections, &laptop);
+        // The queue dialled: the sender holds a live connection it started, and the receiver
+        // accepted one, with no keeper and no caller of `connect` in the case.
+        wait_live(&sim, &main_managed.connections, &laptop.peer_id()).await?;
+        if main_managed.connections.started_by(&laptop.peer_id()) != Some(Started::Here) {
+            return Err("the connection the queue made is not one the sender dialled".to_owned());
+        }
+        wait_live(&sim, &laptop_managed.connections, &main.peer_id()).await?;
+        if laptop_managed.connections.started_by(&main.peer_id()) != Some(Started::There) {
+            return Err("the receiver did not take the queue's dial as the peer's".to_owned());
+        }
+        let delivered = wait_for(
+            &sim,
+            &laptop_messages.collected,
+            1,
+            Duration::from_secs(120),
+        )
+        .await?;
+        if delivered[0].body != body {
+            return Err("the message the queue dialled for is not the one that arrived".to_owned());
+        }
+        // The queue's poll is not a dial per second, and the gaps between the dials grow. The
+        // receiver is silenced, so every dial runs its whole connect budget before it fails;
+        // what is measured is the moment the state enters `Dialling` — a dial this case can
+        // see — not the policy's own counter, which a queue that reset it every round would
+        // also keep low.
+        sim.link().silence(laptop.addr());
+        main_messages
+            .messages
+            .send(&laptop.peer_id(), NOW, b"nothing will take this")
+            .map_err(|error| error.to_string())?;
+        main_managed.connections.disconnect(&laptop.peer_id());
+        let mark = sim.link().trace().len();
+        let mut starts: Vec<Duration> = Vec::new();
+        let mut dialling = false;
+        let mut spent = Duration::ZERO;
+        while spent < Duration::from_secs(120) {
+            sim.clock().advance(Duration::from_secs(1)).await;
+            spent += Duration::from_secs(1);
+            tokio::task::yield_now().await;
+            let now_dialling = matches!(
+                main_managed.connections.recovery(&laptop.peer_id()),
+                Recovery::Dialling { .. }
+            );
+            if now_dialling && !dialling {
+                starts.push(spent);
+            }
+            dialling = now_dialling;
+        }
+        let trace = sim.link().trace();
+        let datagrams = trace[mark..]
+            .iter()
+            .filter(|event| event.from == main.addr() && event.to == laptop.addr())
+            .count();
+        sim.link().resume(laptop.addr());
+        if datagrams == 0 {
+            return Err(format!(
+                "a queued message put nothing on the link in {spent:?} of virtual time"
+            ));
+        }
+        if starts.is_empty() {
+            return Err(format!(
+                "a queued message dialled not once in {spent:?} of virtual time, though it sent \
+                 {datagrams} datagrams"
+            ));
+        }
+        // One episode, not a dial a round: the queue asked every second and the policy made its
+        // own dials, each after the gap the last failure earned. What bounds the count is the
+        // episode plus the re-checks it earns — a queue that re-armed the policy every round
+        // would dial as often as the connect budget allows, twelve in two minutes. The gaps
+        // themselves are `the_recovery_state_is_readable`'s to assert; here the count is what
+        // separates paced dials from a dial a round.
+        let most = RECOVERY_DIALS as usize + 2;
+        if starts.len() > most {
+            return Err(format!(
+                "a queued message dialled {} times in {spent:?} of virtual time, more than the \
+                 episode's {RECOVERY_DIALS} and the re-checks it earns: a queue that asks once a \
+                 round has become a dial a round",
+                starts.len()
+            ));
+        }
+        if starts.len() < 2 {
+            return Err(format!(
+                "a queued message dialled {} times in {spent:?} of virtual time, so the pacing was \
+                 never exercised",
+                starts.len()
+            ));
+        }
+        // The moments those dials began, read rather than counted: each one waits out the gap
+        // its predecessor earned, so the gaps never shrink, and over a whole episode they grow.
+        // A dial that runs its connect budget is sampled at the second it began, so a gap reads
+        // as the policy's own plus at most a second.
+        let gaps: Vec<Duration> = starts.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        if gaps.windows(2).any(|pair| pair[1] < pair[0]) {
+            return Err(format!(
+                "the gaps between the queue's dials shrank: {gaps:?} out of {starts:?}"
+            ));
+        }
+        if let (Some(first), Some(last)) = (gaps.first(), gaps.last())
+            && gaps.len() >= 3
+            && last <= first
+        {
+            return Err(format!(
+                "the gaps between the queue's dials did not grow: {gaps:?} out of {starts:?}"
+            ));
+        }
+        // Nothing reached the silenced receiver, so the message is still the queue's.
+        let pending = main_messages
+            .messages
+            .pending(&laptop.peer_id())
+            .map_err(|error| error.to_string())?;
+        if pending.len() != 1 {
+            return Err(format!(
+                "the queue holds {} messages after a dial that could not be answered, not the one \
+                 it kept",
+                pending.len()
+            ));
+        }
+        if laptop_messages.collected.len() != 1 {
+            return Err(format!(
+                "the silenced receiver was handed {} messages, not the one from before the dials",
+                laptop_messages.collected.len()
+            ));
+        }
+        Ok(())
+    })
+}
+
+/// A message standing in the queue does not let a peer that accepts every connection and
+/// drops it escape the episode's bound.
+///
+/// The two halves are bounded separately — the queue asks once per waiting spell, and the
+/// policy counts a connection that carried nothing as one of the episode's dials — and this
+/// is the case that bounds them together. No keeper runs on the sender's side, so the queue
+/// is the only thing dialling; the peer accepts and closes at once, so every dial produces a
+/// connection that carried nothing and every connection it takes is one dial. The window is
+/// long enough for the episode's whole run and short of the slow re-check, so a queue that
+/// re-armed the policy each round would be seen as the extra connections the peer takes.
+pub(crate) fn a_standing_message_does_not_let_a_closing_peer_escape_the_bound() -> Result<(), String>
+{
+    block_on(async {
+        let sim = Sim::new().map_err(io_error)?;
+        let beacon = TestBeacon::start(&sim).map_err(io_error)?;
+        let (main, laptop) = paired_machines(&sim)?;
+        // The sender's own gate is open; the receiver runs no layer at all, because it is
+        // going to drop every connection it is given.
+        main.rights()?
+            .bind(&laptop.peer_id(), main_binding(&label("admin")?)?, NOW)
+            .map_err(|error| error.to_string())?;
+        let (closer, accepted) = closing_peer(&sim, &laptop, |_, _| Duration::ZERO)?;
+        let main_managed = Managed::start(&sim, &beacon, &main, &main.records())?;
+        let main_messages = Messaging::open(&sim, &main, Arc::new(NoFloor))?;
+        main_messages
+            .messages
+            .send(&laptop.peer_id(), NOW, b"a peer that keeps closing")
+            .map_err(|error| error.to_string())?;
+        main_messages.serve(&main_managed.connections, &laptop);
+        let mut spent = Duration::ZERO;
+        while spent < Duration::from_secs(75) {
+            sim.clock().advance(Duration::from_secs(1)).await;
+            spent += Duration::from_secs(1);
+            tokio::task::yield_now().await;
+        }
+        let taken = accepted.load(Ordering::SeqCst);
+        let state = main_managed.connections.recovery(&laptop.peer_id());
+        closer.abort();
+        // Every dial this case made produced a connection, so the peer's count of them is the
+        // episode's count — and it is the episode's, not a dial a round.
+        if taken != RECOVERY_DIALS as usize {
+            return Err(format!(
+                "a standing message dialled {taken} times in {spent:?} of virtual time, not the \
+                 episode's {RECOVERY_DIALS}: a peer that accepts and drops has escaped the bound"
+            ));
+        }
+        // And the pair is where the bound leaves it: the episode used up, waiting for the slow
+        // re-check, with nothing dialling in between.
+        let Recovery::Exhausted { dials, .. } = &state else {
+            return Err(format!(
+                "after the episode the pair reads `{state}`, not an episode used up"
+            ));
+        };
+        if *dials != RECOVERY_DIALS {
+            return Err(format!(
+                "the used-up episode counts {dials} dials, not {RECOVERY_DIALS}"
+            ));
+        }
+        Ok(())
+    })
+}
+
+/// An answer that the peer already took this message is the pair's traffic: by the peer's own
+/// account the message reached it, so the connection carried the pair's use even though its
+/// round's frames were all measured before the answer arrived.
+///
+/// The case gets there the only way the layer can. The first offer is made by hand over the
+/// pair — the receiver takes it and remembers the identifier — and the second is the queue's
+/// own round, which meets `already taken`. A hand offer is not the layer's settle and counts
+/// nothing, so the counter moves only on the queue's answer. Then the connection is closed
+/// inside the keeper's settle window: a dial that carried nothing is a strike against the peer
+/// there, and this one carried the take, so the pair dials again rather than counting it.
+pub(crate) fn an_already_taken_answer_is_traffic() -> Result<(), String> {
+    block_on(async {
+        let sim = Sim::new().map_err(io_error)?;
+        let beacon = TestBeacon::start(&sim).map_err(io_error)?;
+        let (main, laptop) = paired_machines(&sim)?;
+        // Both bound: the sender's gate is open and the receiver has the pair to take under.
+        main.rights()?
+            .bind(&laptop.peer_id(), main_binding(&label("admin")?)?, NOW)
+            .map_err(|error| error.to_string())?;
+        laptop
+            .rights()?
+            .bind(
+                &main.peer_id(),
+                binding(
+                    "laptop-account",
+                    "laptop-instance",
+                    &label("laptop-assistant")?,
+                )?,
+                NOW,
+            )
+            .map_err(|error| error.to_string())?;
+        let main_managed = Managed::start(&sim, &beacon, &main, &main.records())?;
+        let laptop_managed = Managed::start(&sim, &beacon, &laptop, &laptop.records())?;
+        let main_messages = Messaging::open(&sim, &main, Arc::new(NoFloor))?;
+        let laptop_messages = Messaging::open(&sim, &laptop, Arc::new(NoFloor))?;
+        // The main dials, so the keeper that judges this connection is the main's own and the
+        // take is counted on the side that offered. The moment is taken before the dial, so the
+        // settle window below is measured from at or before the connection's adoption.
+        let dialled_at = sim.clock().elapsed();
+        let keeper = spawn_keeper(&main_managed, &laptop);
+        let connection = wait_live(&sim, &main_managed.connections, &laptop.peer_id()).await?;
+        wait_live(&sim, &laptop_managed.connections, &main.peer_id()).await?;
+        let traffic = main_managed
+            .connections
+            .traffic(&laptop.peer_id())
+            .ok_or("the pair has no connection to measure")?;
+        // Only the receiver's service runs: the sender's own queue must not offer the envelope
+        // before the case has offered it by hand.
+        laptop_messages.serve(&laptop_managed.connections, &main);
+        let body = b"taken once by hand".to_vec();
+        let envelope = main_messages
+            .messages
+            .send(&laptop.peer_id(), NOW, &body)
+            .map_err(|error| error.to_string())?;
+        let message = Message::new(envelope, body).map_err(|error| error.to_string())?;
+        let first = offer_raw(&connection, &message).await?;
+        if first != Answer::Taken {
+            return Err(format!(
+                "the first offer of a fresh envelope was answered `{first:?}`, not taken"
+            ));
+        }
+        let second = offer_raw(&connection, &message).await?;
+        if second != Answer::AlreadyTaken {
+            return Err(format!(
+                "the second offer of the same envelope was answered `{second:?}`, not already \
+                 taken"
+            ));
+        }
+        if laptop_messages.collected.len() != 1 {
+            return Err(format!(
+                "the same envelope was handed to the receiver's caller {} times, not once",
+                laptop_messages.collected.len()
+            ));
+        }
+        // A hand offer is not the layer's settle, so neither answer counted as the pair's use.
+        if traffic.taken() != 0 {
+            return Err(format!(
+                "two offers by hand counted {} answers as the pair's traffic, not none",
+                traffic.taken()
+            ));
+        }
+        // The queue's own round now offers the same envelope and meets the same answer.
+        main_messages.serve(&main_managed.connections, &laptop);
+        wait_for_state(
+            &sim,
+            &main_messages.messages,
+            &laptop.peer_id(),
+            |state| *state == QueueState::Empty,
+            Duration::from_secs(120),
+        )
+        .await?;
+        if traffic.taken() != 1 {
+            return Err(format!(
+                "an answer of already taken moved the pair's take counter to {}, not one",
+                traffic.taken()
+            ));
+        }
+        if laptop_messages.collected.len() != 1 {
+            return Err(format!(
+                "the already-taken answer was delivered again: the receiver's caller was handed \
+                 {} messages",
+                laptop_messages.collected.len()
+            ));
+        }
+        // The death has to fall inside the settle window, or the keeper judges it as ordinary
+        // churn whatever the connection carried.
+        let settled_for = sim.clock().elapsed().saturating_sub(dialled_at);
+        if settled_for >= KEEPER_SETTLE {
+            return Err(format!(
+                "the case spent {settled_for:?} before closing, past the {KEEPER_SETTLE:?} window \
+                 the keeper judges a fresh connection in"
+            ));
+        }
+        laptop_managed.connections.disconnect(&main.peer_id());
+        // The keeper's own verdict, sampled while it happens: a connection that carried nothing
+        // would be a strike, which shows as a counted dial waiting out a gap or an episode used
+        // up. This one carried the take, so the next dial is the first of a fresh run, and it
+        // is a new connection the pair comes back with.
+        let closed = connection.stable_id();
+        let mut redialled = false;
+        let mut spent = Duration::ZERO;
+        while spent < Duration::from_secs(60) {
+            let state = main_managed.connections.recovery(&laptop.peer_id());
+            let strike = match &state {
+                Recovery::Exhausted { .. } => true,
+                Recovery::Waiting { last: Some(_), .. } => true,
+                Recovery::Dialling { dial } | Recovery::Waiting { dial, .. } => *dial > 1,
+                _ => false,
+            };
+            if strike {
+                return Err(format!(
+                    "a connection that carried an already-taken answer was counted against the \
+                     peer: the pair reads `{state}` {spent:?} after the close"
+                ));
+            }
+            if main_managed
+                .connections
+                .live(&laptop.peer_id())
+                .is_some_and(|live| live.stable_id() != closed)
+            {
+                redialled = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+            sim.clock().advance(Duration::from_millis(100)).await;
+            spent += Duration::from_millis(100);
+        }
+        if !redialled {
+            return Err(format!(
+                "the pair did not dial again within {spent:?} of the close"
+            ));
+        }
+        if keeper.is_finished() {
+            return Err(
+                "the keeper stopped after a connection that carried a taken answer".to_owned(),
+            );
         }
         keeper.abort();
         Ok(())

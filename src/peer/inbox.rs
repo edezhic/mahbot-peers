@@ -42,7 +42,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use quinn::{RecvStream, Runtime, SendStream};
+use quinn::{Endpoint, RecvStream, Runtime, SendStream};
 
 use crate::beacon::{sleep, timeout};
 use crate::identity::{Fingerprint, PeerId};
@@ -112,12 +112,18 @@ impl Inbox {
     /// layer's executor, and the audit log's cross-process lock. A stream's own task runs on the
     /// injected runtime, so a slow action holds its stream and no other.
     ///
+    /// `endpoint` is the one the pair's connections run over: the offer loop dials with it
+    /// when a message is waiting and the pair has no connection, through the same retry
+    /// policy the keeper uses, so a queued message is a reason to dial and not a reason to
+    /// dial once a second.
+    ///
     /// # Errors
     ///
     /// The first refusal either half met, in its own words.
     pub async fn serve(
         self: Arc<Self>,
         connections: Arc<Connections>,
+        endpoint: Endpoint,
         peer: PeerId,
     ) -> Result<(), InboxError> {
         let running = Arc::new(AtomicBool::new(true));
@@ -132,7 +138,7 @@ impl Inbox {
         let messages = Arc::clone(&self.messages);
         let offer = async move {
             messages
-                .offer_loop(Arc::clone(&connections), peer)
+                .offer_loop(Arc::clone(&connections), &endpoint, peer)
                 .await
                 .map_err(InboxError::Messages)
         };
