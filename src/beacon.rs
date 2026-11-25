@@ -78,8 +78,9 @@ pub const BEACON_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// recipient can leave unread. A push beyond it waits for credit; a push that
 /// cannot complete within the server's exchange bound is answered
 /// [`BeaconError::UnknownPeer`] — the same answer an unregistered id gets — so a
-/// live recipient that stops reading is reported as unreachable instead of
-/// stalling the sender. Nothing is stored for a later attempt.
+/// live recipient that stops reading is reported as a payload the beacon did not
+/// hand over, instead of stalling the sender. Nothing is stored for a later
+/// attempt.
 pub const MAX_CONCURRENT_STREAMS: u32 = 16;
 
 /// The domain separator of an introduction's signature.
@@ -90,9 +91,11 @@ const INTRODUCTION_DOMAIN: &[u8] = b"mahbot-peers introduction v1";
 pub enum BeaconError {
     /// The service is not running, or the connection to it is gone.
     Unavailable,
-    /// The addressee is not reachable at this moment — not registered, or its
-    /// live connection could not take the frame within the server's exchange
-    /// bound — so nothing was stored.
+    /// The beacon did not hand the payload to the addressee: it holds no registration for it, or
+    /// its live connection could not take the frame within the server's exchange bound. Either
+    /// way nothing was stored for a later attempt. This is the beacon's answer about one
+    /// delivery, not a statement about the peer: a lookup that missed is a different answer,
+    /// [`Session::lookup`]'s `Ok(None)`, and the two are reported as themselves.
     UnknownPeer(PeerId),
     /// The payload is larger than [`MAX_PAYLOAD_BYTES`].
     PayloadTooLarge(usize),
@@ -120,7 +123,11 @@ impl fmt::Display for BeaconError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unavailable => f.write_str("the beacon is unavailable"),
-            Self::UnknownPeer(id) => write!(f, "peer {} is not reachable", id.fingerprint()),
+            Self::UnknownPeer(id) => write!(
+                f,
+                "the beacon did not hand the payload to {}",
+                id.fingerprint()
+            ),
             Self::PayloadTooLarge(len) => write!(
                 f,
                 "an introduction of {len} bytes exceeds {MAX_PAYLOAD_BYTES}"

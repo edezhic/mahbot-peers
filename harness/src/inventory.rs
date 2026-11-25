@@ -930,7 +930,7 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.peer.pairing.flight_timeout",
-        "a peer that is registered and reachable but never answers a ceremony flight ends the attempt as a flight timeout, distinct from a beacon failure, with the attempt counted against nobody and cleared",
+        "a peer that is registered and reachable but never answers a ceremony flight ends the attempt as a flight timeout, naming the wait that ended and no cause beyond it — the sentence is not a beacon failure and claims nothing about why nothing arrived — with the attempt counted against nobody and cleared",
     ),
     Capability::witnessed(
         "library.peer.pairing.attempt_expired",
@@ -966,7 +966,7 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.peer.pairing.respond_ignores_strangers",
-        "a machine waiting to be paired drops a malformed payload and a well-formed non-opening flight from a stranger, keeps waiting, and still pairs with the real initiator, with one comparison each and no record for the stranger",
+        "a machine waiting to be paired is not handed a malformed payload or a well-formed non-opening flight from a stranger — the presence holds only openings — so it keeps waiting and still pairs with the real initiator, with one comparison each and no record for the stranger",
     ),
     Capability::witnessed(
         "library.peer.pairing.mediator",
@@ -1038,7 +1038,7 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.peer.presence.rearms",
-        "this machine's own registration comes back by itself when the beacon does: while the beacon is gone the state names it as unreachable with the count of failed registration dials, once it returns the registration is held again with no person and no restart, and a run that is dropped leaves the state idle rather than claiming a registration nothing refreshes",
+        "this machine's own registration comes back by itself when the beacon does: while the beacon is gone the state names it as unreachable with the count of failed registration dials, once it returns the registration is held again with no person and no restart, and dropping the presence closes its session so the beacon forgets the registration",
     ),
     Capability::witnessed(
         "library.peer.connect.vanish_bound",
@@ -1373,6 +1373,98 @@ const CAPABILITIES: &[Capability] = &[
     Capability::witnessed(
         "library.peer.presence.refresh",
         "a registration that is never refreshed is forgotten on the beacon's own lifetime while its session stays open, and a registration refreshed by `Presence` outlives that lifetime",
+    ),
+    Capability::witnessed(
+        "library.peer.presence.one_registration",
+        "a machine has one registration at the beacon and a ceremony runs over it: the beacon holds the machine at the same address before the ceremony and after it, and a peer looking it up gets that address, so the machine stays findable through a ceremony it does not register for",
+    ),
+    Capability::witnessed(
+        "library.peer.presence.refresh_during_a_ceremony",
+        "a registration refreshed while two people compare does not take the flight the ceremony is waiting for: both sides confirm and the pair is written, and the beacon still holds both machines afterwards",
+    ),
+    Capability::witnessed(
+        "library.peer.presence.outlives_the_lifetime",
+        "a comparison that takes longer than the registration's own lifetime pairs with no presence loop and no refresh by the caller: the machine's presence refreshes the registration while the people look, and both sides finish",
+    ),
+    Capability::witnessed(
+        "library.peer.presence.flight_held",
+        "an opening that arrives before the other machine's person starts the ceremony is held rather than dropped: the person starts once, the comparison is shown once on each side, and the pair is written",
+    ),
+    Capability::witnessed(
+        "library.peer.presence.delivery_and_lookup_told_apart",
+        "the crate reports the call it made: a flight the beacon did not hand over says so and claims nothing about the peer's state; a lookup that missed says the beacon does not know the peer and claims nothing about a delivery; a registered peer whose path answered nothing is reported as no direct path, not as an unregistered machine",
+    ),
+    Capability::witnessed(
+        "library.peer.presence.two_ceremonies",
+        "one machine pairs with two peers at once: each ceremony receives only its own peer's flights, both pairs are written, and each ceremony shows its person exactly one comparison — the two comparisons differ",
+    ),
+    Capability::witnessed(
+        "library.peer.presence.claim_released",
+        "a cancelled ceremony takes its waiting slot with it: after a ceremony is dropped, the next flight from that peer reaches the ceremony that waits for it and the pair is written",
+    ),
+    Capability::witnessed(
+        "library.peer.presence.claim_takes_the_held_opening",
+        "a claim takes in the opening held for its peer: an opening that arrived while no ceremony waited on its sender is handed to the first claim on that peer as its first flight, and it is no longer in the hold, so a person who starts with that peer after the other machine did is not left waiting for a flight that is sitting in the hold",
+    ),
+    Capability::witnessed(
+        "library.peer.presence.hold_bounded",
+        "the hold for peers no ceremony waits on is bounded, newest-first and openings-only: five openings are pushed to one machine, it hands out the four newest newest first, the oldest is not among them, no fifth arrives beside them, and a payload that cannot start a ceremony is not held at all",
+    ),
+    Capability::witnessed(
+        "library.peer.presence.hold_one_per_peer",
+        "an opening is held once per peer: a machine that starts a second time before anyone waits on it replaces the opening held for it, so the person is handed the attempt still running and the abandoned one is not kept beside it for a second responder",
+    ),
+    Capability::witnessed(
+        "library.peer.presence.flights_in_order",
+        "a peer's flights reach its ceremony in the order they were sent: the opening, reveal and confirmation one attempt's initiator sends, pushed while its ceremony has claimed the peer and is not taking them, are handed over in that order, so below the bound a newer flight never displaces an undelivered older one",
+    ),
+    Capability::witnessed(
+        "library.peer.presence.pending_bounded",
+        "one peer's flights wait in a stated number at most: one more than `MAX_PENDING` real openings are pushed to a claimed peer, the slot hands over the newest `MAX_PENDING` — the oldest was the one dropped — and no further flight is kept",
+    ),
+    Capability::witnessed(
+        "library.peer.presence.waiter_dropped",
+        "a handle that is dropped takes its waiting with it: a dropped handle waiting for any opening is not woken by the opening that follows, while a live one beside it is, so no wake goes to a handle nobody holds and nothing accumulates on a machine that receives no further pushes; and the last claim on a peer takes its slot with it, so a later flight for that peer wakes nobody and is not kept",
+    ),
+    Capability::witnessed(
+        "library.peer.presence.handles_share_the_slot",
+        "two handles on one peer share that peer's slot: a flight that arrived for the peer is still taken by the handle that remains after the other is dropped, and only the last handle to go takes the slot with it",
+    ),
+    Capability::witnessed(
+        "library.peer.presence.stale_opening_dropped",
+        "a flight whose sender has given up is not delivered, on either path: an opening held for a peer nobody waits on is not handed to a person who starts later than `PAIR_FLIGHT_TIMEOUT`, and a machine flight sitting in the slot of a peer a ceremony has already claimed is not handed over either",
+    ),
+    Capability::witnessed(
+        "library.peer.presence.requests_never_dial",
+        "a request never dials the beacon: with the beacon stopped and the keeper's episode used up, a lookup waits out its own request bound, answers `Unavailable`, and puts no datagram on the wire to the beacon in the whole window — a request that dialled would be the only thing sending there",
+    ),
+    Capability::witnessed(
+        "library.peer.presence.drop_ends_the_wait",
+        "a presence dropped while the keeper waits out its slow re-check does not wait the re-check out: the endpoint handle the presence held is released, so the restart a product rebinds with succeeds inside its own budget",
+    ),
+    Capability::witnessed(
+        "library.peer.presence.stale_confirmation_refused",
+        "a confirmation from an attempt that ended is not obeyed in a claimed peer's slot: the ceremony that claimed the peer refuses it as a binding mismatch, writes no pair on its own side, and shows its person no second comparison — the sender's side is a race and is not asserted",
+    ),
+    Capability::witnessed(
+        "library.peer.presence.confirmation_not_aged",
+        "a confirmation is not aged by the machine-flight timeout: it waits in the peer's slot for as long as the person comparing takes, in either direction, and the ceremony that claimed the peer takes it when they answer, so a slow comparison does not cost the pair its flight",
+    ),
+    Capability::witnessed(
+        "library.peer.presence.confirmation_not_held",
+        "a confirmation is never held for a person who has not started: it belongs to an attempt already under way, so a machine with no ceremony for its sender drops it, and a ceremony that later claims that peer is not handed it",
+    ),
+    Capability::witnessed(
+        "library.peer.presence.reader_not_stalled",
+        "a frame the reader refuses costs it nothing: the beacon relays what a stranger hands it without checking the signature, and the reader takes such a frame and is ready for the next one, so a legitimate flight still arrives inside the machine-flight wait",
+    ),
+    Capability::witnessed(
+        "library.peer.presence.concurrent_waiters",
+        "one installed session releases every request that was waiting for one: two requests parked with no session both answer the beacon's own answer, so the second is not left waiting for the next refresh — its own request bound would have run out first, and it would have answered that no session could be had",
+    ),
+    Capability::witnessed(
+        "library.peer.presence.every_waiter_woken",
+        "a flight from a peer wakes every handle waiting on that peer, not only the last one to file a waker: two handles on one peer, each polled once with a waker of its own, are both woken by one flight, so a second ceremony on the same peer is not left sleeping until its own deadline",
     ),
     // The message layer: the queue a sender keeps, the offer it makes, the answers a
     // receiver gives, and the rights around both.

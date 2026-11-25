@@ -10,7 +10,7 @@ use std::time::Duration;
 use mahbot_peers::identity::PeerId;
 use mahbot_peers::peer::{
     Account, Binding, ConnectFailure, Connections, Floor, Instance, Label, Pair, Presence,
-    Recovery, StopCause,
+    Recovery, Registration, StopCause,
 };
 use mahbot_peers::tls::PeerPolicy;
 use quinn::crypto::rustls::QuicServerConfig;
@@ -54,16 +54,19 @@ pub(super) fn holds_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 
 /// Run a machine's presence and wait until the beacon holds its registration.
 ///
-/// A running machine keeps itself findable; a case that needs it registered before the
-/// next step asks here rather than guessing how many scheduler turns a handshake and a
-/// registration take.
+/// A running machine keeps itself findable: the presence registers by itself and stays
+/// registered until it is dropped. A case that needs it registered before the next step asks here
+/// rather than guessing how many scheduler turns a handshake and a registration take.
+///
+/// One `Presence` per machine per case: a second one would displace the first's registration, and
+/// that is the very thing the presence exists to prevent. A machine that restarts gets a new
+/// endpoint, so its presence is rebuilt after the restart.
 pub(super) async fn keep_findable(
     sim: &Sim,
     beacon: &TestBeacon,
     machine: &Machine,
-) -> Result<tokio::task::JoinHandle<()>, String> {
+) -> Result<Presence, String> {
     let presence = Presence::new(beacon.client(machine)?);
-    let task = tokio::spawn(async move { presence.run().await });
     let registry = beacon.registry();
     let peer = machine.peer_id();
     within(sim, Duration::from_secs(120), async {
@@ -74,14 +77,14 @@ pub(super) async fn keep_findable(
                 .snapshot()
                 .iter()
                 .any(|(id, _)| *id == peer);
-            if held {
+            if held && presence.state() == Registration::Registered {
                 return Ok::<(), String>(());
             }
             tokio::task::yield_now().await;
         }
     })
     .await??;
-    Ok(task)
+    Ok(presence)
 }
 
 /// Await the moment the pair's recovery counts one dial that met the connection which

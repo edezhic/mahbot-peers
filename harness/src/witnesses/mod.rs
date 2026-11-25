@@ -33,6 +33,7 @@ mod link;
 mod machines;
 mod messages;
 mod peer;
+mod presence;
 mod rights;
 mod server;
 mod support;
@@ -1596,6 +1597,122 @@ const WITNESSES: &[Witness] = &[
         id: "an_action_to_a_peer_that_is_not_there_names_the_failure",
         capabilities: &["library.peer.actions.connect_failure"],
         case: actions::link::an_action_to_a_peer_that_is_not_there_names_the_failure,
+    },
+    // One registration per machine, one reader, and where a ceremony's flights go.
+    Witness {
+        id: "a_ceremony_leaves_the_registration_where_it_was",
+        capabilities: &["library.peer.presence.one_registration"],
+        case: presence::a_ceremony_leaves_the_registration_where_it_was,
+    },
+    Witness {
+        id: "a_refresh_during_a_comparison_keeps_the_flight",
+        capabilities: &["library.peer.presence.refresh_during_a_ceremony"],
+        case: presence::a_refresh_during_a_comparison_keeps_the_flight,
+    },
+    Witness {
+        id: "a_comparison_outlives_the_registration_lifetime",
+        capabilities: &["library.peer.presence.outlives_the_lifetime"],
+        case: presence::a_comparison_outlives_the_registration_lifetime,
+    },
+    Witness {
+        id: "a_confirmation_is_not_aged_by_the_flight_timeout",
+        capabilities: &["library.peer.presence.confirmation_not_aged"],
+        case: presence::a_confirmation_is_not_aged_by_the_flight_timeout,
+    },
+    Witness {
+        id: "a_confirmation_is_not_held_for_a_later_ceremony",
+        capabilities: &["library.peer.presence.confirmation_not_held"],
+        case: presence::a_confirmation_is_not_held_for_a_later_ceremony,
+    },
+    Witness {
+        id: "a_refused_frame_does_not_stall_the_reader",
+        capabilities: &["library.peer.presence.reader_not_stalled"],
+        case: presence::a_refused_frame_does_not_stall_the_reader,
+    },
+    Witness {
+        id: "a_flight_that_arrives_before_the_person_starts_is_held",
+        capabilities: &["library.peer.presence.flight_held"],
+        case: presence::a_flight_that_arrives_before_the_person_starts_is_held,
+    },
+    Witness {
+        id: "an_undelivered_flight_is_not_an_unregistered_peer",
+        capabilities: &["library.peer.presence.delivery_and_lookup_told_apart"],
+        case: presence::an_undelivered_flight_is_not_an_unregistered_peer,
+    },
+    Witness {
+        id: "two_peers_pair_with_one_machine_at_once",
+        capabilities: &["library.peer.presence.two_ceremonies"],
+        case: presence::two_peers_pair_with_one_machine_at_once,
+    },
+    Witness {
+        id: "a_cancelled_ceremony_takes_its_waiting_slot",
+        capabilities: &["library.peer.presence.claim_released"],
+        case: presence::a_cancelled_ceremony_takes_its_waiting_slot,
+    },
+    Witness {
+        id: "a_hold_is_bounded_and_keeps_the_newest",
+        capabilities: &["library.peer.presence.hold_bounded"],
+        case: presence::a_hold_is_bounded_and_keeps_the_newest,
+    },
+    Witness {
+        id: "a_hold_keeps_one_opening_per_peer",
+        capabilities: &["library.peer.presence.hold_one_per_peer"],
+        case: presence::a_hold_keeps_one_opening_per_peer,
+    },
+    Witness {
+        id: "a_claim_takes_in_the_opening_held_for_its_peer",
+        capabilities: &["library.peer.presence.claim_takes_the_held_opening"],
+        case: presence::a_claim_takes_in_the_opening_held_for_its_peer,
+    },
+    Witness {
+        id: "a_peers_flights_reach_its_ceremony_in_the_order_they_were_sent",
+        capabilities: &["library.peer.presence.flights_in_order"],
+        case: presence::a_peers_flights_reach_its_ceremony_in_the_order_they_were_sent,
+    },
+    Witness {
+        id: "a_peers_pending_flights_are_bounded",
+        capabilities: &["library.peer.presence.pending_bounded"],
+        case: presence::a_peers_pending_flights_are_bounded,
+    },
+    Witness {
+        id: "a_flight_wakes_every_handle_waiting_on_the_peer",
+        capabilities: &["library.peer.presence.every_waiter_woken"],
+        case: presence::a_flight_wakes_every_handle_waiting_on_the_peer,
+    },
+    Witness {
+        id: "one_session_releases_every_waiting_request",
+        capabilities: &["library.peer.presence.concurrent_waiters"],
+        case: presence::one_session_releases_every_waiting_request,
+    },
+    Witness {
+        id: "a_dropped_handle_takes_its_waiting_with_it",
+        capabilities: &["library.peer.presence.waiter_dropped"],
+        case: presence::a_dropped_handle_takes_its_waiting_with_it,
+    },
+    Witness {
+        id: "a_second_handle_keeps_the_flight_when_the_first_is_dropped",
+        capabilities: &["library.peer.presence.handles_share_the_slot"],
+        case: presence::a_second_handle_keeps_the_flight_when_the_first_is_dropped,
+    },
+    Witness {
+        id: "a_held_opening_older_than_the_flight_timeout_is_not_delivered",
+        capabilities: &["library.peer.presence.stale_opening_dropped"],
+        case: presence::a_held_opening_older_than_the_flight_timeout_is_not_delivered,
+    },
+    Witness {
+        id: "a_request_never_dials_the_beacon",
+        capabilities: &["library.peer.presence.requests_never_dial"],
+        case: presence::a_request_never_dials_the_beacon,
+    },
+    Witness {
+        id: "a_dropped_presence_ends_the_slow_recheck",
+        capabilities: &["library.peer.presence.drop_ends_the_wait"],
+        case: presence::a_dropped_presence_ends_the_slow_recheck,
+    },
+    Witness {
+        id: "a_stale_confirmation_is_not_obeyed_in_a_claimed_slot",
+        capabilities: &["library.peer.presence.stale_confirmation_refused"],
+        case: presence::a_stale_confirmation_is_not_obeyed_in_a_claimed_slot,
     },
 ];
 

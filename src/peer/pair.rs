@@ -23,13 +23,17 @@
 //! 4. the initiator's confirmation;
 //! 5. the responder's confirmation.
 //!
-//! Every flight is an introduction the sender signed, and the session refuses one
+//! Every flight is an introduction the sender signed, and the receiver refuses one
 //! whose signature does not verify; the beacon can neither alter nor re-attribute a
-//! flight. What it can do is replay an old one, so the flights after the opening
-//! carry a value derived from this attempt's transcript (or from the initiator's
-//! commitment, before the transcript exists). A replayed flight does not match, and
-//! the state machine refuses it: a beacon can stop a pair from forming, but it
-//! cannot make a machine record a pairing the other machine did not confirm.
+//! flight. What it can do is replay an old one: the answer is bound to the
+//! initiator's commitment, the reveal is checked against that commitment, and both
+//! confirmations carry a value derived from this attempt's transcript. A replayed
+//! flight does not match what it is checked against, and the state machine refuses
+//! it. An opening is the one flight nothing binds: one that arrives after the opening
+//! is either the simultaneous start the fingerprint rule settles or a replay of an
+//! attempt that is not this one, which changes nothing. A beacon can stop a pair from
+//! forming, but it cannot make a machine record a pairing the other machine did not
+//! confirm.
 //!
 //! A machine writes its record only when its own person confirmed and it has
 //! received the other machine's confirmation. Each flight carries whether its
@@ -61,9 +65,10 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::beacon::{BeaconError, Introduction, Session, timeout};
+use crate::beacon::{BeaconError, Introduction, timeout};
 use crate::identity::{Fingerprint, Identity, PeerId};
 use crate::peer::address;
+use crate::peer::presence::{Flights, Presence};
 use crate::peer::record::{RecordError, RecordStore, Timestamp};
 
 /// How many symbols two people compare.
@@ -256,6 +261,18 @@ impl Body {
     }
 }
 
+/// Whether a flight can start a ceremony: only an opening does, so only an opening is worth
+/// holding for a person who has not started yet.
+pub(crate) fn opens_a_ceremony(payload: &[u8]) -> bool {
+    matches!(Message::parse(payload), Ok(message) if message.kind() == Kind::Commit)
+}
+
+/// Whether a flight's sender waits for the attempt's own lifetime rather than for one machine
+/// flight: a confirmation does, because the peer's person may still be comparing the same string.
+pub(crate) fn waits_for_the_attempt(payload: &[u8]) -> bool {
+    matches!(Message::parse(payload), Ok(message) if message.kind() == Kind::Confirm)
+}
+
 impl Message {
     /// Read a message, refusing anything the closed set does not produce.
     fn parse(bytes: &[u8]) -> Result<Self, PairError> {
@@ -366,8 +383,9 @@ pub enum Outcome {
 /// One side of one ceremony, as a state machine.
 ///
 /// It holds no I/O: a caller feeds it the peer's payloads and sends what it asks
-/// for. [`run`] is the driver that does both over a beacon session; the test rig
-/// drives the machine directly when it has to stand between two of them.
+/// for. [`run`] is the driver that does both over this machine's registration at
+/// the beacon; the test rig drives the machine directly when it has to stand
+/// between two of them.
 pub struct Ceremony {
     me: PeerId,
     peer: PeerId,
@@ -770,19 +788,32 @@ where
     }
 }
 
-/// Run one ceremony over a live beacon session.
+/// Run one ceremony over this machine's registration at the beacon.
 ///
-/// `now` supplies every moment the record needs — the attempt's start and the
-/// pairing's — because the library never reads a clock. `person` is the human
-/// comparison: it is given the six symbols and answers whether they matched the
-/// other machine's. It is awaited, so a person who takes minutes does not block the
-/// reactor; a caller with a blocking UI implements [`Person`] over an async channel.
+/// `presence` is the machine's one [`Presence`]: the ceremony neither opens a session of its own
+/// nor registers one, because a second registration would displace the machine's and a session
+/// nobody reads would take the flights it is waiting for. A flight is delivered to the ceremony
+/// for the peer it comes from — this one — and an opening that arrives before this side's
+/// person has started is held by the presence, not dropped; any other flight for a peer no
+/// ceremony waits on is dropped, because nothing could take it.
 ///
-/// A machine that starts and receives the other machine's opening flight applies
-/// the fingerprint rule: the smaller fingerprint's attempt wins, and the loser's
-/// is dropped without counting against anybody.
+/// `now` supplies every moment the record needs — the attempt's start and the pairing's —
+/// because the library never reads a clock. `person` is the human comparison: it is given the
+/// six symbols and answers whether they matched the other machine's. It is awaited, so a person
+/// who takes minutes does not block the reactor; a caller with a blocking UI implements
+/// [`Person`] over an async channel.
+///
+/// A machine that starts and receives the other machine's opening flight applies the fingerprint
+/// rule: the smaller fingerprint's attempt wins, and the loser's is dropped without counting
+/// against anybody.
+///
+/// A responder waits for the other machine for as long as its person might still start on their
+/// side, so this call does not end because nothing has arrived yet, and it never names a cause
+/// about the peer: the peer has done nothing the crate observed. A machine whose own registration
+/// is not held at the beacon cannot be reached by the other side at all, and says so through
+/// [`Presence::state`], which is where a product reads a beacon outage during a ceremony.
 pub async fn run<N, P>(
-    session: &Session,
+    presence: &Presence,
     me: &Identity,
     opening: Opening,
     store: &RecordStore,
@@ -798,7 +829,7 @@ where
     // The attempt is written once the opening flight is decided: a ceremony that
     // cannot start at all — this machine's own identity, a closed pair — is not an
     // attempt. A flight that then fails ends the attempt, so it blocks no retry.
-    let (peer, mut ceremony, first) = match opening {
+    let (peer, mut ceremony, first, flights) = match opening {
         Opening::Initiate(peer) => {
             let peer_id = peer.peer_id();
             if peer_id == me_id {
@@ -811,7 +842,10 @@ where
             // The address is a hint the peer may dial, not identity: a beacon that
             // cannot answer it does not stop the ceremony, which fails with a beacon
             // error at its first flight if the beacon is really gone.
-            let address = session.observed_address().await.ok();
+            let address = presence.observed_address().await.ok();
+            // The claim is taken before the first flight is sent, so the answer cannot arrive
+            // before anyone waits for it.
+            let flights = presence.flights(peer_id);
             let (ceremony, first) = Ceremony::initiate(me_id, peer, address, already)?;
             (
                 peer_id,
@@ -820,46 +854,45 @@ where
                     send: Some(first),
                     ..Turn::default()
                 },
+                flights,
             )
         }
-        Opening::Respond => loop {
-            // Waiting to be paired is the caller's wait: a machine that nobody
-            // starts with is not a broken ceremony.
-            let introduction = session
-                .next_introduction()
-                .await
-                .map_err(PairError::Beacon)?;
-            let peer_id = introduction.from();
-            if peer_id == me_id {
-                return Err(PairError::OwnIdentity);
+        Opening::Respond => {
+            let openings = presence.openings();
+            loop {
+                // Waiting to be paired is the caller's wait: a machine that nobody
+                // starts with is not a broken ceremony.
+                let introduction = openings.next().await;
+                let peer_id = introduction.from();
+                if peer_id == me_id {
+                    return Err(PairError::OwnIdentity);
+                }
+                // The presence holds only openings, so this flight can start a ceremony; a
+                // peer this machine has closed is the one case it cannot know about, and
+                // another machine may still start.
+                if store.is_closed(&peer_id) {
+                    continue;
+                }
+                let already = store.is_paired(&peer_id);
+                // Best effort, like the initiator's: the answer is a hint, and a beacon
+                // that cannot give it has not ended this machine's wait.
+                let address = presence.observed_address().await.ok();
+                let (ceremony, turn) = Ceremony::respond(me_id, &introduction, address, already)?;
+                // From here the ceremony is this peer's: every later flight of it arrives on
+                // this handle, and no other peer's does. A flight that arrived while the
+                // opening was being answered is in the peer's slot only if a ceremony had
+                // already claimed it; otherwise only an opening was held, and this claim takes
+                // that in.
+                let flights = presence.flights(peer_id);
+                break (peer_id, ceremony, turn, flights);
             }
-            // A stranger's malformed or non-opening flight is not this machine's
-            // ceremony: drop it and keep waiting, so one payload from any machine
-            // with a beacon session cannot end the wait. The same goes for a peer
-            // this machine has closed: another machine may still start.
-            let Ok(message) = Message::parse(introduction.payload()) else {
-                continue;
-            };
-            if message.kind() != Kind::Commit || store.is_closed(&peer_id) {
-                continue;
-            }
-            let already = store.is_paired(&peer_id);
-            // Best effort, like the initiator's: the answer is a hint, and a beacon
-            // that cannot give it has not ended this machine's wait.
-            let address = session.observed_address().await.ok();
-            let (ceremony, turn) =
-                Ceremony::answer(me_id, &introduction, &message, address, already)?;
-            break (peer_id, ceremony, turn);
-        },
+        }
     };
     // An opening that already decides the ceremony — both sides hold the pair —
     // writes no attempt: nothing is being attempted.
     if let Some(outcome) = first.outcome {
         if let Some(bytes) = first.send {
-            session
-                .introduce(peer, &bytes)
-                .await
-                .map_err(PairError::Beacon)?;
+            send(presence, peer, &bytes).await?;
         }
         return finish(store, &now, outcome);
     }
@@ -867,12 +900,12 @@ where
         .begin_attempt(&peer, now())
         .map_err(PairError::Record)?;
     let flight = Flight {
-        session,
+        presence,
         store,
         now: &now,
         expires_at: attempt.expires_at,
     };
-    let outcome = drive(&mut ceremony, first, peer, &mut person, &flight).await;
+    let outcome = drive(&mut ceremony, first, peer, &mut person, &flight, &flights).await;
     if outcome.is_err() {
         // The ceremony ended without a comparison: it counts against nobody and
         // must not block a retry. A crash is the case the attempt's expiry is for.
@@ -881,10 +914,23 @@ where
     outcome
 }
 
-/// What the driver and the turn applier share: the session, the record, the
-/// caller's moment and the instant the attempt stops being one.
+/// Hand one ceremony flight to the peer.
+///
+/// The beacon's one answer about a delivery is [`BeaconError::UnknownPeer`], which says what
+/// became of the flight and nothing about the peer: it covers both a peer the beacon holds no
+/// registration for and a connection that could not take the frame, so a sentence naming either
+/// would be a cause this machine did not observe.
+async fn send(presence: &Presence, peer: PeerId, bytes: &[u8]) -> Result<(), PairError> {
+    presence
+        .introduce(peer, bytes)
+        .await
+        .map_err(PairError::Beacon)
+}
+
+/// What the driver and the turn applier share: the machine's presence, the flights it is waiting
+/// on, the record, the caller's moment and the instant the attempt stops being one.
 struct Flight<'a, N> {
-    session: &'a Session,
+    presence: &'a Presence,
     store: &'a RecordStore,
     now: &'a N,
     expires_at: Timestamp,
@@ -901,6 +947,7 @@ async fn drive<N, P>(
     peer: PeerId,
     person: &mut P,
     flight: &Flight<'_, N>,
+    flights: &Flights<'_>,
 ) -> Result<Outcome, PairError>
 where
     N: Fn() -> Timestamp,
@@ -912,10 +959,9 @@ where
     let now = flight.now;
     let expires_at = flight.expires_at;
     loop {
-        // A machine flight waits at most PAIR_FLIGHT_TIMEOUT. A confirmation
-        // waits for what is left of the attempt: the peer's own person is
-        // comparing the same string, and a slow human is not a dropped link. What a
-        // silent peer means differs with the wait, and neither is a beacon outage.
+        // A machine flight waits at most PAIR_FLIGHT_TIMEOUT. A confirmation waits for what is
+        // left of the attempt: the peer's own person is comparing the same string, and a slow
+        // human is not a dropped link.
         let remaining = expires_at.remaining(now());
         if remaining.is_zero() {
             return Err(PairError::AttemptExpired { peer });
@@ -925,18 +971,13 @@ where
         } else {
             PAIR_FLIGHT_TIMEOUT.min(remaining)
         };
-        let introduction = match flight.session.next_introduction_within(bound).await {
-            Ok(Some(introduction)) => introduction,
-            Ok(None) if now() >= expires_at => return Err(PairError::AttemptExpired { peer }),
-            Ok(None) => return Err(PairError::FlightTimeout { peer, after: bound }),
-            Err(error) => return Err(PairError::Beacon(error)),
+        let Some(introduction) = timeout(&**flight.presence.runtime(), bound, flights.next()).await
+        else {
+            if now() >= expires_at {
+                return Err(PairError::AttemptExpired { peer });
+            }
+            return Err(PairError::FlightTimeout { peer, after: bound });
         };
-        // An introduction from anybody else is not this ceremony's. Dropping it is
-        // safer than failing: a stranger must not be able to end a pairing by
-        // sending one flight.
-        if introduction.from() != peer {
-            continue;
-        }
         let message = Message::parse(introduction.payload())?;
         // Both sides started at once: the smaller fingerprint's attempt wins.
         if ceremony.started() && ceremony.awaits_reply() && message.kind() == Kind::Commit {
@@ -987,11 +1028,7 @@ where
     P: Person,
 {
     if let Some(bytes) = turn.send {
-        flight
-            .session
-            .introduce(peer, &bytes)
-            .await
-            .map_err(PairError::Beacon)?;
+        send(flight.presence, peer, &bytes).await?;
     }
     if let Some(comparison) = turn.show {
         let remaining = flight.expires_at.remaining((flight.now)());
@@ -999,7 +1036,7 @@ where
             return Err(PairError::AttemptExpired { peer });
         }
         let Some(accepted) = timeout(
-            &**flight.session.runtime(),
+            &**flight.presence.runtime(),
             remaining,
             person.ask(comparison),
         )
@@ -1009,11 +1046,7 @@ where
         };
         let answer = ceremony.confirm(accepted)?;
         if let Some(bytes) = answer.send {
-            flight
-                .session
-                .introduce(peer, &bytes)
-                .await
-                .map_err(PairError::Beacon)?;
+            send(flight.presence, peer, &bytes).await?;
         }
         if let Some(outcome) = answer.outcome {
             return finish(flight.store, flight.now, outcome).map(Some);
@@ -1111,11 +1144,13 @@ pub enum PairError {
     NotPaired,
     /// A message arrived out of order or after the ceremony ended.
     OutOfOrder,
-    /// The peer did not answer a machine flight within [`PAIR_FLIGHT_TIMEOUT`].
-    /// Distinct from [`Self::Beacon`]: the beacon was fine and the peer was silent.
+    /// No flight from the peer arrived within the wait this machine was under: a machine flight
+    /// waits [`PAIR_FLIGHT_TIMEOUT`], and a confirmation waits what is left of the attempt,
+    /// because its sender waits as long as the other person compares. The wait ended with
+    /// nothing, which is what this machine observed and no more.
     FlightTimeout { peer: PeerId, after: Duration },
-    /// The attempt's lifetime passed while a person's answer was outstanding:
-    /// nobody answered the comparison, and the attempt is over.
+    /// The attempt's lifetime passed before the ceremony reached an outcome: a person did not
+    /// answer the comparison in time, or a flight did not arrive in what was left of the attempt.
     AttemptExpired { peer: PeerId },
     /// The introduction was addressed to, or came from, the wrong machine.
     WrongPeer { expected: PeerId, got: PeerId },
@@ -1152,12 +1187,12 @@ impl fmt::Display for PairError {
             Self::OutOfOrder => f.write_str("the ceremony message arrived out of order"),
             Self::FlightTimeout { peer, after } => write!(
                 f,
-                "the peer {} did not answer a ceremony flight within {after:?}",
+                "no ceremony flight from {} arrived within {after:?}",
                 peer.fingerprint()
             ),
             Self::AttemptExpired { peer } => write!(
                 f,
-                "the attempt with {} expired before the comparison was answered",
+                "the attempt with {} expired before the ceremony reached an outcome",
                 peer.fingerprint()
             ),
             Self::WrongPeer { expected, got } => write!(
@@ -1167,8 +1202,8 @@ impl fmt::Display for PairError {
                 got.fingerprint()
             ),
             Self::Entropy => f.write_str("the system randomness source is unavailable"),
-            Self::Beacon(error) => write!(f, "the beacon: {error}"),
-            Self::Record(error) => write!(f, "the peer record: {error}"),
+            Self::Beacon(error) => write!(f, "{error}"),
+            Self::Record(error) => write!(f, "{error}"),
         }
     }
 }

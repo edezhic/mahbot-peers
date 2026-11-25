@@ -163,7 +163,7 @@ pub(crate) fn connection_binding_is_decided_by_one_machine() -> Result<(), Strin
             &laptop,
             &laptop.records(),
         )?;
-        let connection = managed_laptop
+        let _connection = managed_laptop
             .connections
             .connect(&managed_laptop.endpoint, &main.fingerprint())
             .await
@@ -219,7 +219,6 @@ pub(crate) fn connection_binding_is_decided_by_one_machine() -> Result<(), Strin
         if refusal != Refusal::NoRight {
             return Err(format!("the claim allowed or refused as {refusal}"));
         }
-        drop(connection);
         Ok(())
     })
 }

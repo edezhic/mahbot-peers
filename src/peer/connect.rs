@@ -681,8 +681,9 @@ impl fmt::Display for Vanish {
 /// It runs three kinds of task on the injected runtime: one reader that samples whether each
 /// live connection's peer is still answering (the module's note on liveness states the rule),
 /// one binding exchange per connection it keeps, and one task per incoming connection it
-/// accepts. Everything else — the accept loop, a keeper, a presence loop — is a future the
-/// caller spawns and decides when to drop.
+/// accepts. Everything else — the accept loop and one keeper per paired peer — is a future the
+/// caller spawns and decides when to drop; the machine's presence, when the caller keeps one,
+/// runs its own.
 pub struct Connections {
     me: PeerId,
     store: RecordStore,

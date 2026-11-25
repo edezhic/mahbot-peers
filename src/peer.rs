@@ -26,9 +26,10 @@
 //!   stated cap, a slow re-check once an episode is used up, the reasons that start a
 //!   new one, the two states that are never retried, and the state a product reads to
 //!   show what is happening.
-//! - [`presence`] keeps a machine's registration at the beacon alive while it
-//!   runs, so a peer that remembers its address can still find it after a move, and
-//!   takes the registration up again by itself when a beacon that was down returns.
+//! - [`presence`] is the machine's one registration at the beacon: it registers itself and stays
+//!   registered while it exists, takes the beacon up again after an outage, and is the one reader
+//!   of what the beacon pushes, so a peer that remembers its address can still find it after a
+//!   move and a ceremony's flight reaches the ceremony for the peer it came from.
 //! - [`messages`] is what one machine says to another: a body queued durably at the
 //!   sender, offered over the pair's live direct connection, decided by the receiver
 //!   through the rights layer, deduplicated by envelope, delivered at least once,
@@ -144,7 +145,7 @@ pub use pair::{
     COMPARISON_SYMBOLS, Ceremony, Comparison, Opening, Outcome, PAIR_FLIGHT_TIMEOUT, PairError,
     Person, Role, Turn,
 };
-pub use presence::{Presence, Registration};
+pub use presence::{Flights, MAX_HELD, MAX_PENDING, Presence, Registration};
 pub use record::{Attempt, Limits, Malformed, PeerRecord, RecordError, RecordStore, Timestamp};
 pub use recovery::{
     ConnectFailure, NotTrustedCause, RECOVERY_DIALS, RECOVERY_FIRST_GAP, RECOVERY_RECHECK,

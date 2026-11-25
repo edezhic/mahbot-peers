@@ -22,9 +22,9 @@ use crate::connect::TrustSet;
 use crate::machine::Machine;
 use crate::sim::Sim;
 
-use super::peer::{NOW, Shown, pair_together, paired, session};
+use super::peer::NOW;
 use super::rights::{label, person};
-use super::support::{io_error, keep_findable, pair, spawn_keeper, within};
+use super::support::{BUDGET, io_error, keep_findable, pair, spawn_keeper, within};
 
 /// A machine's manager, its endpoint and the accept loop the case spawned.
 ///
@@ -96,35 +96,21 @@ pub(crate) fn pairing_then_direct_connection() -> Result<(), String> {
     block_on(async {
         let sim = Sim::new().map_err(io_error)?;
         let beacon = TestBeacon::start(&sim).map_err(io_error)?;
-        let left = sim.machine().map_err(io_error)?;
-        let right = sim.machine().map_err(io_error)?;
-        let left_store = left.records();
-        let right_store = right.records();
-        let (left_outcome, right_outcome) = pair_together(
+        // Each machine keeps itself findable for the whole case, as a running machine does:
+        // the ceremony runs over its one registration.
+        let (left, right, _left_presence, _right_presence) = super::peer::pair_with_delay(
             &sim,
             &beacon,
-            super::peer::Pairing {
-                left: &left,
-                right: &right,
-                left_opens: mahbot_peers::peer::Opening::Initiate(right.fingerprint()),
-                right_opens: mahbot_peers::peer::Opening::Respond,
-                left_person: &Shown::accepting(),
-                right_person: &Shown::accepting(),
-                left_store: &left_store,
-                right_store: &right_store,
-            },
+            Duration::ZERO,
+            Duration::ZERO,
+            "the ceremony",
         )
         .await?;
-        if !paired(&left_outcome) || !paired(&right_outcome) {
-            return Err("the ceremony did not pair both sides".to_owned());
-        }
+        let left_store = left.records();
+        let right_store = right.records();
         let managed_right = Managed::start(&sim, &beacon, &right, &right_store)?;
         let managed_left = Managed::start(&sim, &beacon, &left, &left_store)?;
-        // The peer keeps itself findable, as a running machine does; the pairing
-        // wrote no address, so the first connect needs the beacon's answer.
-        let presence_task = keep_findable(&sim, &beacon, &right).await?;
-        // The ceremony's sessions are dropped and their closes flushed. The pairing
-        // wrote no address, so this first connect asks the beacon for one — a
+        // The pairing wrote no address, so this first connect asks the beacon for one — a
         // lookup, which is the beacon's part. The data path that follows must not
         // touch it.
         sim.clock().advance(Duration::from_secs(2)).await;
@@ -145,8 +131,7 @@ pub(crate) fn pairing_then_direct_connection() -> Result<(), String> {
                 right.addr()
             ));
         }
-        // The lookup's session is dropped and its close flushed; from here the
-        // connection must add no datagram to the beacon.
+        // From here the connection must add no datagram to the beacon.
         sim.clock().advance(Duration::from_secs(2)).await;
         tokio::task::yield_now().await;
         let mark = sim.link().trace().len();
@@ -171,7 +156,6 @@ pub(crate) fn pairing_then_direct_connection() -> Result<(), String> {
         {
             return Err("the direct data path touched the beacon".to_owned());
         }
-        presence_task.abort();
         Ok(())
     })
 }
@@ -240,7 +224,7 @@ pub(crate) fn reconnect_falls_back_to_the_beacon() -> Result<(), String> {
         let _managed_right = Managed::start(&sim, &beacon, &right, &right_store)?;
         // The machine keeps itself findable the way it does in a running process:
         // the registration is refreshed while it runs, not held by one request.
-        let presence_task = keep_findable(&sim, &beacon, &right).await?;
+        let _right_presence = keep_findable(&sim, &beacon, &right).await?;
         let managed_left = Managed::start(&sim, &beacon, &left, &left_store)?;
         let mark = sim.link().trace().len();
         let connection = within(
@@ -281,7 +265,6 @@ pub(crate) fn reconnect_falls_back_to_the_beacon() -> Result<(), String> {
         {
             return Err("the dialing side rewrote the address it dialed".to_owned());
         }
-        presence_task.abort();
         Ok(())
     })
 }
@@ -332,7 +315,6 @@ pub(crate) fn reconnect_stops_after_both_fail() -> Result<(), String> {
                 trace[mark..].len()
             ));
         }
-        drop(silent);
         Ok(())
     })
 }
@@ -391,7 +373,7 @@ pub(crate) fn four_failures_are_distinct() -> Result<(), String> {
         // The beacon knows the peer and gives its address, and no connection can be
         // made to it: the peer's path answers nothing.
         let pathless_peer = sim.machine().map_err(io_error)?;
-        let pathless_session = session(&beacon, &pathless_peer).await?;
+        let _pathless_presence = keep_findable(&sim, &beacon, &pathless_peer).await?;
         left_store
             .record_pairing(&pathless_peer.peer_id(), NOW)
             .map_err(|error| error.to_string())?;
@@ -430,7 +412,6 @@ pub(crate) fn four_failures_are_distinct() -> Result<(), String> {
         if variants.iter().any(|found| !found) {
             return Err("a failure was reported as another".to_owned());
         }
-        drop(pathless_session);
         Ok(())
     })
 }
@@ -939,7 +920,6 @@ pub(crate) fn reconnect_cause_names_the_remembered_address() -> Result<(), Strin
                 ));
             }
         }
-        drop(silent);
         Ok(())
     })
 }
@@ -950,12 +930,18 @@ pub(crate) fn presence_keeps_registration_alive() -> Result<(), String> {
         let beacon = TestBeacon::start(&sim).map_err(io_error)?;
         let machine = sim.machine().map_err(io_error)?;
         let watcher = sim.machine().map_err(io_error)?;
-        let watcher_session = session(&beacon, &watcher).await?;
+        let watcher_presence = keep_findable(&sim, &beacon, &watcher).await?;
         // A registration that is never refreshed is forgotten on its own lifetime
         // while the session stays open: keep-alive traffic holds the connection, and
         // the registration is what expires.
-        let idle_session = session(&beacon, &machine).await?;
-        if watcher_session
+        let idle_session = within(&sim, BUDGET, beacon.client(&machine)?.connect())
+            .await?
+            .map_err(|error| error.to_string())?;
+        idle_session
+            .register()
+            .await
+            .map_err(|error| error.to_string())?;
+        if watcher_presence
             .lookup(&machine.peer_id())
             .await
             .map_err(|error| error.to_string())?
@@ -965,7 +951,7 @@ pub(crate) fn presence_keeps_registration_alive() -> Result<(), String> {
         }
         sim.clock().advance(Duration::from_secs(400)).await;
         tokio::task::yield_now().await;
-        if watcher_session
+        if watcher_presence
             .lookup(&machine.peer_id())
             .await
             .map_err(|error| error.to_string())?
@@ -980,14 +966,14 @@ pub(crate) fn presence_keeps_registration_alive() -> Result<(), String> {
         }
         // A machine that wants to be found refreshes, and its registration outlives
         // the beacon's lifetime.
-        let task = keep_findable(&sim, &beacon, &machine).await?;
+        let _presence = keep_findable(&sim, &beacon, &machine).await?;
         sim.clock().advance(Duration::from_secs(400)).await;
-        // The refresh is a session and a registration on the clean link: what the advance
+        // The refresh is a registration on the clean link: what the advance
         // starts, a few scheduler turns finish. Ask until the answer is there rather than
         // counting turns.
         let answer = within(&sim, Duration::from_secs(120), async {
             loop {
-                match watcher_session.lookup(&machine.peer_id()).await {
+                match watcher_presence.lookup(&machine.peer_id()).await {
                     Ok(Some(address)) => return Ok::<_, String>(address),
                     Ok(None) => tokio::task::yield_now().await,
                     Err(error) => return Err(error.to_string()),
@@ -995,11 +981,9 @@ pub(crate) fn presence_keeps_registration_alive() -> Result<(), String> {
             }
         })
         .await??;
-        task.abort();
         if answer != machine.addr() {
             return Err("the refreshed registration was forgotten".to_owned());
         }
-        drop(idle_session);
         Ok(())
     })
 }
@@ -1057,50 +1041,42 @@ fn no_second_ceremony(
 
 /// Two machines paired by a real ceremony, with a manager and its accept loop on
 /// the left. The right is left un-managed, so a case can restart it first.
+///
+/// The presences the ceremony ran over are returned with the machines: the caller decides how
+/// long each machine stays registered, and dropping one takes that machine's registration with it.
 async fn paired_by_ceremony(
     sim: &Sim,
     beacon: &TestBeacon,
-) -> Result<(Machine, Machine, RecordStore, Managed), String> {
-    let left = sim.machine().map_err(io_error)?;
-    let right = sim.machine().map_err(io_error)?;
+) -> Result<(Machine, Machine, RecordStore, Managed, (Presence, Presence)), String> {
+    let (left, right, left_presence, right_presence) =
+        super::peer::pair_with_delay(sim, beacon, Duration::ZERO, Duration::ZERO, "the ceremony")
+            .await?;
     let left_store = left.records();
-    let right_store = right.records();
-    // A real ceremony, not a record written by hand.
-    let (left_outcome, right_outcome) = pair_together(
-        sim,
-        beacon,
-        super::peer::Pairing {
-            left: &left,
-            right: &right,
-            left_opens: mahbot_peers::peer::Opening::Initiate(right.fingerprint()),
-            right_opens: mahbot_peers::peer::Opening::Respond,
-            left_person: &Shown::accepting(),
-            right_person: &Shown::accepting(),
-            left_store: &left_store,
-            right_store: &right_store,
-        },
-    )
-    .await?;
-    if !paired(&left_outcome) || !paired(&right_outcome) {
-        return Err("the ceremony did not pair both sides".to_owned());
-    }
     let managed_left = Managed::start(sim, beacon, &left, &left_store)?;
-    Ok((left, right, left_store, managed_left))
+    Ok((
+        left,
+        right,
+        left_store,
+        managed_left,
+        (left_presence, right_presence),
+    ))
 }
 
 pub(crate) fn pairing_then_reconnect_after_restart() -> Result<(), String> {
     block_on(async {
         let sim = Sim::new().map_err(io_error)?;
         let beacon = TestBeacon::start(&sim).map_err(io_error)?;
-        let (left, mut right, left_store, managed_left) = paired_by_ceremony(&sim, &beacon).await?;
+        let (left, mut right, left_store, managed_left, (_left_presence, right_presence)) =
+            paired_by_ceremony(&sim, &beacon).await?;
         // The peer goes away and comes back over the same root. The pairing
         // ceremony wrote no address, so the left has no remembered one to try: the
         // beacon is its first source, and it is still a lookup, not a path.
+        drop(right_presence);
         right.restart().await?;
         let right_store = right.records();
         let _managed_right = Managed::start(&sim, &beacon, &right, &right_store)?;
-        let presence_task = keep_findable(&sim, &beacon, &right).await?;
-        // Flush the ceremony sessions' closes, then watch the reconnection alone.
+        let _right_presence = keep_findable(&sim, &beacon, &right).await?;
+        // The reconnection is watched on its own, after the registration is in place.
         sim.clock().advance(Duration::from_secs(2)).await;
         tokio::task::yield_now().await;
         let second = within(
@@ -1123,7 +1099,6 @@ pub(crate) fn pairing_then_reconnect_after_restart() -> Result<(), String> {
             return Err("the reconnection changed the pairing".to_owned());
         }
         no_second_ceremony(&left_store, &right.peer_id(), &right_store, &left.peer_id())?;
-        presence_task.abort();
         Ok(())
     })
 }
@@ -1134,12 +1109,15 @@ pub(crate) fn pairing_restart_then_keeper_reconnects() -> Result<(), String> {
     block_on(async {
         let sim = Sim::new().map_err(io_error)?;
         let beacon = TestBeacon::start(&sim).map_err(io_error)?;
-        let (left, mut right, left_store, managed_left) = paired_by_ceremony(&sim, &beacon).await?;
+        let (left, mut right, left_store, managed_left, (_left_presence, right_presence)) =
+            paired_by_ceremony(&sim, &beacon).await?;
+        // The right is registered by this case below, at the moment it needs it.
+        drop(right_presence);
         let right_store = right.records();
         let managed_right = Managed::start(&sim, &beacon, &right, &right_store)?;
         // The right keeps itself findable while it runs, so the left's first dial has
         // a beacon answer to use.
-        let right_presence_task = keep_findable(&sim, &beacon, &right).await?;
+        let right_presence = keep_findable(&sim, &beacon, &right).await?;
         // The left dials once, so the right learns the address authenticated data
         // arrives from — the one its keeper tries first after the restart.
         let first = within(
@@ -1163,12 +1141,12 @@ pub(crate) fn pairing_restart_then_keeper_reconnects() -> Result<(), String> {
         // The peer goes away and comes back over the same root at a fresh address,
         // as a machine that restarted does; everything in memory is gone.
         drop(first);
-        right_presence_task.abort();
+        drop(right_presence);
         drop(managed_right);
         right.restart().await?;
         let right_store = right.records();
         let managed_right = Managed::start(&sim, &beacon, &right, &right_store)?;
-        let right_presence_task = keep_findable(&sim, &beacon, &right).await?;
+        let _right_presence = keep_findable(&sim, &beacon, &right).await?;
         // No caller dials: the restarted machine's own start is the trigger, and its
         // keeper works through the remembered address by itself.
         let keeper = spawn_keeper(&managed_right, &left);
@@ -1199,7 +1177,6 @@ pub(crate) fn pairing_restart_then_keeper_reconnects() -> Result<(), String> {
         }
         no_second_ceremony(&left_store, &right.peer_id(), &right_store, &left.peer_id())?;
         keeper.abort();
-        right_presence_task.abort();
         Ok(())
     })
 }
@@ -4942,8 +4919,8 @@ pub(crate) fn pair_recovers_after_the_beacon_returns() -> Result<(), String> {
         if &received[..] != b"back again" {
             return Err(format!("the datagram arrived as {received:?}"));
         }
-        left_presence.abort();
-        right_presence.abort();
+        drop(left_presence);
+        drop(right_presence);
         left_keeper.abort();
         right_keeper.abort();
         Ok(())
@@ -5058,8 +5035,8 @@ pub(crate) fn pair_recovers_after_the_peer_moves() -> Result<(), String> {
             }
         })
         .await?;
-        left_presence.abort();
-        right_presence.abort();
+        drop(left_presence);
+        drop(right_presence);
         keeper.abort();
         right_keeper.abort();
         Ok(())
@@ -5069,19 +5046,14 @@ pub(crate) fn pair_recovers_after_the_peer_moves() -> Result<(), String> {
 /// This machine's own registration comes back by itself when the beacon does: a beacon that
 /// is killed — silenced with no close — makes the presence report it as unreachable with the
 /// attempt count growing, and a beacon that comes back at the same address with the same
-/// key finds the registration made again, with the run still going. A run that is dropped —
-/// how a caller stops it — leaves the state idle rather than claiming a registration nothing
-/// refreshes.
+/// key finds the registration made again. Dropping the presence closes its session, and the
+/// beacon forgets the registration with it.
 pub(crate) fn presence_returns_after_the_beacon_restarts() -> Result<(), String> {
     block_on(async {
         let sim = Sim::new().map_err(io_error)?;
         let mut beacon = TestBeacon::start(&sim).map_err(io_error)?;
         let machine = sim.machine().map_err(io_error)?;
-        let presence = Arc::new(Presence::new(beacon.client(&machine)?));
-        let task = {
-            let presence = Arc::clone(&presence);
-            tokio::spawn(async move { presence.run().await })
-        };
+        let presence = Presence::new(beacon.client(&machine)?);
         // The registration is made before anything is taken away.
         drive_until(&sim, Duration::from_secs(120), || {
             let held = beacon
@@ -5146,19 +5118,22 @@ pub(crate) fn presence_returns_after_the_beacon_restarts() -> Result<(), String>
             }
         })
         .await?;
-        if task.is_finished() {
-            return Err("the presence stopped instead of registering again".to_owned());
-        }
-        // Dropping the run is how a caller stops it, and the state must not keep claiming a
-        // registration nothing is refreshing.
-        task.abort();
-        let _ = task.await;
-        if presence.state() != Registration::Idle {
-            return Err(format!(
-                "a stopped presence reads `{}`, not idle",
-                presence.state()
-            ));
-        }
+        // Dropping the presence is how a caller stops it: the session closes with it, and the
+        // beacon has nothing left to hold.
+        drop(presence);
+        drive_until(&sim, RECOVERY_RECHECK + Duration::from_secs(60), || {
+            let held = beacon
+                .registry()
+                .lock()
+                .expect("the beacon registry is not poisoned")
+                .snapshot();
+            if held.iter().any(|(id, _)| *id == machine.peer_id()) {
+                Err("the beacon still holds the registration of a dropped presence".to_owned())
+            } else {
+                Ok(())
+            }
+        })
+        .await?;
         Ok(())
     })
 }

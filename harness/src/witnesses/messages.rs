@@ -37,11 +37,10 @@ use crate::messages::{Messaging, NOW, wait_for, wait_for_state};
 use crate::sim::Sim;
 
 use super::connection::{Managed, closing_peer};
-use super::peer::session;
 use super::rights::{fill_log, label, paired_machines, person};
 use super::support::{
-    binding, counted_dial, field, holds_bytes, io_error, main_binding, offer_frame, pair, ready,
-    single_ending, spawn_keeper, wait_live, within,
+    binding, counted_dial, field, holds_bytes, io_error, keep_findable, main_binding, offer_frame,
+    pair, ready, single_ending, spawn_keeper, wait_live, within,
 };
 
 /// Offer one message by hand, as the sender's own service would.
@@ -3229,8 +3228,8 @@ pub(crate) fn the_beacon_never_carries_a_message() -> Result<(), String> {
         let connected = ready(&sim, &beacon, false, Arc::new(NoFloor)).await?;
         // Both machines keep themselves findable, so the beacon's memory is not empty and
         // the claim is about what it holds, not about a server nobody ever spoke to.
-        let _main_session = session(&beacon, &connected.main).await?;
-        let _laptop_session = session(&beacon, &connected.laptop).await?;
+        let _main_presence = keep_findable(&sim, &beacon, &connected.main).await?;
+        let _laptop_presence = keep_findable(&sim, &beacon, &connected.laptop).await?;
         connected
             .laptop_messages
             .serve(&connected.laptop_managed.connections, &connected.main);

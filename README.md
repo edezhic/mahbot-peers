@@ -23,7 +23,7 @@ The library (`src/`) holds:
 | `tls` | TLS 1.3 with raw public keys (RFC 7250), pinned to the peer's fingerprint instead of a certificate chain, with a per-service ALPN and resumption off so the pin always runs |
 | `net` | endpoint construction over an injected datagram socket and an injected clock — no default for either |
 | `beacon` | the beacon: the closed message set (`wire`), the client half (`Beacon`, `Session`) — register, look an id up, learn the address observed on this path, hand a signed introduction over, take the ones pushed to a live session — and the one deadline combinator the client and the server share (`timeout`, whose documentation says why there is one copy and not two) |
-| `peer` | the peer layer: `record` is the durable memory of another machine, at both levels; `access` is the connection level's vocabulary — the account on the instance, the assistant, the pair, the four capabilities, the rights and the small versioned fact; `pair` the acquaintance ceremony, `connect` the per-machine connection manager, `recovery` the one retry policy for a pair, `presence` the registration refresh that re-arms itself after a beacon outage, `binding` the exchange that carries the connection level over a live connection, `rights` the decision, `audit` the record of what happened, `messages` the queue a machine keeps for a peer and the offer it makes over the pair's own connection, `actions` the at-most-once command with its durable journal and unknown marks, and `inbox` the one reader that tells a message from an action on that connection. Each is documented where it is enforced |
+| `peer` | the peer layer: `record` is the durable memory of another machine, at both levels; `access` is the connection level's vocabulary — the account on the instance, the assistant, the pair, the four capabilities, the rights and the small versioned fact; `pair` the acquaintance ceremony, `connect` the per-machine connection manager, `recovery` the one retry policy for a pair, `presence` the machine's one registration at the beacon — kept alive by itself, and the one reader of what the beacon pushes to it, `binding` the exchange that carries the connection level over a live connection, `rights` the decision, `audit` the record of what happened, `messages` the queue a machine keeps for a peer and the offer it makes over the pair's own connection, `actions` the at-most-once command with its durable journal and unknown marks, and `inbox` the one reader that tells a message from an action on that connection. Each is documented where it is enforced |
 
 The key-replacement invariant covers every shipped source: no `fs::rename`,
 `remove_dir` or `fs::copy` anywhere, and no write form in the identity module. The
@@ -249,11 +249,50 @@ once, and self-recovery resumes when the caller runs `keep_connected` again — 
 product knows it is the one that has to. A stop whose cause is still there is answered as the stop,
 with its cause, and that is the same cause the readable state shows.
 
-The machine stays findable by itself too: `Presence::run` opens and holds its own session, and
-when the beacon is gone it opens another — so a beacon that comes back finds this machine
-registered again with no person and no restart. `Presence::state` reports a `Registration`, so a
-product can tell a registration being refreshed from a beacon that is unreachable and when the next
-try is due.
+The machine stays findable by itself too, and has exactly one registration: `Presence` is built once
+per machine, registers at once and keeps itself registered — refreshing at a third of the answered
+lifetime, dialling again as soon as its session closes, and opening a new session after a beacon
+outage — for as long as it exists. Dropping it closes the session and ends both of its tasks: the
+keeper is woken out of a failed-dial wait, and the reader out of the session's wait or its pause. A
+dial already in flight is the one thing a drop does not cancel — it finishes first, so the
+endpoint handle that task holds can outlive the drop by up to `BEACON_REQUEST_TIMEOUT`, and that is
+the bound. A product that must have the socket back before it drops the presence and then closes and
+drops its own endpoint handle: the connection and the dial end with it, both tasks finish, and the
+socket goes. The beacon forgets the registration with the connection. `Presence::state` reports a
+`Registration`, so a product can tell a registration being refreshed from a beacon that is
+unreachable and when the next try is due. A request — `lookup`, `observed_address`,
+`introduce` — rides that registration and never dials a session of its own: a request that finds
+none waits for one until its own request bound runs out and then answers `Unavailable`, so the retry
+cadence is the keeper's and a caller that asks again does not become it.
+
+The beacon keeps one registration per peer and the latest wins, so a second session that registers
+would displace the machine's. The ceremony therefore takes the machine's `Presence` instead of a
+session of its own: it neither registers nor opens a connection, and the flight it is waiting for
+cannot be pushed to a session nobody reads. `Presence` is also the one reader of what the beacon
+pushes: an introduction from a peer a ceremony waits on goes to that ceremony and never to another,
+and that peer's flights wait for it in the order they were sent, `MAX_PENDING` of them at most —
+the second flight of an exchange is the next step of it, so handing the newer one over first would
+lose the step before it and end the ceremony as out of order, and at the bound the oldest goes. An
+opening from a peer nobody waits on yet is held instead — one per peer, and for `MAX_HELD` peers
+at most, handed out newest first because an opening that has been sitting is one whose initiator is
+likelier to have given up already — so an opening that arrives before the other person has started
+is not lost and a stranger cannot fill this machine's memory. Only an opening is held: no other
+flight can start a ceremony, so no other is kept for one. A frame the reader refuses costs it
+nothing — the beacon relays what any machine hands it, without looking at the signature — so a
+stranger's bad bytes cannot make the reader sleep through a legitimate flight. One rule decides
+whether a flight is handed over, on either path, and it is the wait its sender is under: a machine
+flight older than `PAIR_FLIGHT_TIMEOUT` is not shown to a person, in the hold or in a peer's slot,
+while a confirmation is not aged by it, because its sender waits for as long as the peer's person
+compares the same string. A cancelled ceremony takes its claim with it, and the flights waiting for
+that peer go with the last handle on it; a `Flights` handle borrows the presence it reads, so a
+waiter cannot outlive the registration that would feed it, and a handle that never took a peer takes
+its waker with it. The invariant `peer.one_beacon_registration` scans the crate's own sources to
+keep it so: the registration is made and read in one file. A raw `Session` a product opens for
+itself is not prevented from registering — the crate cannot hold one registration per machine
+without process-global state, which it does not have — so a product reaches the beacon through its
+presence. The crate opens one session of its own besides: the manager's lookup, which registers
+nothing and reads nothing, so it displaces no registration — and the harness's rig opens raw
+sessions that do register, which is why the invariant's scope leaves the rig out.
 
 Two things would defeat a retry, and both are fixed rather than papered over. A connection that is
 merely not yet declared dead does not outrank a fresh one, and the manager reads that itself rather
@@ -281,29 +320,53 @@ handshakes costs a bounded number of tasks and delays the next accept by at most
 
 This release changes the public surface, which nothing published before this one had to. The accept
 path takes the manager's endpoint: `Inbox::serve` and the message service are given it so that a
-queued message can cause a dial. `Presence::run` opens and re-opens its own session and returns
-nothing, and `Presence::state` reports a `Registration` — no answer from the beacon yet, held, or
-the beacon unreachable with the moment the next try was due — so a product can show a beacon
-outage instead of looking as though nothing were wrong. The policy has a module of its own,
-`peer::recovery`, because the state a product shows and the failures it reports are one contract:
-`Recovery`, `StopCause`, `ConnectFailure` and `NotTrustedCause` live there — the last two moved
-from `peer::connect` and are still re-exported from `peer` — together with the stated numbers a
-caller plans against, `RECOVERY_FIRST_GAP`, `RECOVERY_DIALS` and `RECOVERY_RECHECK`, which is the
-bound the slow re-check never exceeds, and `DIAL_BUDGET`, the longest one dial may take, which the
-action budget reserves so that a record read cannot cost the dial. `ConnectFailure` gained
+queued message can cause a dial. `Presence` keeps its own registration: it registers when it is
+built and refreshes itself, and `Presence::state` reports a `Registration` — no answer from the
+beacon yet, held, or the beacon unreachable with the moment the next try was due — so a product
+can show a beacon outage instead of looking as though nothing were wrong. The policy has a module of
+its own, `peer::recovery`, because the state a product shows and the failures it reports are one
+contract: `Recovery`, `StopCause`, `ConnectFailure` and `NotTrustedCause` live there — the last
+two moved from `peer::connect` and are still re-exported from `peer` — together with the stated
+numbers a caller plans against, `RECOVERY_FIRST_GAP`, `RECOVERY_DIALS` and `RECOVERY_RECHECK`, which
+is the bound the slow re-check never exceeds, and `DIAL_BUDGET`, the longest one dial may take,
+which the action budget reserves so that a record read cannot cost the dial. `ConnectFailure` gained
 `Nowhere` — no beacon and no remembered address, which is configuration rather than a network
 state — and `Deferred` — this machine could not read the peer's record just now, which is not a
-statement about the peer and not a claim that a dial was made. `Connections` gained `wake` (a
-person asking again starts a fresh episode), `ensure` (one dial, paced by the policy, which is how
-a queued message or a requested action dials), `recovery` and `watched` (the state, and whether a
-keeper will act on it), and `vanish_bound`, whose `Vanish` is a reading rather than a bare
-duration. `VANISH_BOUND` is the floor of the bound that reading states, public because a caller
-choosing a keep-alive acts on it. `ACCEPT_IN_FLIGHT` is the cap on half-finished handshakes one
-machine carries at once — public because the lane count it replaced was, and because a caller
-opening a public address needs the number. `Keeper`, `ACCEPT_LANES` and `KEEPER_UNSTABLE_LIMIT`
-are gone, and `Connections::keep_connected` answers the `StopCause` it stopped for. `Presence` is
-no longer `Clone` — it holds the registration it reports — so a product keeps it once, behind
-whatever it already shares, rather than copying it.
+statement about the peer and not a claim that a dial was made. `Connections` gained `wake` (a person
+asking again starts a fresh episode), `ensure` (one dial, paced by the policy, which is how a queued
+message or a requested action dials), `recovery` and `watched` (the state, and whether a keeper will
+act on it), and `vanish_bound`, whose `Vanish` is a reading rather than a bare duration.
+`VANISH_BOUND` is the floor of the bound that reading states, public because a caller choosing a
+keep-alive acts on it. `ACCEPT_IN_FLIGHT` is the cap on half-finished handshakes one machine carries
+at once — public because the lane count it replaced was, and because a caller opening a public
+address needs the number. `Keeper`, `ACCEPT_LANES` and `KEEPER_UNSTABLE_LIMIT` are gone, and
+`Connections::keep_connected` answers the `StopCause` it stopped for. `Presence` is no longer
+`Clone` — it holds the registration it reports — so a product keeps it once, behind whatever it
+already shares, rather than copying it. One registration per machine, and one reader:
+`Presence::new` starts the registration and the reader itself, and `Presence::run` is gone, because
+a loop the caller can cancel is a registration the caller can lose while a ceremony is using it.
+`pair::run` takes a `&Presence` instead of a `Session`, so a caller no longer registers a session of
+its own to run a ceremony. `Presence` gained `lookup`, `observed_address`, `introduce`, `runtime`,
+`flights` and `openings`, and `Flights` is new: `next` for the next introduction of the peer the
+handle is bound to, and a borrow of the presence so a handle cannot outlive the registration it
+reads. `MAX_HELD` is public because it is the hold's stated bound, and `openings` hands held
+openings out newest first. `MAX_PENDING` is public for the same reason: it is how many of one peer's
+flights wait for its ceremony, and they wait in the order the peer sent them — a newer flight does
+not displace an undelivered older one below the bound, and at the bound the oldest goes. Only an
+opening is held, because only an opening can start a ceremony, and a flight is aged by the wait its
+sender is under — the machine-flight timeout for a machine flight, the attempt's own lifetime for
+a confirmation. Dropping the presence ends both of its tasks; a dial already in flight is the one
+wait a drop does not cancel, and its bound is `BEACON_REQUEST_TIMEOUT`. A ceremony that waits to be
+called keeps waiting for as long as its person might still start on the other machine, and it names
+no cause about the peer: a machine whose own registration is not held cannot be reached by the other
+side at all, and says so through `Presence::state`, which is where a product reads a beacon outage
+during a ceremony.
+
+`BeaconError::UnknownPeer`'s text says the beacon did not hand the payload over where it used to say
+the peer was not reachable, which the beacon's one answer does not prove; a ceremony flight it did
+not take is that same error on `PairError::Beacon`, so one sentence covers one fact.
+
+`PairError::FlightTimeout` names the wait that ended and nothing about why nothing arrived.
 
 ## The messages
 

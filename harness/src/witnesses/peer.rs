@@ -4,24 +4,26 @@
 //! opens a socket or starts a process; a claim that needs a real network is in the
 //! capability inventory as unproducible, with what would produce it.
 
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use mahbot_peers::beacon::{Introduction, Session};
+use mahbot_peers::beacon::Introduction;
+use mahbot_peers::identity::PeerId;
 use mahbot_peers::peer::pair::{self, Ceremony, Opening, Outcome};
 use mahbot_peers::peer::{
-    COMPARISON_SYMBOLS, ConnectFailure, Connections, Limits, Malformed, NotTrustedCause,
-    RecordError, RecordStore, Rights, Timestamp,
+    COMPARISON_SYMBOLS, Comparison, ConnectFailure, Connections, Limits, Malformed,
+    NotTrustedCause, Person, Presence, RecordError, RecordStore, Rights, Timestamp,
 };
 
 use crate::beacon::TestBeacon;
-use crate::clock::block_on;
+use crate::clock::{MockClock, block_on};
 use crate::machine::Machine;
 use crate::pair::Mediator;
 use crate::sim::Sim;
 
 use super::rights::person;
-use super::support::{BUDGET, io_error, within};
+use super::support::{BUDGET, io_error, keep_findable, within};
 
 /// A moment a case uses; the library never reads one.
 pub(super) const NOW: Timestamp = Timestamp::from_unix_seconds(1_000_000);
@@ -30,31 +32,27 @@ pub(super) fn now() -> Timestamp {
     NOW
 }
 
-/// A live beacon session for `machine`, registered so introductions reach it.
-pub(super) async fn session(beacon: &TestBeacon, machine: &Machine) -> Result<Session, String> {
-    let session = beacon
-        .client(machine)?
-        .connect()
-        .await
-        .map_err(|error| error.to_string())?;
-    session
-        .register()
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(session)
-}
-
 /// Sign `payload` as `from` for `to`: the one way a case hands a ceremony flight to
 /// the beacon.
 fn introduce(from: &Machine, to: &Machine, payload: Vec<u8>) -> Result<Introduction, String> {
     Introduction::signed(&from.identity, to.peer_id(), payload).map_err(|error| error.to_string())
 }
 
-/// The strings one side showed its person, and how the person answered.
+/// How much of the case's own time one step of a slow person's wait moves: small enough that the
+/// session's own keep-alive runs between the steps.
+const STEP: Duration = Duration::from_secs(5);
+
+/// How much of the case's own time one pairing may take: enough for both people to compare
+/// through a registration's whole lifetime and a half, and consumed only by a case that is stuck.
+const PAIRING_BUDGET: Duration = Duration::from_secs(300);
+
+/// The strings one side showed its person, how the person answered, and how long they took.
 #[derive(Clone, Default)]
 pub(super) struct Shown {
     seen: Arc<Mutex<Vec<String>>>,
     accept: bool,
+    /// How much of the case's own time this person spends before answering.
+    slow: Option<(MockClock, Duration)>,
 }
 
 impl Shown {
@@ -62,6 +60,7 @@ impl Shown {
         Self {
             seen: Arc::new(Mutex::new(Vec::new())),
             accept: true,
+            slow: None,
         }
     }
 
@@ -72,13 +71,15 @@ impl Shown {
         }
     }
 
-    pub(super) fn person(&self) -> impl FnMut(mahbot_peers::peer::Comparison) -> bool + '_ {
-        move |comparison| {
-            self.seen
-                .lock()
-                .expect("the shown list is not poisoned")
-                .push(comparison.to_string());
-            self.accept
+    /// A person who takes `by` of the case's own time before answering.
+    ///
+    /// The registration is refreshed at a third of its lifetime, so a comparison that takes
+    /// longer than that is compared under a refresh; one that takes longer than the lifetime
+    /// itself is compared after the registration would have expired if nothing refreshed it.
+    pub(super) fn taking(clock: &MockClock, by: Duration) -> Self {
+        Self {
+            slow: Some((clock.clone(), by)),
+            ..Self::accepting()
         }
     }
 
@@ -90,15 +91,41 @@ impl Shown {
     }
 }
 
+impl Person for Shown {
+    async fn ask(&mut self, comparison: Comparison) -> bool {
+        self.seen
+            .lock()
+            .expect("the shown list is not poisoned")
+            .push(comparison.to_string());
+        if let Some((clock, by)) = &self.slow {
+            // To a target rather than by a total, because both people compare at once and share
+            // one clock.
+            let until = clock.elapsed() + *by;
+            while let Some(step) = until
+                .checked_sub(clock.elapsed())
+                .filter(|left| !left.is_zero())
+            {
+                clock.advance(step.min(STEP)).await;
+                tokio::task::yield_now().await;
+            }
+        }
+        self.accept
+    }
+}
+
 /// The two sides of one comparison: the machines, how each enters, the people and
 /// the stores they write.
 pub(super) struct Pairing<'a> {
     pub left: &'a Machine,
     pub right: &'a Machine,
+    /// Each machine's one presence: the ceremony runs over it and never registers a session of
+    /// its own.
+    pub left_presence: &'a Presence,
+    pub right_presence: &'a Presence,
     pub left_opens: Opening,
     pub right_opens: Opening,
-    pub left_person: &'a Shown,
-    pub right_person: &'a Shown,
+    pub left_person: Shown,
+    pub right_person: Shown,
     pub left_store: &'a RecordStore,
     pub right_store: &'a RecordStore,
 }
@@ -106,28 +133,37 @@ pub(super) struct Pairing<'a> {
 /// Run one ceremony on each side over one beacon, and hand back both outcomes.
 pub(super) async fn pair_together(
     sim: &Sim,
-    beacon: &TestBeacon,
     pairing: Pairing<'_>,
 ) -> Result<(Result<Outcome, String>, Result<Outcome, String>), String> {
-    let left_session = session(beacon, pairing.left).await?;
-    let right_session = session(beacon, pairing.right).await?;
-    let (left_outcome, right_outcome) = within(sim, Duration::from_secs(90), async {
+    let Pairing {
+        left,
+        right,
+        left_presence,
+        right_presence,
+        left_opens,
+        right_opens,
+        left_person,
+        right_person,
+        left_store,
+        right_store,
+    } = pairing;
+    let (left_outcome, right_outcome) = within(sim, PAIRING_BUDGET, async {
         tokio::join!(
             pair::run(
-                &left_session,
-                &pairing.left.identity,
-                pairing.left_opens,
-                pairing.left_store,
+                left_presence,
+                &left.identity,
+                left_opens,
+                left_store,
                 now,
-                pairing.left_person.person(),
+                left_person,
             ),
             pair::run(
-                &right_session,
-                &pairing.right.identity,
-                pairing.right_opens,
-                pairing.right_store,
+                right_presence,
+                &right.identity,
+                right_opens,
+                right_store,
                 now,
-                pairing.right_person.person(),
+                right_person,
             ),
         )
     })
@@ -140,6 +176,84 @@ pub(super) async fn pair_together(
 
 pub(super) fn paired(outcome: &Result<Outcome, String>) -> bool {
     matches!(outcome, Ok(Outcome::Paired { .. }))
+}
+
+/// What the beacon holds for each machine, at each address.
+fn held(beacon: &TestBeacon, expected: &[(PeerId, SocketAddr)]) -> Result<(), String> {
+    let snapshot = beacon
+        .registry()
+        .lock()
+        .expect("the beacon registry is not poisoned")
+        .snapshot();
+    for (peer, address) in expected {
+        match snapshot.iter().find(|(id, _)| id == peer) {
+            Some((_, found)) if found == address => {}
+            Some((_, found)) => {
+                return Err(format!(
+                    "the beacon holds {} at {found}, not at {address}",
+                    peer.fingerprint()
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "the beacon holds no registration for {}",
+                    peer.fingerprint()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run one ceremony between two fresh machines over one beacon, with the initiator's person
+/// taking `left_by` of the case's own time to compare and the responder's person `right_by`, and
+/// hand the machines and their presences back once the pair is written and the beacon still holds
+/// both.
+///
+/// `what` names the case in a failure. The presences are the caller's to keep: dropping them
+/// unregisters the machines.
+pub(super) async fn pair_with_delay(
+    sim: &Sim,
+    beacon: &TestBeacon,
+    left_by: Duration,
+    right_by: Duration,
+    what: &str,
+) -> Result<(Machine, Machine, Presence, Presence), String> {
+    let left = sim.machine().map_err(io_error)?;
+    let right = sim.machine().map_err(io_error)?;
+    let left_store = left.records();
+    let right_store = right.records();
+    let left_presence = keep_findable(sim, beacon, &left).await?;
+    let right_presence = keep_findable(sim, beacon, &right).await?;
+    let expected = [
+        (left.peer_id(), left.addr()),
+        (right.peer_id(), right.addr()),
+    ];
+    held(beacon, &expected)?;
+    let (left_outcome, right_outcome) = pair_together(
+        sim,
+        Pairing {
+            left: &left,
+            right: &right,
+            left_presence: &left_presence,
+            right_presence: &right_presence,
+            left_opens: Opening::Initiate(right.fingerprint()),
+            right_opens: Opening::Respond,
+            left_person: Shown::taking(sim.clock(), left_by),
+            right_person: Shown::taking(sim.clock(), right_by),
+            left_store: &left_store,
+            right_store: &right_store,
+        },
+    )
+    .await?;
+    if !paired(&left_outcome) || !paired(&right_outcome) {
+        return Err(format!(
+            "{what} did not pair: {left_outcome:?} / {right_outcome:?}"
+        ));
+    }
+    sim.clock().advance(Duration::from_secs(2)).await;
+    held(beacon, &expected)?;
+    Ok((left, right, left_presence, right_presence))
 }
 
 // ---------------------------------------------------------------------------
@@ -566,16 +680,19 @@ pub(crate) fn pairing_computes_one_string() -> Result<(), String> {
         let right_store = right.records();
         let left_shown = Shown::accepting();
         let right_shown = Shown::accepting();
+        let left_presence = keep_findable(&sim, &beacon, &left).await?;
+        let right_presence = keep_findable(&sim, &beacon, &right).await?;
         let (left_outcome, right_outcome) = pair_together(
             &sim,
-            &beacon,
             Pairing {
                 left: &left,
                 right: &right,
+                left_presence: &left_presence,
+                right_presence: &right_presence,
                 left_opens: Opening::Initiate(right.fingerprint()),
                 right_opens: Opening::Respond,
-                left_person: &left_shown,
-                right_person: &right_shown,
+                left_person: left_shown.clone(),
+                right_person: right_shown.clone(),
                 left_store: &left_store,
                 right_store: &right_store,
             },
@@ -638,16 +755,19 @@ pub(crate) fn pairing_records_only_after_both_confirm() -> Result<(), String> {
         let right = sim.machine().map_err(io_error)?;
         let left_store = left.records();
         let right_store = right.records();
+        let left_presence = keep_findable(&sim, &beacon, &left).await?;
+        let right_presence = keep_findable(&sim, &beacon, &right).await?;
         let (left_outcome, right_outcome) = pair_together(
             &sim,
-            &beacon,
             Pairing {
                 left: &left,
                 right: &right,
+                left_presence: &left_presence,
+                right_presence: &right_presence,
                 left_opens: Opening::Initiate(right.fingerprint()),
                 right_opens: Opening::Respond,
-                left_person: &Shown::rejecting(),
-                right_person: &Shown::accepting(),
+                left_person: Shown::rejecting(),
+                right_person: Shown::accepting(),
                 left_store: &left_store,
                 right_store: &right_store,
             },
@@ -689,16 +809,19 @@ pub(crate) fn pairing_is_repeatable_until_both_hold() -> Result<(), String> {
         let right = sim.machine().map_err(io_error)?;
         let left_store = left.records();
         let right_store = right.records();
+        let left_presence = keep_findable(&sim, &beacon, &left).await?;
+        let right_presence = keep_findable(&sim, &beacon, &right).await?;
         let (first_left, first_right) = pair_together(
             &sim,
-            &beacon,
             Pairing {
                 left: &left,
                 right: &right,
+                left_presence: &left_presence,
+                right_presence: &right_presence,
                 left_opens: Opening::Initiate(right.fingerprint()),
                 right_opens: Opening::Respond,
-                left_person: &Shown::accepting(),
-                right_person: &Shown::accepting(),
+                left_person: Shown::accepting(),
+                right_person: Shown::accepting(),
                 left_store: &left_store,
                 right_store: &right_store,
             },
@@ -721,14 +844,15 @@ pub(crate) fn pairing_is_repeatable_until_both_hold() -> Result<(), String> {
         let right_shown = Shown::accepting();
         let (second_left, second_right) = pair_together(
             &sim,
-            &beacon,
             Pairing {
                 left: &left,
                 right: &right,
+                left_presence: &left_presence,
+                right_presence: &right_presence,
                 left_opens: Opening::Initiate(right.fingerprint()),
                 right_opens: Opening::Respond,
-                left_person: &left_shown,
-                right_person: &right_shown,
+                left_person: left_shown.clone(),
+                right_person: right_shown.clone(),
                 left_store: &left_store,
                 right_store: &right_store,
             },
@@ -747,14 +871,15 @@ pub(crate) fn pairing_is_repeatable_until_both_hold() -> Result<(), String> {
         let right_shown = Shown::accepting();
         let (third_left, third_right) = pair_together(
             &sim,
-            &beacon,
             Pairing {
                 left: &left,
                 right: &right,
+                left_presence: &left_presence,
+                right_presence: &right_presence,
                 left_opens: Opening::Initiate(right.fingerprint()),
                 right_opens: Opening::Respond,
-                left_person: &left_shown,
-                right_person: &right_shown,
+                left_person: left_shown.clone(),
+                right_person: right_shown.clone(),
                 left_store: &left_store,
                 right_store: &right_store,
             },
@@ -780,17 +905,17 @@ pub(crate) fn pairing_refuses_own_identity() -> Result<(), String> {
         let beacon = TestBeacon::start(&sim).map_err(io_error)?;
         let machine = sim.machine().map_err(io_error)?;
         let store = machine.records();
-        let session = session(&beacon, &machine).await?;
+        let presence = keep_findable(&sim, &beacon, &machine).await?;
         let outcome = within(
             &sim,
             BUDGET,
             pair::run(
-                &session,
+                &presence,
                 &machine.identity,
                 Opening::Initiate(machine.fingerprint()),
                 &store,
                 now,
-                Shown::accepting().person(),
+                Shown::accepting(),
             ),
         )
         .await?
@@ -815,17 +940,20 @@ pub(crate) fn pairing_closes_after_three_rejections() -> Result<(), String> {
         let right = sim.machine().map_err(io_error)?;
         let left_store = left.records();
         let right_store = right.records();
+        let left_presence = keep_findable(&sim, &beacon, &left).await?;
+        let right_presence = keep_findable(&sim, &beacon, &right).await?;
         for attempt in 1..=3 {
             let (left_outcome, _) = pair_together(
                 &sim,
-                &beacon,
                 Pairing {
                     left: &left,
                     right: &right,
+                    left_presence: &left_presence,
+                    right_presence: &right_presence,
                     left_opens: Opening::Initiate(right.fingerprint()),
                     right_opens: Opening::Respond,
-                    left_person: &Shown::rejecting(),
-                    right_person: &Shown::accepting(),
+                    left_person: Shown::rejecting(),
+                    right_person: Shown::accepting(),
                     left_store: &left_store,
                     right_store: &right_store,
                 },
@@ -845,17 +973,16 @@ pub(crate) fn pairing_closes_after_three_rejections() -> Result<(), String> {
         if !left_store.is_closed(&right.peer_id()) {
             return Err("a fresh open of the root cleared the closed pair".to_owned());
         }
-        let left_session = session(&beacon, &left).await?;
         let refused = within(
             &sim,
             BUDGET,
             pair::run(
-                &left_session,
+                &left_presence,
                 &left.identity,
                 Opening::Initiate(right.fingerprint()),
                 &left_store,
                 now,
-                Shown::accepting().person(),
+                Shown::accepting(),
             ),
         )
         .await?
@@ -1141,8 +1268,8 @@ pub(crate) fn pairing_mediator_yields_different_strings() -> Result<(), String> 
         {
             return Err("the mediator shares a machine's identity".to_owned());
         }
-        let watcher_session = session(&beacon, &left).await?;
-        if watcher_session
+        let left_presence = keep_findable(&sim, &beacon, &left).await?;
+        if left_presence
             .lookup(&mediator.peer_id())
             .await
             .map_err(|error| error.to_string())?
@@ -1150,28 +1277,27 @@ pub(crate) fn pairing_mediator_yields_different_strings() -> Result<(), String> 
         {
             return Err("the mediator is not registered at the beacon".to_owned());
         }
-        let left_session = session(&beacon, &left).await?;
-        let right_session = session(&beacon, &right).await?;
+        let right_presence = keep_findable(&sim, &beacon, &right).await?;
         let left_shown = Shown::rejecting();
         let right_shown = Shown::rejecting();
         let (left_outcome, right_outcome, interposed) =
             within(&sim, Duration::from_secs(90), async {
                 tokio::join!(
                     pair::run(
-                        &left_session,
+                        &left_presence,
                         &left.identity,
                         Opening::Initiate(mediator.fingerprint()),
                         &left_store,
                         now,
-                        left_shown.person(),
+                        left_shown.clone(),
                     ),
                     pair::run(
-                        &right_session,
+                        &right_presence,
                         &right.identity,
                         Opening::Respond,
                         &right_store,
                         now,
-                        right_shown.person(),
+                        right_shown.clone(),
                     ),
                     mediator.interpose(left.peer_id(), right.peer_id()),
                 )
@@ -1235,16 +1361,19 @@ pub(crate) fn pairing_simultaneous_start_keeps_one() -> Result<(), String> {
         let right_store = right.records();
         let left_shown = Shown::accepting();
         let right_shown = Shown::accepting();
+        let left_presence = keep_findable(&sim, &beacon, &left).await?;
+        let right_presence = keep_findable(&sim, &beacon, &right).await?;
         let (left_outcome, right_outcome) = pair_together(
             &sim,
-            &beacon,
             Pairing {
                 left: &left,
                 right: &right,
+                left_presence: &left_presence,
+                right_presence: &right_presence,
                 left_opens: Opening::Initiate(right.fingerprint()),
                 right_opens: Opening::Initiate(left.fingerprint()),
-                left_person: &left_shown,
-                right_person: &right_shown,
+                left_person: left_shown.clone(),
+                right_person: right_shown.clone(),
                 left_store: &left_store,
                 right_store: &right_store,
             },
@@ -1321,39 +1450,40 @@ pub(crate) fn pairing_ignores_a_foreign_opening() -> Result<(), String> {
         let right_store = right.records();
         let left_shown = Shown::accepting();
         let right_shown = Shown::accepting();
-        let left_session = session(&beacon, &left).await?;
-        let right_session = session(&beacon, &right).await?;
-        let third_session = session(&beacon, &third).await?;
+        let left_presence = keep_findable(&sim, &beacon, &left).await?;
+        let right_presence = keep_findable(&sim, &beacon, &right).await?;
+        let third_presence = keep_findable(&sim, &beacon, &third).await?;
         // A third machine's own opening flight, addressed to the larger machine —
         // the one a simultaneous start makes yield — and delivered before either
-        // real ceremony starts reading: it is the first thing the larger machine
-        // sees while it waits for its reply.
+        // real ceremony starts reading. Neither side responds, so the presence holds
+        // it for a sender no ceremony waits on, and the simultaneous start must not
+        // see it, book it as an attempt, or lose its own comparison to it.
         let (_, commit) = Ceremony::initiate(third.peer_id(), left.fingerprint(), None, false)
             .map_err(|error| error.to_string())?;
         within(
             &sim,
             BUDGET,
-            third_session.introduce(left.peer_id(), &commit),
+            third_presence.introduce(left.peer_id(), &commit),
         )
         .await?
         .map_err(|error| error.to_string())?;
         let (left_outcome, right_outcome) = within(&sim, Duration::from_secs(90), async {
             tokio::join!(
                 pair::run(
-                    &left_session,
+                    &left_presence,
                     &left.identity,
                     Opening::Initiate(right.fingerprint()),
                     &left_store,
                     now,
-                    left_shown.person(),
+                    left_shown.clone(),
                 ),
                 pair::run(
-                    &right_session,
+                    &right_presence,
                     &right.identity,
                     Opening::Initiate(left.fingerprint()),
                     &right_store,
                     now,
-                    right_shown.person(),
+                    right_shown.clone(),
                 ),
             )
         })
@@ -1390,37 +1520,39 @@ pub(crate) fn pairing_respond_ignores_a_foreign_payload() -> Result<(), String> 
         let right_store = right.records();
         let left_shown = Shown::accepting();
         let right_shown = Shown::accepting();
-        let left_session = session(&beacon, &left).await?;
-        let right_session = session(&beacon, &right).await?;
-        let third_session = session(&beacon, &third).await?;
-        // A malformed payload, then a well-formed flight that does not open a
-        // ceremony: neither may end a machine's wait for a real initiator.
-        third_session
+        let left_presence = keep_findable(&sim, &beacon, &left).await?;
+        let right_presence = keep_findable(&sim, &beacon, &right).await?;
+        let third_presence = keep_findable(&sim, &beacon, &third).await?;
+        // A malformed payload, then a well-formed flight that does not open a ceremony: neither
+        // may end a machine's wait for a real initiator. The presence is what keeps them out of
+        // the ceremony — it holds only openings — so this case fails if it ever holds anything
+        // else.
+        third_presence
             .introduce(left.peer_id(), b"not a ceremony message")
             .await
             .map_err(|error| error.to_string())?;
         let already_paired = paired_flight(&third, &left)?;
-        third_session
+        third_presence
             .introduce(left.peer_id(), &already_paired)
             .await
             .map_err(|error| error.to_string())?;
         let (left_outcome, right_outcome) = within(&sim, Duration::from_secs(90), async {
             tokio::join!(
                 pair::run(
-                    &left_session,
+                    &left_presence,
                     &left.identity,
                     Opening::Respond,
                     &left_store,
                     now,
-                    left_shown.person(),
+                    left_shown.clone(),
                 ),
                 pair::run(
-                    &right_session,
+                    &right_presence,
                     &right.identity,
                     Opening::Initiate(left.fingerprint()),
                     &right_store,
                     now,
-                    right_shown.person(),
+                    right_shown.clone(),
                 ),
             )
         })
@@ -1438,7 +1570,6 @@ pub(crate) fn pairing_respond_ignores_a_foreign_payload() -> Result<(), String> 
         if left_store.get(&third.peer_id()).is_some() {
             return Err("the stranger's payload was booked against it".to_owned());
         }
-        drop(third_session);
         Ok(())
     })
 }
@@ -1453,16 +1584,16 @@ pub(crate) fn pairing_respond_waits_for_its_peer() -> Result<(), String> {
         let right_store = right.records();
         let left_shown = Shown::accepting();
         let right_shown = Shown::accepting();
-        let left_session = session(&beacon, &left).await?;
-        let right_session = session(&beacon, &right).await?;
+        let left_presence = keep_findable(&sim, &beacon, &left).await?;
+        let right_presence = keep_findable(&sim, &beacon, &right).await?;
         let (left_outcome, right_outcome) = within(&sim, Duration::from_secs(120), async {
             let responder = pair::run(
-                &left_session,
+                &left_presence,
                 &left.identity,
                 Opening::Respond,
                 &left_store,
                 now,
-                left_shown.person(),
+                left_shown.clone(),
             );
             let initiator = async {
                 // Longer than the beacon's request bound (15 s) and inside the
@@ -1471,12 +1602,12 @@ pub(crate) fn pairing_respond_waits_for_its_peer() -> Result<(), String> {
                 sim.clock().advance(Duration::from_secs(30)).await;
                 tokio::task::yield_now().await;
                 pair::run(
-                    &right_session,
+                    &right_presence,
                     &right.identity,
                     Opening::Initiate(left.fingerprint()),
                     &right_store,
                     now,
-                    right_shown.person(),
+                    right_shown.clone(),
                 )
                 .await
             };
@@ -1506,19 +1637,19 @@ pub(crate) fn pairing_failure_leaves_no_attempt() -> Result<(), String> {
         let right = sim.machine().map_err(io_error)?;
         let left_store = left.records();
         let right_store = right.records();
-        // A session to a beacon that then stops answering.
-        let dead_session = session(&dead, &left).await?;
+        // A machine registered with a beacon that then stops answering.
+        let dead_presence = keep_findable(&sim, &dead, &left).await?;
         dead.stop();
         let failed = within(
             &sim,
             Duration::from_secs(60),
             pair::run(
-                &dead_session,
+                &dead_presence,
                 &left.identity,
                 Opening::Initiate(right.fingerprint()),
                 &left_store,
                 now,
-                Shown::accepting().person(),
+                Shown::accepting(),
             ),
         )
         .await?
@@ -1535,16 +1666,21 @@ pub(crate) fn pairing_failure_leaves_no_attempt() -> Result<(), String> {
         {
             return Err("a failure before the first flight left an attempt behind".to_owned());
         }
+        // The live beacon is a different endpoint, so each machine registers with it anew.
+        drop(dead_presence);
+        let left_presence = keep_findable(&sim, &live, &left).await?;
+        let right_presence = keep_findable(&sim, &live, &right).await?;
         let (left_outcome, right_outcome) = pair_together(
             &sim,
-            &live,
             Pairing {
                 left: &left,
                 right: &right,
+                left_presence: &left_presence,
+                right_presence: &right_presence,
                 left_opens: Opening::Initiate(right.fingerprint()),
                 right_opens: Opening::Respond,
-                left_person: &Shown::accepting(),
-                right_person: &Shown::accepting(),
+                left_person: Shown::accepting(),
+                right_person: Shown::accepting(),
                 left_store: &left_store,
                 right_store: &right_store,
             },
@@ -1567,25 +1703,25 @@ pub(crate) fn pairing_flight_timeout_is_not_a_beacon_outage() -> Result<(), Stri
         let left = sim.machine().map_err(io_error)?;
         let right = sim.machine().map_err(io_error)?;
         let left_store = left.records();
-        let left_session = session(&beacon, &left).await?;
+        let left_presence = keep_findable(&sim, &beacon, &left).await?;
         // The peer is registered and reachable, and never runs a ceremony.
-        let _right_session = session(&beacon, &right).await?;
+        let _right_presence = keep_findable(&sim, &beacon, &right).await?;
         let failed = within(
             &sim,
             Duration::from_secs(120),
             pair::run(
-                &left_session,
+                &left_presence,
                 &left.identity,
                 Opening::Initiate(right.fingerprint()),
                 &left_store,
                 now,
-                Shown::accepting().person(),
+                Shown::accepting(),
             ),
         )
         .await?
         .map_err(|error| error.to_string());
         match &failed {
-            Err(error) if error.contains("did not answer") && !error.contains("beacon") => {}
+            Err(error) if error.contains("no ceremony flight") && !error.contains("beacon") => {}
             other => return Err(format!("a silent peer ended {other:?}")),
         }
         // The attempt ended without a comparison: it counts against nobody and does
@@ -1606,23 +1742,26 @@ pub(crate) fn pairing_flight_timeout_is_not_a_beacon_outage() -> Result<(), Stri
 /// The responder takes the opening flight, answers it, takes the initiator's fresh
 /// value, and checks it was shown a comparison. A case that drives one side by hand
 /// uses this; `drive_to_confirmation` is the same with both sides driven.
-async fn answer_to_confirmation(session: &Session, machine: &Machine) -> Result<Ceremony, String> {
-    let opening = session
-        .next_introduction()
-        .await
-        .map_err(|error| error.to_string())?;
+async fn answer_to_confirmation(
+    presence: &Presence,
+    machine: &Machine,
+) -> Result<Ceremony, String> {
+    let openings = presence.openings();
+    let opening = openings.next().await;
     let (mut ceremony, step) =
         Ceremony::respond(machine.peer_id(), &opening, Some(machine.addr()), false)
             .map_err(|error| error.to_string())?;
+    let peer = opening.from();
+    // From here the ceremony is this peer's: its reveal arrives on this handle and no other
+    // peer's flight does.
+    drop(openings);
+    let flights = presence.flights(peer);
     let answer = step.send.ok_or("the responder sent no answer")?;
-    session
-        .introduce(opening.from(), &answer)
+    presence
+        .introduce(peer, &answer)
         .await
         .map_err(|error| error.to_string())?;
-    let reveal = session
-        .next_introduction()
-        .await
-        .map_err(|error| error.to_string())?;
+    let reveal = flights.next().await;
     let step = ceremony
         .receive(reveal.payload())
         .map_err(|error| error.to_string())?;
@@ -1645,12 +1784,12 @@ pub(crate) fn pairing_attempt_expiry_is_its_own_failure() -> Result<(), String> 
             attempt_lifetime: Duration::from_secs(2),
             ..Limits::default()
         })?;
-        let left_session = session(&beacon, &left).await?;
-        let right_session = session(&beacon, &right).await?;
+        let left_presence = keep_findable(&sim, &beacon, &left).await?;
+        let right_presence = keep_findable(&sim, &beacon, &right).await?;
         // The responder is driven by hand to the comparison and never confirms: the
         // initiator's wait for that confirmation is the attempt's lifetime.
         let responder = async {
-            answer_to_confirmation(&right_session, &right).await?;
+            answer_to_confirmation(&right_presence, &right).await?;
             Ok::<(), String>(())
         };
         let shown = Shown::accepting();
@@ -1662,12 +1801,12 @@ pub(crate) fn pairing_attempt_expiry_is_its_own_failure() -> Result<(), String> 
         let (failed, responder) = within(&sim, Duration::from_secs(120), async {
             tokio::join!(
                 pair::run(
-                    &left_session,
+                    &left_presence,
                     &left.identity,
                     Opening::Initiate(right.fingerprint()),
                     &left_store,
                     &now,
-                    shown.person(),
+                    shown.clone(),
                 ),
                 responder,
             )
@@ -1675,9 +1814,17 @@ pub(crate) fn pairing_attempt_expiry_is_its_own_failure() -> Result<(), String> 
         .await?;
         responder?;
         let failed = failed.map_err(|error| error.to_string());
+        let expected = format!(
+            "the attempt with {} expired before the ceremony reached an outcome",
+            right.fingerprint()
+        );
         match &failed {
-            Err(error) if error.contains("expired") && !error.contains("beacon") => {}
-            other => return Err(format!("an unanswered comparison ended {other:?}")),
+            Err(error) if *error == expected => {}
+            other => {
+                return Err(format!(
+                    "an unanswered comparison ended {other:?}, not `{expected}`"
+                ));
+            }
         }
         if left_store
             .get(&right.peer_id())
@@ -1987,12 +2134,12 @@ pub(crate) fn pairing_abandoned_comparison_expires() -> Result<(), String> {
             attempt_lifetime: Duration::from_secs(2),
             ..Limits::default()
         })?;
-        let left_session = session(&beacon, &left).await?;
-        let right_session = session(&beacon, &right).await?;
+        let left_presence = keep_findable(&sim, &beacon, &left).await?;
+        let right_presence = keep_findable(&sim, &beacon, &right).await?;
         // The responder is driven by hand to the comparison; the initiator's person
         // is never answered.
         let responder = async {
-            answer_to_confirmation(&right_session, &right).await?;
+            answer_to_confirmation(&right_presence, &right).await?;
             Ok::<(), String>(())
         };
         let clock = sim.clock().clone();
@@ -2000,7 +2147,7 @@ pub(crate) fn pairing_abandoned_comparison_expires() -> Result<(), String> {
         let (failed, responder) = within(&sim, Duration::from_secs(120), async {
             tokio::join!(
                 pair::run(
-                    &left_session,
+                    &left_presence,
                     &left.identity,
                     Opening::Initiate(right.fingerprint()),
                     &left_store,

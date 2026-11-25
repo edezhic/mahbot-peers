@@ -32,13 +32,13 @@ use crate::messages::{Messaging, wait_for};
 use crate::sim::Sim;
 
 use super::super::connection::Managed;
-use super::super::peer::session;
 use super::super::rights::{label, person};
 #[cfg(unix)]
 use super::super::support::Ready;
 use super::super::support::counted_dial;
 use super::super::support::{
-    field, io_error, main_binding, pair, single_ending, socket, spawn_keeper, wait_live, within,
+    field, io_error, keep_findable, main_binding, pair, single_ending, socket, spawn_keeper,
+    wait_live, within,
 };
 use super::{
     ACTION_MAGIC, ACTION_VERSION, LONG, NOW, id, offer_bytes, ran_with, ready, request,
@@ -352,8 +352,8 @@ pub(crate) fn the_beacon_never_carries_an_action() -> Result<(), String> {
         let ready = ready(&sim, &beacon, Arc::new(NoFloor)).await?;
         // Both machines keep themselves findable, so the beacon's memory is not empty and the
         // claim is about what it holds, not about a server nobody ever spoke to.
-        let _main_session = session(&beacon, &ready.main).await?;
-        let _laptop_session = session(&beacon, &ready.laptop).await?;
+        let _main_presence = keep_findable(&sim, &beacon, &ready.main).await?;
+        let _laptop_presence = keep_findable(&sim, &beacon, &ready.laptop).await?;
         ready.main_messages.executions.run(b"done");
         ready
             .main_messages
@@ -1127,7 +1127,7 @@ pub(crate) fn one_request_has_one_total_budget() -> Result<(), String> {
         let beacon = TestBeacon::start(&sim).map_err(io_error)?;
         let ready = ready(&sim, &beacon, Arc::new(NoFloor)).await?;
         // The main is registered, so the dial after the dead address can find its live one.
-        let _main_session = session(&beacon, &ready.main).await?;
+        let _main_presence = keep_findable(&sim, &beacon, &ready.main).await?;
         // The laptop's only remembered address for the main is dead: the dial spends its whole
         // connect bound on it before the beacon names the live one.
         ready

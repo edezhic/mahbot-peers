@@ -309,9 +309,10 @@ pub enum Response {
     /// that the addressee's application read it — delivery is at-least-once — and
     /// nothing is stored for a later attempt.
     Delivered,
-    /// The addressee is not reachable at this moment — not registered, or
-    /// registered on a connection the beacon could not write to — so nothing was
-    /// stored.
+    /// The beacon did not hand the frame to the addressee: it holds no registration for it, or
+    /// the connection it is registered on could not take the frame within the server's exchange
+    /// bound. Either way nothing was stored. This is the beacon's one answer about a delivery,
+    /// and it is not a statement about the peer.
     UnknownPeer(PeerId),
     /// The request was not understood. See [`Refusal`].
     Refused(Refusal),

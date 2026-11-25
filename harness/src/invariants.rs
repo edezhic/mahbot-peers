@@ -234,6 +234,9 @@ pub const BINDING_FILE: &str = "src/peer/binding.rs";
 /// which layer owns it.
 pub const INBOX_FILE: &str = "src/peer/inbox.rs";
 
+/// The one file that registers the machine and reads what the beacon pushes to it.
+pub const PRESENCE_FILE: &str = "src/peer/presence.rs";
+
 /// The two files that accept a stream of the pair's connection. They are the only entries
 /// [`EXEMPT`] excuses from `peer.one_stream_acceptor`, and the summary check proves the two
 /// lists name the same files.
@@ -484,6 +487,13 @@ pub const INVARIANTS: &[Invariant] = &[
         scope: ACCEPTOR_FILES,
         control: "let (send, recv) = connection.accept_bi().await?;\nlet (send, recv) = connection.accept_bi().await?;",
         check: one_acceptor_per_file,
+    },
+    Invariant {
+        id: "peer.one_beacon_registration",
+        claim: "the machine's beacon registration is made and read in one file — the presence — and nowhere else under the crate's sources: the beacon keeps one registration per peer, so a second session that registers displaces the machine's, and a second reader takes a pushed introduction the ceremony was waiting for. The harness's rig registers raw sessions of its own, which the claim's scope leaves out; the one session the crate opens elsewhere — the manager's lookup — registers nothing and reads nothing, and nothing in the beacon's server or its entry point opens a client session at all",
+        scope: &["src/"],
+        control: "let lifetime = session.register().await?;\nlet introduction = session.next_introduction().await?;",
+        check: one_beacon_registration,
     },
 ];
 
@@ -763,6 +773,29 @@ fn key_is_minted_in_one_place(source: &Source) -> Vec<Finding> {
 
 fn no_persistent_state(source: &Source) -> Vec<Finding> {
     forbidden(source, &["std::fs", "OpenOptions", "File::"])
+}
+
+/// A machine's beacon registration is made and read in one file: the presence.
+///
+/// The beacon keeps one registration per peer and the latest wins, so a session that registers
+/// elsewhere displaces the machine's — the machine becomes unfindable and a flight pushed to the
+/// displaced registration is never read. The same goes for a second reader: the beacon hands each
+/// pushed introduction to one `accept_uni` caller, so a reader outside the presence takes flights
+/// meant for the ceremony. The scan is lexical — the method calls are the vocabulary such a
+/// second registration or reader would have to use — and the presence being the only caller is
+/// what makes the property structural.
+fn one_beacon_registration(source: &Source) -> Vec<Finding> {
+    if source.path == PRESENCE_FILE {
+        return Vec::new();
+    }
+    forbidden(
+        source,
+        &[
+            ".register()",
+            ".next_introduction(",
+            ".next_introduction_within(",
+        ],
+    )
 }
 
 /// A peer layer names no capability and asks no question of its own.
