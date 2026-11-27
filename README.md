@@ -3,15 +3,21 @@
 The peer layer between mahbot instances: machines connect directly, with no
 relay in the path, and remember each other by key. This crate is the network
 half — it knows keys, addresses, byte counts, the messages one machine queues for
-another, and the actions one asks another to run; the product knows people, accounts,
-rights, what a message means, what an action runs and how both are shown.
+another, the actions one asks another to run, and the bytes of a whole file in
+flight; the product knows people, accounts, rights, what a message means, what an
+action runs, where a file lands, how it is named on disk and what happens to a
+partial one.
 
 The crate holds the seams the rest of the layer is built on — identity and its key
 file, the QUIC transport over raw public keys, the beacon — and the peer layer above
-them. Messages and actions are here: a message is queued at its sender, offered over
-the pair's direct connection, decided by the receiver's rights and delivered at least
-once; an action carries the caller's identifier, is executed at most once, and a
-repeat is answered "already executed". Files and the screen are not.
+them. Messages, actions and files are here: a message is queued at its sender, offered
+over the pair's direct connection, decided by the receiver's rights and delivered at
+least once; an action carries the caller's identifier, is executed at most once, and a
+repeat is answered "already executed"; a whole file moves over the same connection —
+an offer, the receiver's one decision, then the bytes, with resume, a SHA-256 the
+receiver verifies, and a backpressure that is the transport's. What stays with the
+product is where a file lands, how it is named on disk and what happens to a partial
+file. The screen is not here.
 
 ## What the crate provides
 
@@ -23,7 +29,7 @@ The library (`src/`) holds:
 | `tls` | TLS 1.3 with raw public keys (RFC 7250), pinned to the peer's fingerprint instead of a certificate chain, with a per-service ALPN and resumption off so the pin always runs |
 | `net` | endpoint construction over an injected datagram socket and an injected clock — no default for either |
 | `beacon` | the beacon: the closed message set (`wire`), the client half (`Beacon`, `Session`) — register, look an id up, learn the address observed on this path, hand a signed introduction over, take the ones pushed to a live session — and the one deadline combinator the client and the server share (`timeout`, whose documentation says why there is one copy and not two) |
-| `peer` | the peer layer: `record` is the durable memory of another machine, at both levels; `access` is the connection level's vocabulary — the account on the instance, the assistant, the pair, the four capabilities, the rights and the small versioned fact; `pair` the acquaintance ceremony, `connect` the per-machine connection manager, `recovery` the one retry policy for a pair, `presence` the machine's one registration at the beacon — kept alive by itself, and the one reader of what the beacon pushes to it, `binding` the exchange that carries the connection level over a live connection, `rights` the decision, `audit` the record of what happened, `messages` the queue a machine keeps for a peer and the offer it makes over the pair's own connection, `actions` the at-most-once command with its durable journal and unknown marks, and `inbox` the one reader that tells a message from an action on that connection. Each is documented where it is enforced |
+| `peer` | the peer layer: `record` is the durable memory of another machine, at both levels; `access` is the connection level's vocabulary — the account on the instance, the assistant, the pair, the five capabilities, the rights and the small versioned fact; `pair` the acquaintance ceremony, `connect` the per-machine connection manager, `recovery` the one retry policy for a pair, `presence` the machine's one registration at the beacon — kept alive by itself, and the one reader of what the beacon pushes to it, `binding` the exchange that carries the connection level over a live connection, `rights` the decision, `audit` the record of what happened, `messages` the queue a machine keeps for a peer and the offer it makes over the pair's own connection, `actions` the at-most-once command with its durable journal and unknown marks, `transfer` the whole-file transfer over the pair's own connection — an offer, the receiver's one decision, then the bytes with resume, a SHA-256 the product reports at each end and the crate compares, and a backpressure that is the transport's — and `inbox` the one reader that tells a message from an action from a transfer on that connection. Each is documented where it is enforced |
 
 The key-replacement invariant covers every shipped source: no `fs::rename`,
 `remove_dir` or `fs::copy` anywhere, and no write form in the identity module. The
@@ -135,23 +141,30 @@ the crate never invents one and never turns a peer's key into one.
 
 A right is `(peer, assistant, capability, term, issuer, withdrawn)`. The plan's scope
 field is deliberately not here: no capability yet names a resource it would narrow, and
-the format is additive, so it arrives as its own tag when one does. The four
-capabilities are write to me, take files from me, work on me and see the screen — one
-capability covering watching and acting. The list is closed: a right stored for a
-capability this build does not know is kept and written back untouched, and no question
-this build can ask matches it.
+the format is additive, so it arrives as its own tag when one does. "Put files on me" is
+no exception to that, though it is the one that looks like one: it grants an undirected
+push into a place the product chooses, so there is no resource the crate could name in the
+right. The five capabilities are write to me, put files on me, work on me, take files
+from me and see the screen — the last of which is one capability covering watching and
+acting. Only three of them are served by anything: write to me, put files on me and work
+on me. "Take files from me" and "see the screen" are inert — nothing lets a peer ask this
+machine for a file of its own, and nothing streams the screen yet — so granting either
+changes nothing. The list is closed: a right stored for a capability this build does not
+know is kept and written back untouched, and no question this build can ask matches it.
 
 Only this machine's own person, or its own default, can write a right. A write
 attributed to a peer is refused before it changes anything and the refusal is recorded.
 The default has one act per pair: exactly "write to me", once, when the pair comes into
 being, and again only when a person returns the machine from a withdrawn trust. It never
 re-creates a right a person withdrew or one that ended, and it renews nothing: the row
-stays on file, and its presence is what stops the default acting again. The default is
+stays on file, and its presence is what stops the default acting again. It covers
+messages and the addressed reply and never a file landing here: file ingress is an
+explicit grant by the person on the machine that bears the effect. The default is
 one capability for every assistant — the plan's guest floor — so a guest is never
-defaulted `work on me` or `see the screen`, and a person may widen it explicitly, with
-the record naming that person. The product's declaration of which assistant is a guest
-is not stored: it changes no decision the crate makes, and the format is additive when a
-decision depends on it.
+defaulted `work on me`, `see the screen` or `put files on me`, and a person may widen it
+explicitly, with the record naming that person. The product's declaration of which
+assistant is a guest is not stored: it changes no decision the crate makes, and the
+format is additive when a decision depends on it.
 
 `Rights::decide` answers the one question — may this connection, as this assistant,
 exercise this capability on this machine now — in the plan's order: authenticate, right,
@@ -188,34 +201,35 @@ the withdrawal, with no reload asked of the caller. A record that is there and c
 read is its own cause, not an unpaired machine: the manager fails closed and names the
 file. `Connections::disconnect` remains the immediate way to close it in the same act.
 
-Every grant, refusal, ending, withdrawal, return, attempt-lock clearing, refused message,
-dropped queue and executed action is appended to `peer::audit`, a private append-only log
-under the storage root, before the act it describes: a crash may leave a recorded act that did
-not happen and never an act nobody recorded. The log is created as a private temporary file
-and published without replacing, so it carries the rule before its first byte lands. Every
-append re-checks the log's privacy on the descriptor it writes through, so a log another
-account can read refuses the next append, and every append cuts a torn tail another process
-left before writing past it. A half-written last entry is cut back, and a half-written header
-is completed rather than refused. The log keeps the bytes below its cap minus
-`RESERVED_FOR_PERSON_BYTES` for a person: the entries a peer causes by asking — a refusal, a
-refused write, an ending a question notices, a message a receiver refuses, an executed action
-— stop there and are answered without an entry, while a grant, a withdrawal, a trust
-withdrawal, a return and an attempt-lock clearing may use the whole file, so a peer cannot
-fill the log and take away the acts that stop it. A person's act that would pass the cap is
-refused until the product makes room, and an ending that finds no room is answered and left
-unmarked: the log is never compacted, so what a peer's part loses stays lost. The record is
-re-read before every question, so a withdrawal by another process on the same root refuses the
-next question on this one. Every moment is the caller's; the crate reads no clock.
+Every grant, refusal, ending, withdrawal, return, attempt-lock clearing, refused message, dropped
+queue, executed action and authorised transfer is appended to `peer::audit`, a private append-only
+log under the storage root, before the act it describes: a crash may leave a recorded act that did
+not happen and never an act nobody recorded. The log is created as a private temporary file and
+published without replacing, so it carries the rule before its first byte lands. Every append
+re-checks the log's privacy on the descriptor it writes through, so a log another account can read
+refuses the next append, and every append cuts a torn tail another process left before writing past
+it. A half-written last entry is cut back, and a half-written header is completed rather than
+refused. The log keeps the bytes below its cap minus `RESERVED_FOR_PERSON_BYTES` for a person: the
+entries a peer causes by asking — a refusal, a refused write, an ending a question notices, a
+message a receiver refuses, an executed action, a transfer it authorised — stop there and are
+answered without an entry, while a grant, a withdrawal, a trust withdrawal, a return and an
+attempt-lock clearing may use the whole file, so a peer cannot fill the log and take away the acts
+that stop it. A person's act that would pass the cap is refused until the product makes room, and an
+ending that finds no room is answered and left unmarked: the log is never compacted, so what a
+peer's part loses stays lost. The record is re-read before every question, so a withdrawal by
+another process on the same root refuses the next question on this one. Every moment is the
+caller's; the crate reads no clock.
 
 The connection manager's rule for a fresh connection reads the binding exchange, a message
-offer and an action request as what they are: the manager's own handshake and the sender's
-own act, not the pair's use. A connection that only exchanged its binding, or offered a
-message or an action nobody answered, and then died carried nothing, so it is one dial of the
-pair's recovery like any other that carried nothing. A message the receiver took, or answered
-"already taken", or an action whose answer means the receiver accepted it — it ran, ran with
-a result too large to carry, or the identifier was already spent — is the pair's use and ends
-the run of dials, which is what keeps a machine holding one queued message or one unanswered
-action from being re-dialled for ever.
+offer, an action request and a transfer attempt as what they are: the manager's own handshake
+and the sender's own act, not the pair's use. A connection that only exchanged its binding, or
+offered a message or an action nobody answered, or opened a transfer that moved no byte, and
+then died carried nothing, so it is one dial of the pair's recovery like any other that
+carried nothing. A message the receiver took, or answered "already taken", an action whose
+answer means the receiver accepted it — it ran, ran with a result too large to carry, or the
+identifier was already spent — or a transfer that moved a byte is the pair's use and ends the
+run of dials, which is what keeps a machine holding one queued message, one unanswered action
+or one file in flight from being re-dialled for ever.
 
 ## Recovery
 
@@ -240,9 +254,10 @@ different port, with no person and no restart. A bounded, visible, paced retry i
 silent retry loop: that forbids a loop nobody can see and nothing bounds, and this one is bounded
 by the episode, paced by the gap and readable while it runs.
 
-A queued message dials, and does not dial once a second: `Connections::ensure` makes one dial only
-when the policy is due, so the queue's poll and the keeper cannot hammer a peer between them and a
-beacon session is not opened per poll. A product with news the crate cannot see — a person asking
+A queued message and a running transfer dial, and neither dials once a second:
+`Connections::ensure` makes one dial only when the policy is due, so the queue's poll, the
+transfer's wait and the keeper cannot hammer a peer between them and a beacon session is not
+opened per poll. A product with news the crate cannot see — a person asking
 again — hands it in through `Connections::wake`, which starts a fresh episode. A stop is not
 permanent while its cause is: `ensure` re-opens a stopped pair once the cause has gone and dials it
 once, and self-recovery resumes when the caller runs `keep_connected` again — `watched` is how a
@@ -551,20 +566,221 @@ moment, and the capability it records is the one that decision returned. The inv
 `actions.no_capability_from_a_body` scans the module to keep it that way — the layer names
 no `Capability` value — so no path leads from a body to a right, a grant or a capability.
 
-Messages and actions share the pair's connection. `Inbox::serve` is the one place that takes a
-stream and decides what it is: the binding exchange owns the first stream a kept connection
-carries, and the inbox owns every stream after it, handing a message or an action to the layer
-whose magic the frame carries. A message is therefore never taken for an action nor an action
-for a message, in either direction. Two checks keep it so: `peer.one_stream_acceptor` finds a
-third acceptor in any other file, excusing only the two the exemption table names, and
-`peer.one_acceptor_per_file` holds each of those to a single `accept_bi` call site. An action
-in flight does not count as the pair having carried traffic for the connection manager, while
-an answer that means the receiving side accepted the operation — it ran, ran with a result
-too large to carry, or the identifier was already spent — does. Every other answer means
-nothing was taken, so a slow-down followed by a drop is not a link failure. A message counts
-only the take; an action also counts a repeat, because its journal proves the receiver
-accepted the operation before. So a machine holding one unanswered action cannot be re-dialled
-for ever. The beacon carries no action: an action travels only on the pair's own connection.
+Messages, actions and transfers share the pair's connection. `Inbox::serve` is the one place
+that takes a stream and decides what it is: the binding exchange owns the first stream a kept
+connection carries, and the inbox owns every stream after it, handing a message, an action or a
+transfer to the layer whose magic the frame carries. A message is therefore never taken for an
+action nor an action for a message, in either direction, and neither for a transfer. Two checks keep
+it so: `peer.one_stream_acceptor` finds a third acceptor in any other file, excusing only the two
+the exemption table names, and `peer.one_acceptor_per_file` holds each of those to a single
+`accept_bi` call site. An action in flight does not count as the pair having carried traffic for the
+connection manager, while an answer that means the receiving side accepted the operation — it ran,
+ran with a result too large to carry, or the identifier was already spent — does. Every other answer
+means nothing was taken, so a slow-down followed by a drop is not a link failure. A message counts
+only the take; an action also counts a repeat, because its journal proves the receiver accepted the
+operation before. So a machine holding one unanswered action cannot be re-dialled for ever. The
+beacon carries no action: an action travels only on the pair's own connection.
+
+## The files
+
+A whole file moves over the pair's own connection, and the direction is one: a machine offers a file
+and it lands on the peer. Nothing fetches — a peer asking this machine for a file of its own is not
+served, which is why "take files from me" is inert and granting it changes nothing. The beacon
+carries no file either: a transfer travels only on the pair's own connection.
+
+A file does not travel as a stream of messages. It is a transfer in its own right: one bidirectional
+stream per attempt, an offer, the receiving machine's answer, then the bytes, then the receiver's
+verdict. It does not inherit the message layer's body cap, does not consume its window, its queue,
+its taken identifiers or its retention, and a transfer frame is never counted as a message. The
+inbox tells the two apart by the frame's magic, and a frame it does not recognise is still a message
+— which is exactly how a peer that does not know transfers answers an offer as unreadable.
+
+Only the receiving machine's decision is asked, because it bears the effect: the permission is "put
+files on me" (`Capability::PUT_FILES`), never the default, and the host's floor is asked after it
+with the same capability. The sending machine's own person is the one acting, so no second grant is
+required — exactly as sending a message requires only the receiver's "write to me". The decision is
+made once, when the transfer is authorised, and holds for its whole life, including across a
+reconnect: a right withdrawn afterwards ends future transfers, not this one, while withdrawn trust
+closes the connection and therefore ends it. The binding to an assistant is re-checked when a
+transfer resumes, and only then.
+
+A product that only wants messages and actions is unchanged: the transfer layer is added to the
+inbox with `Inbox::with_transfers`, nothing else on the surface gained a required argument, and an
+inbox without one costs nothing and slows nothing — an offer that arrives at such a machine is
+answered in the message layer's own vocabulary, exactly as an older peer answers it.
+
+The crate moves bytes and decides whether it may; the product says where they go and what they are.
+It supplies a `Source`, which answers bytes at an offset — the same offset again after a reconnect —
+and may answer "not now" rather than block; a `Sink`, which accepts bytes at an offset, is told
+which peer is sending, and answers what it holds for a name and what it assembled once it holds them
+all; and, at offer time, the file's length and the SHA-256 it must have. The sink's three questions
+are lookups that answer without waiting, because the crate asks them while the sending machine waits
+on its bound: a product hashes as the bytes land, since it has to produce that digest anyway, and a
+product that cannot answer one of them without waiting has put the wrong thing behind the trait. The
+crate never writes the file, never hashes it and never turns its name into a path: a transfer's name
+is the product's, scoped to one peer, carried as given and bounded in length, and the crate only
+compares two names for equality. A product with no sink has not granted file ingress: a peer with no
+right is refused at the right step, and one that holds the right and finds nothing behind it is
+refused at the layer's own floor, which is recorded like any other floor refusal.
+
+The bytes are the transport's, not this layer's. The receiving machine's connection credit is
+`MAX_BUFFERED_BYTES` (32 MiB) and one stream's is `MAX_STREAM_BYTES` (8 MiB), so two transfers —
+`MAX_RUNNING_TRANSFERS` — account for half the connection's credit and the rest stays available to
+messages and actions. The same numbers bound what this machine queues: quinn's `send_window` is
+`MAX_BUFFERED_BYTES`, so a peer that advertises an enormous window cannot make this machine buffer a
+file of its own writes. A sink that answers "not now" stops this machine reading, which stops the
+sender through QUIC's flow control instead of growing memory or dropping the file, and the sender
+reads its source one `TRANSFER_CHUNK` (64 KiB) at a time. A product that builds its own
+`quinn::TransportConfig` gets its own numbers, and these bounds do not apply to it.
+
+Those numbers are what a peer may make this machine buffer in the crate, not what the operating
+system buffers: the socket's send and receive buffers sit on top of them and are the caller's to
+size, because the crate never makes a socket. On a fast path they are the bottleneck — macOS
+defaults are far too small for a gigabit at a hundred milliseconds — so a product that wants the
+throughput sizes `SO_SNDBUF`/`SO_RCVBUF` where it makes the socket.
+
+A transfer whose connection goes away is `Waiting`, not failed: it resumes when the pair reconnects,
+and the product is not asked to start it again. An outage longer than the stall bound is still a
+wait, because that bound is about a live connection. On resume the receiver states how much it
+already holds — and only after the transfer is authorised — and the sender continues from there. A
+transfer with a live connection that stops moving bytes is abandoned after `TRANSFER_STALL` (60 s)
+of no progress, on both sides, which is not a bound on the transfer's length: a large file on a slow
+link and a slow sink take as long as they take, and so does a slow source — one that produces
+something inside the bound, because one that produces nothing for the whole of it is no progress.
+The sending side's own bound is that plus a stated margin (`TRANSFER_GRACE`, 5 s), which carries an
+answer written within it: the constant's own doc states what that margin covers and what lies
+outside it. A receiver that spends its whole bound before it answers is heard as the answer it gave
+— "could not store it" — whether the sender is parked on a write the receiver has not read yet or
+waiting for the verdict after every byte, instead of being timed out as `no progress` first, because
+one event has one cause. What counts as progress is the bytes that landed at the receiving side —
+the offset it states, in its answer to an offer and in the progress word it sends while its sink is
+slow and once a second while the file keeps arriving — and only when that offset has grown: a word
+repeating an offset this machine has already seen is not the file getting further, so a peer cannot
+hold a transfer, and one of this machine's places for the peer with it, by saying `running` about
+the same byte. Nothing else counts and nothing takes it back: a verdict that never arrived, a
+timeout and a re-send leave the count where it was, a byte the transport accepted is not the count,
+and a throttle keeps the offset it states — it can raise the count and never lower it. The progress
+word is what makes a slow sink safe: the transport returns flow-control credit in large steps, so a
+writer parked at a stream window's edge can wait minutes for a receiving side that is storing all
+the while, and it is the receiver's own offset, chunk by chunk, that keeps it from calling a working
+transfer stopped. A sender whose own source is slow reads the same word while it waits, so a slow
+disk is not a stopped transfer either. The same offset is what the receiver's `Running` answer
+states when a second stream offers a name already being answered. One that waits longer than
+`TRANSFER_WAIT` (600 s) for the pair ends as `NoPair` — the pair never answered: its connection did
+not come back, its binding exchange never finished, this machine could not open a stream or write
+its offer and spent the whole wait bound doing so, or its offers went unanswered for the rest of the
+wait bound — either every offer it made, the accepted residual for a pair that is present and
+silent, or every offer after the last it answered — and the receiving side reports the same for a
+transfer whose sender never came back, so a dead transfer is never shown as a quiet one — one that
+is already complete on the receiver is answered complete instead of being sent again, and one
+offered under a name whose stream is still being answered is answered `Running` with the receiver's
+offset. A transfer the receiving machine has ended stays visible to its product for `TRANSFER_WAIT`
+after it ended, and is forgotten once that has passed, so the product's view never goes from failed
+to absent without the wait bound passing first. One the receiving machine's person stopped stays
+stopped: every later offer under that name is answered `Stopped` until the wait bound passes, so a
+stop is not undone by the sender asking again. One the *sending* machine's product stops is a
+different act: it is `Stopped` at once and stays so, the stream is reset with the transfer's stop
+code, and the receiving machine learns that the sending side stopped it rather than that a stream
+merely went away — including while its sink is answering "not now", where the receiver reads the
+stream once more before it calls its own store the cause. A stop is noticed inside a poll wherever
+the transfer waits on its own clock — the answer to its offer, a throttle, the tail, and the polls
+spent waiting for a pair to come back — and two waits are not polled, because neither is on that
+clock: the dial itself, already under way when the stop is made, and a stream the peer has not made
+room for — opening one at its stream limit, or writing the offer while the peer takes no bytes. The
+handle says stopped at once; one of this machine's places for the peer comes back when that wait
+returns. The tail matters too: once every byte is written the transfer waits for the receiver's
+verdict, which for a slow sink is most of its life, and a stop there ends it as stopped and gives
+the place back rather than finishing a file nobody wants. That is not the receiving person's
+decision, so the name is free: a sending product that offers the file again gets a fresh transfer,
+never `StoppedByReceiver` for something the receiving person never did. The wait bound is a budget a
+transfer spends rather than an episode that restarts: it is added up over every wait, so a transfer
+that has been moving bytes for an hour has spent none of it and is still waited for in full when its
+connection drops there, while a pair that keeps coming back and moving nothing exhausts it instead
+of parking the transfer — and the stall bound is spent the same way, on the time a live connection
+spends not moving, so a connection that comes back buys no fresh budget either. Only the receiving
+machine's stated offset growing clears either bound, and an answer that ends the attempt without
+pacing it buys the transfer more time only by stating a further offset (`TRANSFER_STALL` states what
+each kind of answered round spends). Bytes the transport accepted are not growth, so a peer that
+reads a byte a minute, or that keeps this machine waiting before saying "the same offset", cannot
+stretch the bound.
+A record this machine cannot read is waited for under the same bound and then ends as `NoProgress`
+rather than holding one of this machine's places for the peer for ever.
+Nothing of a transfer's own state is kept across a process restart on either side: the product
+offers the file again and the receiver states what it holds. Its authorisation is not transfer state
+— it is an audit entry, kept like every other allowed act.
+
+The answer set is closed and every cause
+is its own: it arrived; it was already there; a transfer under that name is running there; it was
+refused and at which step; it was not run because the machine could not write its own record of the
+act; a limit was reached and which one; the name is already held with different content; what
+arrived does not match the digest; the receiving side could not store it; the receiving side's
+person stopped it; the offer could not be understood at all. What it learns about its own side is in
+the same set: no progress, and the pair never answering — its connection did not come back, its
+binding exchange never finished, this machine could not open a stream or write its offer and spent
+the whole wait bound doing so, or its offers went unanswered for the rest of the wait bound: either
+every offer it made, or every offer after the last it answered — its own product stopped it, its own
+source could not be read, this machine no longer trusts the peer, and nothing arrived that it could
+understand — a peer answering in another vocabulary, or a status byte this build cannot read.
+`NoPair` says what this machine observed, not that the pair was absent: `TransferFailure::NoPair`'s
+own doc states what it covers. A pair that answered anything other than a bare limit does not reach
+it through the window of offers this machine filled itself — the count starts again, so the limit it
+then meets is the limit it met, however slow it was to take the file — and a pair that answers and
+then stops answering altogether still ends as `no pair` at the wait bound.
+The one answer that is not an end is the start limit's throttle: the receiving machine names
+how long to wait before starting another transfer, the product sees `Throttled { retry_after }`, and
+the transfer asks again when that passes. The delay is the peer's, so it is clamped where it is
+read: never longer than `TRANSFER_THROTTLE_CAP` (60 s) and never shorter than a second, a start
+limit that names no delay at all is one second rather than an end. A peer that keeps throttling for
+`TRANSFER_WAIT` (600 s) ends the transfer instead of parking it for ever — unless the offset it
+states keeps growing, which ends the streak: a peer that throttles while it takes bytes is pacing a
+transfer that is moving, and only one that throttles while moving nothing is ended by the bound. A
+throttle is an answer, so what it ends with is the limit it kept meeting — unless the window it was
+meeting was one this machine filled itself: a pair with no binding to decide under answers offers
+with nothing, those offers spend its start window, and a throttle reached that way ends as `NoPair`,
+which is what the transfer met. The count of those unanswered offers is cleared by any answer that
+is not a bare limit, so a pair that answered once — with a name it already holds, say — is a pair
+that is there, and the throttle it meets afterwards is the limit it names. A throttle is slept in
+polls, so a product that stops its transfer during one gets its place back at once rather than when
+the peer's delay runs out. A limit on running transfers is still terminal, because this machine's
+own count would have refused a third one locally, and it carries no delay: the frame's wait beside
+it is a peer's number nothing acts on. An answer that is still arriving is never a refusal: a frame
+the budget cut in half is kept and continued by the next look, and a stream that ends inside a frame
+is a lost attempt rather than "not understood", so a word split across two looks is read once and
+the answer that then arrives is the one that counts. What the sender learns is the class, never the
+receiver's sentence: the host's floor among them stays on the receiver, as a message's refusal does.
+Integrity is the receiving machine's: the product's sink reports the SHA-256 it assembled —
+including the part that was already there from an earlier attempt — and the crate compares it with
+the one the sender offered, so a truncated or corrupted transfer is never answered complete. A sink
+that holds every byte but cannot say what it assembled is answered "the receiver could not store
+it", never "the digest does not match": the crate has no evidence either way and does not
+accuse the bytes.
+
+A transfer that is about to move bytes is recorded first, one entry per transfer and not per chunk,
+in the log's part for peer-driven acts; a log that cannot take the entry stops the transfer and
+answers the sender `not recorded`, and a name that turns out complete or in conflict moved nothing
+and leaves no entry. How often a peer may start one is bounded per peer — `MAX_TRANSFER_STARTS` (6)
+per `TRANSFER_START_WINDOW` (60 s) — and checked before the rights decision, so a peer cannot force
+a record reread or fill the log at will; a resume after a reconnect is the same transfer and does
+not count again. The wait between two offers the pair left unanswered doubles, from one second up to
+eight, and goes back to one as soon as an offer is answered without pacing the transfer, so an offer
+to a pair that never binds is not retried once a second for the whole wait bound. An offer waits
+thirty seconds for the receiving machine's answer, and the verdict that follows the bytes waits for
+the stall bound plus `TRANSFER_GRACE`, because a sink still writing the tail is not a sink that
+stopped. Every offer that is not a resume still spends one start of that window — the doubling slows
+the spending rather than avoiding it — while a resume is the same transfer and spends none. One peer
+may have `MAX_RUNNING_TRANSFERS` (2) transfers running or waiting at once; the receiving side counts
+them and records the new one as one decision under one lock, so the limit holds when a peer offers
+several names at once — which is what keeps "two transfers take half the connection's credit" true.
+The rig runs one task at a time and cannot race two offers, so that half is a structural guarantee
+and no case produces it. A transfer's name is at most `MAX_TRANSFER_NAME_BYTES` (128), the bound a
+label has, and a zero-length file and an empty name are refused locally, before anything is sent.
+
+Nothing of a transfer's own state is stored: no queue, no retention, no journal of its own, no file
+on disk. The crate holds a transfer's name, its length, its digest and how far it has got in memory
+while it runs, and nothing of that after a restart; what it does keep is the authorisation, an audit
+entry like every other allowed act, naming the same name, length and digest. Where a file lands, how
+it is named on disk and what happens to a partial file are the product's decisions, and the crate
+never makes them silently.
 
 ## The server
 
@@ -637,8 +853,10 @@ The harness (`harness/`, never published) is the test rig:
 - **Link.** Datagrams travel through an `AsyncUdpSocket` the test controls —
   the same seam a real socket uses. A script or a seed drops, delays, reorders,
   duplicates and re-addresses them, and every run leaves a trace that replays to
-  itself. A machine's apparent address can change mid-run. A dial drives the clock
-  itself, so a link that drops everything ends at a
+  itself. A plan that delays every datagram by exactly the same amount lets a case
+  count round trips by the link's own reading rather than by how much virtual time the
+  rig happened to spend. A machine's apparent address can change mid-run. A dial drives
+  the clock itself, so a link that drops everything ends at a
   deterministic virtual instant instead of hanging the test, and one machine can
   serve several dialers at once.
 - **Clock.** Time moves only when the test moves it. `quinn` reads the clock and
@@ -663,6 +881,12 @@ The harness (`harness/`, never published) is the test rig:
   the rig stops it on drop. A case that has to count the answers offers by hand on the pair's
   live connection; a case that proves the queue or the action memory runs the real service and
   reads the sink or the executor.
+- **Transfer rig.** A `Source` whose bytes are a function of the absolute offset, so a resumed
+  attempt reads what the first one would have and a large file costs nothing to offer; a sink
+  that folds what it is handed into a SHA-256 and keeps only the count, which is enough to
+  prove a file arrived byte for byte; a sink that keeps the bytes themselves, for the small
+  cases that have to show a resume, a truncation or a corrupted byte; and a wait that moves the
+  virtual clock until a transfer is over instead of sleeping.
 - **Witnesses and invariants.** The capability inventory and the cross-cutting
   invariant table live here, together with the checks that enforce them: every
   entry is either witnessed by a recorded case or marked unproducible with the

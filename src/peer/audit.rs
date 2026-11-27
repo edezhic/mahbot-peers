@@ -3,12 +3,13 @@
 //! # What it holds
 //!
 //! Every grant, every refusal, every ending, every withdrawal, every return, the
-//! clearing of a pairing attempt lock, and — at the message and action layers — every
-//! message a receiver refused, every queue that was dropped and every action recorded
-//! before it ran: what was decided, under whose rights, and when. The moment is the
-//! caller's, like every other moment this crate records. A message's body and an
-//! action's body are never here: the entry names the envelope or the operation, so the
-//! log says what happened without keeping what was said or what was asked.
+//! clearing of a pairing attempt lock, and — at the message, action and transfer layers —
+//! every message a receiver refused, every queue that was dropped, every action recorded
+//! before it ran and every transfer authorised before its first byte: what was decided,
+//! under whose rights, and when. The moment is the caller's, like every other moment this
+//! crate records. A message's body, an action's body and a file's bytes are never here: the
+//! entry names the envelope, the operation or the transfer's name, so the log says what
+//! happened without keeping what was said, what was asked or what was moved.
 //!
 //! # Why append-only
 //!
@@ -65,21 +66,20 @@
 //!
 //! # The cap, and the room a person keeps
 //!
-//! The log is not compacted or rotated. It holds at most [`MAX_FILE_BYTES`], and a
-//! file past it is refused rather than read into memory. Within it, the bytes above
-//! [`RESERVED_FOR_PERSON_BYTES`] below the cap are kept for a person's acts. The
-//! entries a peer causes by asking — a refusal, a refused write, the ending a question
-//! notices, a message a receiver refuses and an action a receiver executes — are not written
-//! once they would reach into that reserve, while a grant, a withdrawal, a trust withdrawal, a
-//! return and an attempt-lock clearing still are. So a peer cannot fill the log and take away
-//! the acts that stop it,
-//! and a refusal that cannot be written is still answered: nothing changes when a question
-//! is refused, so the answer does not depend on the entry. An ending that cannot be written
-//! leaves its row unmarked and refuses all the same — the term passed, and the row's own
-//! `expires_at` names it. Nothing frees that room: the log is never compacted, so the
-//! part a peer may fill only shrinks, and an ending or refusal skipped for want of room
-//! stays unrecorded. A product at the cap must decide what to keep before a person's own
-//! acts fill the reserve.
+//! The log is not compacted or rotated. It holds at most [`MAX_FILE_BYTES`], and a file
+//! past it is refused rather than read into memory. Within it, the bytes above
+//! [`RESERVED_FOR_PERSON_BYTES`] below the cap are kept for a person's acts. The entries a
+//! peer causes by asking — a refusal, a refused write, the ending a question notices, a
+//! message a receiver refuses, an action a receiver executes and a transfer a receiver
+//! authorises — are not written once they would reach into that reserve, while a grant, a
+//! withdrawal, a trust withdrawal, a return and an attempt-lock clearing still are. So a
+//! peer cannot fill the log and take away the acts that stop it, and a refusal that cannot
+//! be written is still answered: nothing changes when a question is refused, so the answer
+//! does not depend on the entry. An ending that cannot be written leaves its row unmarked
+//! and refuses all the same — the term passed, and the row's own `expires_at` names it.
+//! Nothing frees that room: the log is never compacted, so the part a peer may fill only
+//! shrinks, and an ending or refusal skipped for want of room stays unrecorded. A product
+//! at the cap must decide what to keep before a person's own acts fill the reserve.
 //!
 //! A read is not a repair. [`AuditLog::open`] and every append cut a torn tail before
 //! they judge the cap, because they hold the file for writing; [`AuditLog::entries`]
@@ -123,11 +123,11 @@ pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// The bytes below [`MAX_FILE_BYTES`] that the entries a peer can cause may not use.
 ///
-/// A peer causes an entry by asking — a refusal, a refused write, an ending a question
-/// notices — and it can ask again and again, so those stop here, while a person's
-/// grant, withdrawal, trust withdrawal, return or attempt-lock clearing may use the
-/// whole file. One mebibyte is thousands of acts: far more than a person performs, and
-/// small enough that the volume a peer can write is bounded.
+/// A peer causes an entry by asking, and it can ask again and again, so the acts
+/// `Act::is_peer_driven` names stop here, while a person's own acts — a grant, a withdrawal,
+/// a trust withdrawal, a return, an attempt-lock clearing — may use the whole file. One
+/// mebibyte is thousands of acts: far more than a person performs, and small enough that the
+/// volume a peer can write is bounded.
 pub const RESERVED_FOR_PERSON_BYTES: u64 = 1024 * 1024;
 
 /// The most bytes of a floor's reason the log keeps.
@@ -157,6 +157,7 @@ mod code {
     pub const MESSAGE_REFUSED: u8 = 9;
     pub const MESSAGES_DROPPED: u8 = 10;
     pub const ACTION_EXECUTED: u8 = 11;
+    pub const TRANSFER_ALLOWED: u8 = 12;
 }
 
 /// The act body's field tags.
@@ -180,6 +181,9 @@ mod field_tag {
     pub const DROPPED: u8 = 0x11;
     pub const DROP: u8 = 0x12;
     pub const ACTION_ID: u8 = 0x13;
+    pub const TRANSFER_NAME: u8 = 0x14;
+    pub const TRANSFER_LENGTH: u8 = 0x15;
+    pub const TRANSFER_DIGEST: u8 = 0x16;
 }
 
 /// The entry body's field tags.
@@ -277,6 +281,29 @@ pub enum Act {
         /// The right's term, when it had one.
         expires_at: Option<Timestamp>,
     },
+    /// A file transfer was authorised, naming the permission, the transfer's name, its length
+    /// and the digest it must have. It never carries the file: where the bytes land is the
+    /// product's, and the crate has none of them.
+    ///
+    /// The entry is written before the transfer starts, as every other act in this crate is:
+    /// a crash may leave an authorised transfer that moved nothing and never a transfer
+    /// nobody recorded. An authorisation that finds no room in the log's peer-driven part is
+    /// not written, and the transfer is not run — the sender is answered `not recorded`.
+    TransferAllowed {
+        pair: Pair,
+        capability: Capability,
+        /// The transfer's name, exactly as the product supplied it: the crate never mints
+        /// one and never interprets one.
+        name: Vec<u8>,
+        /// The file's length in bytes.
+        length: u64,
+        /// SHA-256 over the whole file, as the product supplied it.
+        digest: [u8; 32],
+        /// Who issued the right it was authorised under.
+        issuer: Issuer,
+        /// The right's term, when it had one.
+        expires_at: Option<Timestamp>,
+    },
     /// An act a newer build wrote: kept so nothing hides, never acted on.
     Unrecognised { code: u8 },
 }
@@ -333,10 +360,12 @@ impl Act {
     /// Whether a question or a peer's write can cause this act.
     ///
     /// A refused question, a refused write, an ending a question notices, a message a receiver
-    /// refuses and an action a receiver executes are the acts a peer causes by asking: none of
-    /// them changes a right, and a peer that keeps asking can cause another one each time — an
-    /// ending that cannot be marked on the row is noticed again by the next question, and a
-    /// peer that keeps sending actions causes an execution entry for each one it is allowed.
+    /// refuses, an action a receiver executes and a transfer a receiver authorises are the acts a
+    /// peer causes by asking: none of them changes a right, and a peer that keeps asking can cause
+    /// another one each time — an ending that cannot be marked on the row is noticed again by the
+    /// next question, a peer that keeps sending actions causes an execution entry for each one it
+    /// is allowed, and one that keeps offering files causes an authorisation entry for each
+    /// transfer it is allowed to start.
     /// Every other act is a person's, or the default's at a pair's coming-into-being, and is
     /// bounded by what the record holds. Only these stop at [`RESERVED_FOR_PERSON_BYTES`]. A
     /// drop is not among them: every drop is this machine's own — a sweep, or a withdrawal a
@@ -350,6 +379,7 @@ impl Act {
                 | Self::Ended { .. }
                 | Self::MessageRefused { .. }
                 | Self::ActionExecuted { .. }
+                | Self::TransferAllowed { .. }
         )
     }
 }
@@ -479,12 +509,12 @@ impl AuditLog {
     /// A tail another process left half written is cut back before this one writes
     /// past it, so the entry this call writes is never the corruption that hides it.
     ///
-    /// A refusal stops at [`RESERVED_FOR_PERSON_BYTES`] below the cap and is answered
-    /// with [`AuditError::NoRoom`], which a caller that only answers a question may
-    /// ignore: nothing changes when a question is refused, so the answer does not
-    /// depend on the entry. A person's act may use the whole file, and one that would
-    /// pass [`MAX_FILE_BYTES`] is refused with [`AuditError::TooLarge`] until the
-    /// product makes room — an unrecorded withdrawal would be an act nobody recorded.
+    /// An act the peer drove — the class [`Act::is_peer_driven`] names — stops at
+    /// [`RESERVED_FOR_PERSON_BYTES`] below the cap and is answered with [`AuditError::NoRoom`],
+    /// which a caller that only answers a question may ignore: nothing changes when a question is
+    /// refused, so the answer does not depend on the entry. A person's act may use the whole file,
+    /// and one that would pass [`MAX_FILE_BYTES`] is refused with [`AuditError::TooLarge`] until
+    /// the product makes room — an unrecorded withdrawal would be an act nobody recorded.
     pub(crate) fn append(&self, entry: &Entry) -> Result<(), AuditError> {
         let body = encode_entry(entry).map_err(|detail| AuditError::Malformed {
             path: self.path.clone(),
@@ -874,6 +904,9 @@ struct Fields {
     count: Option<u64>,
     dropped: Option<Vec<Dropped>>,
     drop: Option<DropReason>,
+    transfer_name: Option<Vec<u8>>,
+    transfer_length: Option<u64>,
+    transfer_digest: Option<[u8; 32]>,
 }
 
 impl Fields {
@@ -955,6 +988,16 @@ impl Fields {
                 }
                 field_tag::DROP => {
                     fields.drop = Some(read_drop_reason(tag, body)?);
+                }
+                field_tag::TRANSFER_NAME => fields.transfer_name = Some(body.to_vec()),
+                field_tag::TRANSFER_LENGTH => {
+                    fields.transfer_length = Some(tlv::u64_of(tag, body).map_err(field_error)?);
+                }
+                field_tag::TRANSFER_DIGEST => {
+                    fields.transfer_digest = Some(
+                        body.try_into()
+                            .map_err(|_| field_detail(tag, "is not a 32-byte digest"))?,
+                    );
                 }
                 // An act field a newer build wrote: read past it, keep the rest.
                 _ => {}
@@ -1065,6 +1108,10 @@ fn encode_entry(entry: &Entry) -> Result<Vec<u8>, String> {
 }
 
 /// One act's bytes: its code and the fields that code names.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per act, each three lines: the act table is read in one place"
+)]
 fn encode_act(act: &Act) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::with_capacity(40);
     match act {
@@ -1158,6 +1205,25 @@ fn encode_act(act: &Act) -> Result<Vec<u8>, String> {
             bytes.push(code::ACTION_EXECUTED);
             put_action_executed(&mut bytes, pair, *capability, id, issuer, *expires_at)?;
         }
+        Act::TransferAllowed {
+            pair,
+            capability,
+            name,
+            length,
+            digest,
+            issuer,
+            expires_at,
+        } => {
+            bytes.push(code::TRANSFER_ALLOWED);
+            put_transfer_allowed(
+                &mut bytes,
+                pair,
+                *capability,
+                (name, *length, digest),
+                issuer,
+                *expires_at,
+            )?;
+        }
         Act::Unrecognised { code } => bytes.push(*code),
     }
     Ok(bytes)
@@ -1195,6 +1261,32 @@ fn put_action_executed(
 ) -> Result<(), String> {
     put_capability(act, pair, capability)?;
     put_field(act, field_tag::ACTION_ID, id)?;
+    put_issuer(act, issuer)?;
+    if let Some(expires_at) = expires_at {
+        put_field(
+            act,
+            field_tag::EXPIRY,
+            &expires_at.unix_seconds().to_be_bytes(),
+        )?;
+    }
+    Ok(())
+}
+
+/// Append an authorised transfer: the pair and capability, the name, the length, the digest,
+/// the issuer and the term.
+fn put_transfer_allowed(
+    act: &mut Vec<u8>,
+    pair: &Pair,
+    capability: Capability,
+    transfer: (&[u8], u64, &[u8; 32]),
+    issuer: &Issuer,
+    expires_at: Option<Timestamp>,
+) -> Result<(), String> {
+    let (name, length, digest) = transfer;
+    put_capability(act, pair, capability)?;
+    put_field(act, field_tag::TRANSFER_NAME, name)?;
+    put_field(act, field_tag::TRANSFER_LENGTH, &length.to_be_bytes())?;
+    put_field(act, field_tag::TRANSFER_DIGEST, digest)?;
     put_issuer(act, issuer)?;
     if let Some(expires_at) = expires_at {
         put_field(
@@ -1372,7 +1464,7 @@ fn decode_act(body: &[u8]) -> Result<Act, String> {
     if code == 0 {
         return Err("the act code is zero".to_owned());
     }
-    if !(code::GRANTED..=code::ACTION_EXECUTED).contains(&code) {
+    if !(code::GRANTED..=code::TRANSFER_ALLOWED).contains(&code) {
         return Ok(Act::Unrecognised { code });
     }
     // A code this build knows but whose fields it cannot read is a newer build's
@@ -1381,6 +1473,10 @@ fn decode_act(body: &[u8]) -> Result<Act, String> {
 }
 
 /// One act this build knows, from the fields it wrote.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per act, each three lines: the act table is read in one place"
+)]
 fn decode_known_act(code: u8, fields: &[u8]) -> Result<Act, String> {
     let fields = Fields::decode(fields)?;
     match code {
@@ -1475,6 +1571,25 @@ fn decode_known_act(code: u8, fields: &[u8]) -> Result<Act, String> {
                 .ok_or("the execution names no issuer")?,
             expires_at: fields.expiry,
         }),
+        code::TRANSFER_ALLOWED => Ok(Act::TransferAllowed {
+            pair: fields.pair()?,
+            capability: fields.capability()?,
+            name: fields
+                .transfer_name
+                .clone()
+                .ok_or("the transfer names no name")?,
+            length: fields
+                .transfer_length
+                .ok_or("the transfer names no length")?,
+            digest: fields
+                .transfer_digest
+                .ok_or("the transfer names no digest")?,
+            issuer: fields
+                .issuer
+                .clone()
+                .ok_or("the transfer names no issuer")?,
+            expires_at: fields.expiry,
+        }),
         _ => Ok(Act::Unrecognised { code }),
     }
 }
@@ -1499,10 +1614,9 @@ pub enum AuditError {
     TooLarge { path: PathBuf, bytes: u64, cap: u64 },
     /// The entry would use bytes the log keeps for a person's acts.
     ///
-    /// Only an entry a peer causes by asking — a refusal, a refused write, an ending a
-    /// question notices, a message a receiver refuses or an action a receiver executes — is
-    /// refused this way, and nothing a peer asks changes anything, so a caller that only
-    /// answers a question may carry on without the entry.
+    /// Only an entry a peer causes by asking — the acts the module docs enumerate — is refused
+    /// this way, and nothing a peer asks changes anything, so a caller that only answers a
+    /// question may carry on without the entry.
     NoRoom { path: PathBuf, kept: u64 },
 }
 

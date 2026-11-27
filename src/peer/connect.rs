@@ -17,7 +17,8 @@
 //! by the gap, and readable while it runs. A connection that carried anything and then died is
 //! a link failure, and the dial that follows it is due at once: recovery, not a loop. Only
 //! dials that carried nothing are paced by the gap. What counts is stated on
-//! [`Connections::keep_connected`].
+//! [`Connections::keep_connected`]: a transfer counts once it has moved a byte, and not when it
+//! was refused, unreadable or failed before one.
 //!
 //! # The connection level travels with the connection
 //!
@@ -279,10 +280,10 @@ struct Live {
 ///
 /// The frame counters at adoption, and the frames written since then that belong to
 /// the binding exchange — the manager's handshake and not the pair's use: a connection
-/// that only exchanged its binding and then died carried nothing. The message and action
-/// layers add their own measurement: a round is an offer or an action request in flight,
-/// `quiet` is where the frames stood when the last one finished, and `taken` is a request
-/// the peer accepted.
+/// that only exchanged its binding and then died carried nothing. The message, action and
+/// transfer layers add their own measurement: a round is an offer, an action request or a
+/// transfer attempt in flight, `quiet` is where the frames stood when the last one finished,
+/// and `taken` is a request the peer accepted.
 #[derive(Debug)]
 struct Watch {
     carried_from: Frames,
@@ -292,11 +293,13 @@ struct Watch {
     /// The frames the exchange wrote, once it has finished; `None` while it is still
     /// in flight.
     exchanged: Mutex<Option<Frames>>,
-    /// How many messages or actions this connection has carried an accepted answer for.
+    /// How many messages, actions or transfers this connection has carried an accepted
+    /// answer for, or a byte of.
     taken: AtomicU64,
-    /// The frames up to the end of the last offer or action round; `None` before one ran.
+    /// The frames up to the end of the last offer, action or transfer round; `None` before
+    /// one ran.
     quiet: Mutex<Option<Frames>>,
-    /// How many offer or action rounds are in flight now.
+    /// How many offer, action or transfer rounds are in flight now.
     rounds: AtomicU32,
     /// The last sign of life the peer gave, sampled by the manager's own reader.
     life: Mutex<Life>,
@@ -420,12 +423,13 @@ impl Frames {
     }
 }
 
-/// One pair's live connection, as the message and action layers use it.
+/// One pair's live connection, as the message, action and transfer layers use it.
 ///
 /// Cheap to clone: the connection is a handle and the watch is shared with the keeper, so
-/// what the layers above report — a round begun or ended, a request accepted — is what the
-/// keeper judges the connection by. An offer or action in flight and one that finished are
-/// not the pair's traffic; an accepted answer always is.
+/// what the layers above report — a round begun or ended, a request accepted, a transfer that
+/// moved a byte — is what the keeper judges the connection by. An offer, an action request or
+/// a transfer attempt in flight and one that finished are not the pair's traffic; an accepted
+/// answer always is.
 #[derive(Clone)]
 pub struct Traffic {
     connection: Connection,
@@ -478,8 +482,8 @@ impl Traffic {
     }
 
     /// How many answers this connection has carried that the peer accepted: a message it took,
-    /// or an action it ran, ran with a result too large to carry, or answered as already
-    /// executed.
+    /// an action it ran, ran with a result too large to carry, or answered as already
+    /// executed, or a transfer that moved a byte.
     ///
     /// The keeper reads the same counter, beside the in-flight rounds, to tell a lost live pair
     /// from a dial that carried nothing. Hidden from the documented API: it exists for the
@@ -490,7 +494,8 @@ impl Traffic {
         self.watch.taken.load(Ordering::SeqCst)
     }
 
-    /// How many offers or action requests are in flight on this connection now.
+    /// How many offers, action requests or transfer attempts are in flight on this connection
+    /// now.
     ///
     /// Hidden for the reason [`Self::taken`] is.
     #[doc(hidden)]
@@ -499,7 +504,8 @@ impl Traffic {
         self.watch.rounds.load(Ordering::SeqCst)
     }
 
-    /// Mark one offer or action request as started, until the guard is dropped.
+    /// Mark one offer, action request or transfer attempt as started, until the guard is
+    /// dropped.
     ///
     /// Until then the connection is not judged by its frames: a request in flight is this
     /// machine's own act, not evidence the pair is alive. A guard rather than a paired call,
@@ -510,14 +516,18 @@ impl Traffic {
         Round { traffic: self }
     }
 
-    /// Record that the peer accepted a message offer or an action request over this connection.
+    /// Record that the peer accepted a message offer or an action request, or that a transfer
+    /// moved a byte, over this connection.
     ///
     /// The layers agree on what counts: a message the peer took, or an action it ran, ran with
-    /// a result too large to carry, or answered as already executed. A message's repeat is not
-    /// counted here because its take was; an action's repeat is, because its journal proves the
-    /// receiver accepted the operation before. Every other answer — refused, not ready, slow
-    /// down, memory full, not recorded, busy, unsupported, unreadable — means the peer took
-    /// nothing, so a connection that drops after one is not counted as a link failure.
+    /// a result too large to carry, or answered as already executed, or a transfer that moved
+    /// at least one byte of the file. A message's repeat is not counted here because its take
+    /// was; an action's repeat is, because its journal proves the receiver accepted the
+    /// operation before; a transfer that was answered `Resume` and then moved nothing is not,
+    /// because a resume is the receiver's answer and not its use. Every other answer —
+    /// refused, not ready, slow down, memory full, not recorded, busy, unsupported,
+    /// unreadable — means the peer took nothing, so a connection that drops after one is not
+    /// counted as a link failure.
     pub(crate) fn took(&self) {
         self.watch.taken.fetch_add(1, Ordering::SeqCst);
     }
@@ -537,7 +547,8 @@ impl Traffic {
     }
 }
 
-/// One offer or action request in flight, ended when it is dropped however the round ends.
+/// One offer, action request or transfer attempt in flight, ended when it is dropped however
+/// the round ends.
 pub(crate) struct Round<'a> {
     traffic: &'a Traffic,
 }
@@ -947,15 +958,15 @@ impl Connections {
         watched.state.wake(now);
     }
 
-    /// Something wants `peer` up now — a message waiting to be delivered — and the next dial
-    /// is made due at once, keeping the episode.
+    /// Something wants `peer` up now — a message waiting to be delivered, or a transfer
+    /// waiting for the pair — and the next dial is made due at once, keeping the episode.
     ///
     /// This is the reason a queued message may cause a dial without becoming a dial per
     /// second: it moves one wait, it does not reset the count, so a peer that keeps accepting
-    /// a connection and dropping it is still bounded by the episode. The crate's own queue is
-    /// its only caller; a caller with a genuinely new reason to start over — a fresh address —
-    /// calls [`Self::wake`], and one that only wants to dial calls [`Self::ensure`], which is
-    /// paced the same way.
+    /// a connection and dropping it is still bounded by the episode. The crate's own queue and
+    /// the crate's own transfer layer are its only callers; a caller with a genuinely new
+    /// reason to start over — a fresh address — calls [`Self::wake`], and one that only wants
+    /// to dial calls [`Self::ensure`], which is paced the same way.
     pub(crate) fn hurry(&self, peer: &PeerId) {
         self.settle_stale(peer);
         let now = self.runtime.now();
@@ -982,8 +993,8 @@ impl Connections {
         self.current(peer).map(|(_, started_by)| started_by)
     }
 
-    /// The pair's live connection as the message and action layers use it, or `None` when
-    /// the pair has no live connection.
+    /// The pair's live connection as the message, action and transfer layers use it, or `None`
+    /// when the pair has no live connection.
     ///
     /// A closed connection is not one; see [`Self::live`]. The handle shares the
     /// manager's own measurement of the connection, so what the layers above report back —
@@ -1373,12 +1384,15 @@ impl Connections {
     /// without a second handshake. A connection that outlives [`KEEPER_SETTLE`] is
     /// settled the same way: the pair got to use it, so its loss is ordinary churn.
     ///
-    /// The message and action layers' requests are measured with the exchange: a request
-    /// in flight, and one that finished, are not the pair's traffic, so a peer that keeps
-    /// dropping a connection after one unanswered request is not mistaken for a live pair.
+    /// The message, action and transfer layers' requests are measured with the exchange: a
+    /// request in flight, and one that finished, are not the pair's traffic, so a peer that
+    /// keeps dropping a connection after one unanswered request is not mistaken for a live
+    /// pair.
     /// A request the peer accepted is: it is the peer acting, so the connection carried
     /// something and its loss is a link failure. So is a message the peer answered
-    /// `already taken`: the peer's own account says it took that one before.
+    /// `already taken`: the peer's own account says it took that one before. A transfer
+    /// counts as carried once it has moved a byte, and not when it was refused, unreadable or
+    /// failed before the first byte: a file that never started is not the pair being used.
     ///
     /// Only a dial whose connection ends before the pair carried anything, inside
     /// [`KEEPER_SETTLE`] and for a reason other than a timeout, is a strike. A timeout is
@@ -2395,14 +2409,16 @@ pub(crate) fn presented(connection: &Connection) -> Option<Fingerprint> {
 /// and not only the handshake: traffic the pair sends inside it is discounted too,
 /// which is the price of the bound.
 ///
-/// The message and action layers are measured the same way and for the same reason: a
-/// request in flight is this machine's own act, and one that finished is measured back to
-/// where the frames stood when the round ended, so neither counts as the pair's use. A
-/// request the peer *accepted* is different — the peer acted on it, which is the pair being
+/// The message, action and transfer layers are measured the same way and for the same
+/// reason: a request in flight is this machine's own act, and one that finished is measured
+/// back to where the frames stood when the round ended, so neither counts as the pair's use.
+/// A request the peer *accepted* is different — the peer acted on it, which is the pair being
 /// alive — so it counts however the frames are read. An answer that took nothing does not
-/// count: see [`Traffic::took`]. The receiving half is not measured at all: a stream the
-/// peer opened is the peer acting, and answering it is the pair being used, so only this
-/// machine's own rounds are discounted.
+/// count: see [`Traffic::took`]. A transfer is the same measurement one step later: it counts
+/// once a byte has moved, and a refusal, an unreadable frame or a failure before the first
+/// byte does not. The receiving half is not measured at all: a stream the peer opened is the
+/// peer acting, and answering it is the pair being used, so only this machine's own rounds are
+/// discounted.
 fn carried(connection: &Connection, watch: &Watch) -> bool {
     if watch.taken.load(Ordering::SeqCst) > 0 {
         return true;

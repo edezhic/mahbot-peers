@@ -24,7 +24,9 @@ use crate::sim::Sim;
 
 use super::peer::NOW;
 use super::rights::{label, person};
-use super::support::{BUDGET, io_error, keep_findable, pair, spawn_keeper, within};
+use super::support::{
+    BUDGET, carries, io_error, keep_findable, pair, round_trip, spawn_keeper, within,
+};
 
 /// A machine's manager, its endpoint and the accept loop the case spawned.
 ///
@@ -134,20 +136,19 @@ pub(crate) fn pairing_then_direct_connection() -> Result<(), String> {
         // From here the connection must add no datagram to the beacon.
         sim.clock().advance(Duration::from_secs(2)).await;
         tokio::task::yield_now().await;
+        // It is a real connection, and the two halves this case holds are one connection: the
+        // accepting side's own half is taken first, the binding exchange it answers is waited
+        // for, and then a word written on the dialling half is read on the accepting one.
+        let live = wait_connected(&sim, &managed_right.connections, &left.peer_id(), None).await?;
+        exchange_done(&sim, &managed_right.connections, &left.peer_id()).await?;
         let mark = sim.link().trace().len();
-        // It is a real connection: a datagram crosses it, machine to machine.
-        connection
-            .send_datagram(b"hello".as_slice().into())
-            .map_err(|error| error.to_string())?;
-        let live = managed_right
-            .connections
-            .live(&left.peer_id())
-            .ok_or("the accepting side adopted no connection")?;
-        let received = within(&sim, Duration::from_secs(5), live.read_datagram())
-            .await?
-            .map_err(|error| error.to_string())?;
-        if &received[..] != b"hello" {
-            return Err(format!("the datagram arrived as {received:?}"));
+        within(&sim, Duration::from_secs(5), round_trip(&connection, &live)).await??;
+        if live.remote_address() != left.addr() {
+            return Err(format!(
+                "the accepting side holds a connection to {} instead of {}",
+                live.remote_address(),
+                left.addr()
+            ));
         }
         let trace = sim.link().trace();
         if trace[mark..]
@@ -530,7 +531,7 @@ pub(crate) fn a_slow_keep_alive_raises_the_bound() -> Result<(), String> {
             return Err("the case's keep-alive does not raise the bound".to_owned());
         }
         let keeper = spawn_keeper(&managed_left, &right);
-        let first = wait_live(&sim, &managed_left.connections, &right.peer_id(), None).await?;
+        let first = wait_connected(&sim, &managed_left.connections, &right.peer_id(), None).await?;
         // Read once the manager's own reader has been heard from: before that nothing measures
         // the peer's silence and the reading is unmeasured.
         let read = measured_bound(&sim, &managed_left.connections).await?;
@@ -643,20 +644,22 @@ pub(crate) fn one_connection_per_pair() -> Result<(), String> {
             .live(&left.peer_id())
             .ok_or("the right side kept no connection")?;
         // It is one connection, not two halves of different ones: both sides' keepers
-        // are a direct path to each other, and a datagram crosses them.
+        // are a direct path to each other, and a word written on the half that started it
+        // is read on the other.
         if left_live.remote_address() != right.addr() || right_live.remote_address() != left.addr()
         {
             return Err("a keeper is not a direct path to the peer".to_owned());
         }
-        left_live
-            .send_datagram(b"pair".as_slice().into())
-            .map_err(|error| error.to_string())?;
-        let received = within(&sim, Duration::from_secs(5), right_live.read_datagram())
-            .await?
-            .map_err(|error| error.to_string())?;
-        if &received[..] != b"pair" {
-            return Err(format!("the datagram arrived as {received:?}"));
-        }
+        // The manager's binding exchange owns the first stream a kept connection carries, so
+        // the side that accepted finishes it before the round trip accepts a stream of its own.
+        exchange_done(&sim, &managed_left.connections, &right.peer_id()).await?;
+        exchange_done(&sim, &managed_right.connections, &left.peer_id()).await?;
+        let (client, server) = if left_started == Started::Here {
+            (&left_live, &right_live)
+        } else {
+            (&right_live, &left_live)
+        };
+        within(&sim, Duration::from_secs(5), round_trip(client, server)).await??;
         Ok(())
     })
 }
@@ -698,17 +701,15 @@ pub(crate) fn same_starter_tie_break_keeps_one() -> Result<(), String> {
         if managed_right.connections.started_by(&left.peer_id()) != Some(Started::There) {
             return Err("the accepting side did not keep the dialer's connection".to_owned());
         }
-        // One connection, not two: a datagram sent on one side's keeper arrives on
-        // the other side's keeper.
-        left_live
-            .send_datagram(b"one".as_slice().into())
-            .map_err(|error| error.to_string())?;
-        let received = within(&sim, Duration::from_secs(5), right_live.read_datagram())
-            .await?
-            .map_err(|error| error.to_string())?;
-        if &received[..] != b"one" {
-            return Err(format!("the datagram arrived as {received:?}"));
-        }
+        // One connection, not two: a word written on the side that dialled is read on the
+        // side that accepted, once that side's own exchange has finished with the first stream.
+        exchange_done(&sim, &managed_right.connections, &left.peer_id()).await?;
+        within(
+            &sim,
+            Duration::from_secs(5),
+            round_trip(&left_live, &right_live),
+        )
+        .await??;
         Ok(())
     })
 }
@@ -752,7 +753,7 @@ pub(crate) fn tie_break_closes_the_dropped_connection() -> Result<(), String> {
             .map_err(|_| "the dropped dial stayed open".to_owned())?;
         // The dropped dial ends with the tie-break's words. The substring is enough:
         // the other tie-break close is the exporter failure, and that one keeps
-        // neither connection, while this case leaves the kept one carrying a datagram.
+        // neither connection, while this case leaves the kept one carrying data.
         match end {
             quinn::ConnectionError::ApplicationClosed(close)
                 if std::str::from_utf8(&close.reason)
@@ -762,18 +763,13 @@ pub(crate) fn tie_break_closes_the_dropped_connection() -> Result<(), String> {
         if managed_small.connections.started_by(&large.peer_id()) != Some(Started::Here) {
             return Err("the small side did not keep its own connection".to_owned());
         }
-        let there = wait_live(&sim, &managed_large.connections, &small.peer_id(), None).await?;
+        let there =
+            wait_connected(&sim, &managed_large.connections, &small.peer_id(), None).await?;
         if there.stable_id() == dropped.stable_id() {
             return Err("the manager kept the connection the rule dropped".to_owned());
         }
-        kept.send_datagram(b"kept".as_slice().into())
-            .map_err(|error| error.to_string())?;
-        let received = within(&sim, Duration::from_secs(5), there.read_datagram())
-            .await?
-            .map_err(|error| error.to_string())?;
-        if &received[..] != b"kept" {
-            return Err(format!("the datagram arrived as {received:?}"));
-        }
+        exchange_done(&sim, &managed_large.connections, &small.peer_id()).await?;
+        within(&sim, Duration::from_secs(5), round_trip(&kept, &there)).await??;
         Ok(())
     })
 }
@@ -1150,7 +1146,7 @@ pub(crate) fn pairing_restart_then_keeper_reconnects() -> Result<(), String> {
         // No caller dials: the restarted machine's own start is the trigger, and its
         // keeper works through the remembered address by itself.
         let keeper = spawn_keeper(&managed_right, &left);
-        let after = wait_live(&sim, &managed_right.connections, &left.peer_id(), None).await?;
+        let after = wait_connected(&sim, &managed_right.connections, &left.peer_id(), None).await?;
         if after.remote_address() != left.addr() {
             return Err(format!(
                 "the keeper reconnected to {} instead of {}",
@@ -1162,16 +1158,9 @@ pub(crate) fn pairing_restart_then_keeper_reconnects() -> Result<(), String> {
             let end = keeper.await.map_err(|error| error.to_string())?;
             return Err(format!("the keeper stopped after the restart: {end}"));
         }
-        after
-            .send_datagram(b"back".as_slice().into())
-            .map_err(|error| error.to_string())?;
-        let there = wait_live(&sim, &managed_left.connections, &right.peer_id(), None).await?;
-        let received = within(&sim, Duration::from_secs(10), there.read_datagram())
-            .await?
-            .map_err(|error| error.to_string())?;
-        if &received[..] != b"back" {
-            return Err(format!("the datagram arrived as {received:?}"));
-        }
+        let there = wait_connected(&sim, &managed_left.connections, &right.peer_id(), None).await?;
+        exchange_done(&sim, &managed_left.connections, &right.peer_id()).await?;
+        within(&sim, Duration::from_secs(10), round_trip(&after, &there)).await??;
         if !left_store.is_paired(&right.peer_id()) || !right_store.is_paired(&left.peer_id()) {
             return Err("the reconnection changed the pairing".to_owned());
         }
@@ -1343,7 +1332,7 @@ pub(crate) fn an_unreadable_record_is_not_an_unpaired_machine() -> Result<(), St
 
 /// A close one side has not observed does not wedge the pair: whichever connection
 /// the rule names, the loser is closed and the next dial reconnects the pair with
-/// one connection that carries a datagram.
+/// one connection that carries data.
 pub(crate) fn asymmetric_liveness_does_not_split_the_pair() -> Result<(), String> {
     block_on(async {
         let sim = Sim::new().map_err(io_error)?;
@@ -1392,15 +1381,13 @@ pub(crate) fn asymmetric_liveness_does_not_split_the_pair() -> Result<(), String
             managed_left.connections.live(&right.peer_id()),
             managed_right.connections.live(&left.peer_id()),
         ) {
-            left_live
-                .send_datagram(b"agree".as_slice().into())
-                .map_err(|error| error.to_string())?;
-            let received = within(&sim, Duration::from_secs(5), right_live.read_datagram())
-                .await?
-                .map_err(|error| format!("the sides' keepers disagree: {error}"))?;
-            if &received[..] != b"agree" {
-                return Err("the two sides hold different connections".to_owned());
-            }
+            exchange_done(&sim, &managed_left.connections, &right.peer_id()).await?;
+            within(
+                &sim,
+                Duration::from_secs(5),
+                round_trip(&right_live, &left_live),
+            )
+            .await??;
         }
         // The stale connection times out; the next dial reconnects the pair.
         sim.clock().advance(Duration::from_secs(40)).await;
@@ -1422,22 +1409,44 @@ pub(crate) fn asymmetric_liveness_does_not_split_the_pair() -> Result<(), String
             .connections
             .live(&left.peer_id())
             .ok_or("the right kept no connection after the retry")?;
-        left_live
-            .send_datagram(b"back".as_slice().into())
-            .map_err(|error| error.to_string())?;
-        let received = within(&sim, Duration::from_secs(5), right_live.read_datagram())
-            .await?
-            .map_err(|error| error.to_string())?;
-        if &received[..] != b"back" {
-            return Err("the reconnection is not one connection".to_owned());
-        }
+        exchange_done(&sim, &managed_left.connections, &right.peer_id()).await?;
+        within(
+            &sim,
+            Duration::from_secs(5),
+            round_trip(&right_live, &left_live),
+        )
+        .await??;
         Ok(())
     })
 }
 
+/// Wait until the manager's own binding exchange has finished on the pair's live connection.
+///
+/// The exchange owns the first stream a kept connection carries, so a case that accepts a
+/// stream by hand waits for it first: its own accept would otherwise be handed the exchange's
+/// stream, which carries the binding rather than the word the case wrote. It is the manager of
+/// the half that will accept — the one the peer dialled — that is asked.
+async fn exchange_done(sim: &Sim, connections: &Connections, peer: &PeerId) -> Result<(), String> {
+    within(sim, Duration::from_secs(60), async {
+        loop {
+            if connections
+                .traffic(peer)
+                .is_some_and(|traffic| traffic.exchange_done())
+            {
+                return Ok::<(), String>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?
+}
+
 /// Await the pair's live connection while the clock moves, optionally one whose
 /// `stable_id` differs from `different_from`.
-async fn wait_live(
+///
+/// Unlike [`super::support::wait_live`] this one waits for the manager's connection and not for
+/// the binding exchange, which is what a case about the connection itself needs.
+pub(super) async fn wait_connected(
     sim: &Sim,
     connections: &Connections,
     peer: &PeerId,
@@ -1519,15 +1528,10 @@ pub(crate) fn quiet_pair_stays_connected() -> Result<(), String> {
             .connections
             .live(&left.peer_id())
             .ok_or("the quiet pair was closed on the other side")?;
-        live.send_datagram(b"still here".to_vec().into())
-            .map_err(|error| error.to_string())?;
-        let received = within(&sim, Duration::from_secs(10), there.read_datagram())
-            .await
-            .map_err(|_| "the datagram did not cross".to_owned())?
-            .map_err(|error| error.to_string())?;
-        if received.as_ref() != b"still here" {
-            return Err("the datagram crossed with different bytes".to_owned());
-        }
+        exchange_done(&sim, &managed_right.connections, &left.peer_id()).await?;
+        within(&sim, Duration::from_secs(10), round_trip(&live, &there))
+            .await?
+            .map_err(|error| format!("the pair did not carry it: {error}"))?;
         Ok(())
     })
 }
@@ -1535,7 +1539,7 @@ pub(crate) fn quiet_pair_stays_connected() -> Result<(), String> {
 /// A quiet, live pair is not declared gone by its own bound: with the default transport both
 /// keepers run over a connection that carries nothing for longer than `vanish_bound()`, the
 /// connection is the same one afterwards, both keepers are still running, the state reads
-/// connected, and a datagram still crosses.
+/// connected, and data still crosses.
 pub(crate) fn a_quiet_pair_outlives_the_vanish_bound() -> Result<(), String> {
     block_on(async {
         let sim = Sim::new().map_err(io_error)?;
@@ -1545,8 +1549,8 @@ pub(crate) fn a_quiet_pair_outlives_the_vanish_bound() -> Result<(), String> {
         let managed_left = Managed::start(&sim, &beacon, &left, &left_store)?;
         let left_keeper = spawn_keeper(&managed_left, &right);
         let right_keeper = spawn_keeper(&managed_right, &left);
-        let first = wait_live(&sim, &managed_left.connections, &right.peer_id(), None).await?;
-        wait_live(&sim, &managed_right.connections, &left.peer_id(), None).await?;
+        let first = wait_connected(&sim, &managed_left.connections, &right.peer_id(), None).await?;
+        wait_connected(&sim, &managed_right.connections, &left.peer_id(), None).await?;
         let stated = VANISH_BOUND + 2 * TRUST_POLL;
         let read = measured_bound(&sim, &managed_left.connections).await?;
         if read != stated {
@@ -1589,15 +1593,24 @@ pub(crate) fn a_quiet_pair_outlives_the_vanish_bound() -> Result<(), String> {
             .connections
             .live(&left.peer_id())
             .ok_or("the quiet pair was closed on the other side")?;
-        live.send_datagram(b"still here".to_vec().into())
-            .map_err(|error| error.to_string())?;
-        let received = within(&sim, Duration::from_secs(10), there.read_datagram())
-            .await
-            .map_err(|_| "the datagram did not cross".to_owned())?
-            .map_err(|error| error.to_string())?;
-        if received.as_ref() != b"still here" {
-            return Err("the datagram crossed with different bytes".to_owned());
+        // Both keepers run, so which half dialled is read rather than assumed: the round
+        // trip is opened on that half and read on the other, once that other half's own
+        // exchange has finished with the first stream the connection carries.
+        let left_dialled =
+            managed_left.connections.started_by(&right.peer_id()) == Some(Started::Here);
+        if left_dialled {
+            exchange_done(&sim, &managed_right.connections, &left.peer_id()).await?;
+        } else {
+            exchange_done(&sim, &managed_left.connections, &right.peer_id()).await?;
         }
+        let (client, server) = if left_dialled {
+            (&live, &there)
+        } else {
+            (&there, &live)
+        };
+        within(&sim, Duration::from_secs(10), round_trip(client, server))
+            .await?
+            .map_err(|error| format!("the quiet pair did not carry it: {error}"))?;
         left_keeper.abort();
         right_keeper.abort();
         Ok(())
@@ -1626,7 +1639,7 @@ pub(crate) fn an_unmeasured_silence_is_not_concluded() -> Result<(), String> {
         let managed_left =
             Managed::start_over(sim.clock().quiet_runtime(), &beacon, &left, &left_store)?;
         let keeper = spawn_keeper(&managed_left, &right);
-        let first = wait_live(&sim, &managed_left.connections, &right.peer_id(), None).await?;
+        let first = wait_connected(&sim, &managed_left.connections, &right.peer_id(), None).await?;
         // The reader this manager started has not been heard from, so nothing here measures
         // the peer's silence and the reading says so.
         let unmeasured = left.transport.idle_timeout + TRUST_POLL;
@@ -1680,18 +1693,12 @@ pub(crate) fn an_unmeasured_silence_is_not_concluded() -> Result<(), String> {
                 "the pair reads `{state}` after a silence nothing measured, not connected"
             ));
         }
-        live.send_datagram(b"still here".as_slice().into())
-            .map_err(|error| error.to_string())?;
         let there = managed_right
             .connections
             .live(&left.peer_id())
             .ok_or("the far side lost its connection on a silence nothing measured")?;
-        let received = within(&sim, Duration::from_secs(10), there.read_datagram())
-            .await?
-            .map_err(|error| error.to_string())?;
-        if &received[..] != b"still here" {
-            return Err(format!("the datagram arrived as {received:?}"));
-        }
+        exchange_done(&sim, &managed_right.connections, &left.peer_id()).await?;
+        within(&sim, Duration::from_secs(10), round_trip(&live, &there)).await??;
         keeper.abort();
         // The contrast: the same machine's manager over the ordinary runtime. The unmeasured
         // manager's keeper is stopped and its connection dropped first, so nothing it does can
@@ -1709,7 +1716,7 @@ pub(crate) fn an_unmeasured_silence_is_not_concluded() -> Result<(), String> {
         )
         .await?
         .map_err(|error| error.to_string())?;
-        wait_live(&sim, &measured.connections, &right.peer_id(), None).await?;
+        wait_connected(&sim, &measured.connections, &right.peer_id(), None).await?;
         // Driven until the reader has been heard from, then the reading must be the measured
         // one, and its bound the fixed bound plus the two keeper rounds.
         measured_bound(&sim, &measured.connections).await?;
@@ -1740,7 +1747,7 @@ pub(crate) fn keeper_reconnects_without_a_caller() -> Result<(), String> {
         let managed_right = Managed::start(&sim, &beacon, &right, &right_store)?;
         let managed_left = Managed::start(&sim, &beacon, &left, &left_store)?;
         let keeper = spawn_keeper(&managed_left, &right);
-        let first = wait_live(&sim, &managed_left.connections, &right.peer_id(), None).await?;
+        let first = wait_connected(&sim, &managed_left.connections, &right.peer_id(), None).await?;
         // The link fails: the far side closes the pair's connection.
         let there = managed_right
             .connections
@@ -1748,7 +1755,7 @@ pub(crate) fn keeper_reconnects_without_a_caller() -> Result<(), String> {
             .ok_or("the far side holds no connection")?;
         there.close(0u32.into(), b"the link failed");
         // The close reaches this side first, and only then does the keeper dial.
-        let second = wait_live(
+        let second = wait_connected(
             &sim,
             &managed_left.connections,
             &right.peer_id(),
@@ -1756,20 +1763,14 @@ pub(crate) fn keeper_reconnects_without_a_caller() -> Result<(), String> {
         )
         .await?;
         // The new connection carries traffic, and the keeper is still running.
-        second
-            .send_datagram(b"back".to_vec().into())
-            .map_err(|error| error.to_string())?;
         let there = managed_right
             .connections
             .live(&left.peer_id())
             .ok_or("the far side did not adopt the new connection")?;
-        let received = within(&sim, Duration::from_secs(10), there.read_datagram())
-            .await
-            .map_err(|_| "the datagram did not cross the new connection".to_owned())?
-            .map_err(|error| error.to_string())?;
-        if received.as_ref() != b"back" {
-            return Err("the new connection carried different bytes".to_owned());
-        }
+        exchange_done(&sim, &managed_right.connections, &left.peer_id()).await?;
+        within(&sim, Duration::from_secs(10), round_trip(&second, &there))
+            .await?
+            .map_err(|error| format!("the new connection carried nothing: {error}"))?;
         if keeper.is_finished() {
             return Err("the keeper stopped while the pair was connected".to_owned());
         }
@@ -2191,23 +2192,18 @@ pub(crate) fn keeper_survives_a_failed_dial_while_the_pair_connects() -> Result<
                 "the keeper stopped on a failed dial while the pair was connected: {end}"
             ));
         }
-        // The pair really is the one the inbound connection took, and it carries.
+        // The pair really is the one the inbound connection took, and it carries: the round
+        // trip is opened on the peer's half and read on this machine's.
         let live = managed_left
             .connections
             .live(&right.peer_id())
             .ok_or("the pair lost its connection")?;
-        live.send_datagram(b"connected".as_slice().into())
-            .map_err(|error| error.to_string())?;
         let there = managed_right
             .connections
             .live(&left.peer_id())
             .ok_or("the far side lost its connection")?;
-        let received = within(&sim, Duration::from_secs(10), there.read_datagram())
-            .await?
-            .map_err(|error| error.to_string())?;
-        if &received[..] != b"connected" {
-            return Err(format!("the datagram arrived as {received:?}"));
-        }
+        exchange_done(&sim, &managed_left.connections, &right.peer_id()).await?;
+        within(&sim, Duration::from_secs(10), round_trip(&there, &live)).await??;
         left_keeper.abort();
         right_keeper.abort();
         Ok(())
@@ -2233,10 +2229,19 @@ fn pair_records(left: &Machine, right: &Machine) -> Result<RecordStore, String> 
     Ok(left_store)
 }
 
+/// How many bytes of a binding fact [`closing_peer`] reads before it answers: more than
+/// any fact this build writes, so a peer that sends one is read whole.
+const EXCHANGE_READ_BYTES: usize = 1024;
+
 /// A far side that accepts every connection and closes it after `script(connection,
 /// index)` of virtual time, counting the accepts: the peer the keeper's bound cases
 /// script. The closure receives the accepted connection, so a case can make it carry
-/// a datagram before it closes.
+/// traffic before it closes.
+///
+/// The peer answers the binding exchange with an empty fact, as a peer speaking this
+/// crate's protocol does. Without that answer the exchange would end only when the
+/// connection does, and everything the dialler sent in between would be measured as part
+/// of the exchange rather than as the pair's traffic.
 pub(super) fn closing_peer(
     sim: &Sim,
     right: &Machine,
@@ -2251,6 +2256,13 @@ pub(super) fn closing_peer(
             let Ok(connection) = incoming.await else {
                 continue;
             };
+            let exchange = connection.clone();
+            tokio::spawn(async move {
+                if let Ok((mut send, mut recv)) = exchange.accept_bi().await {
+                    let _ = recv.read_to_end(EXCHANGE_READ_BYTES).await;
+                    let _ = send.finish();
+                }
+            });
             let after = script(&connection, counter.fetch_add(1, Ordering::SeqCst));
             clock.schedule(after, move || connection.close(0u32.into(), b"draining"));
         }
@@ -2260,7 +2272,7 @@ pub(super) fn closing_peer(
 
 /// Two keepers that start at the same moment both dial — the link is silenced until
 /// each side's dial is in the trace — and the pair converges on one connection that
-/// carries a datagram while both keepers keep running: the tie-break resolves the
+/// carries data while both keepers keep running: the tie-break resolves the
 /// collision without stopping either keeper.
 pub(crate) fn keeper_survives_a_supersession() -> Result<(), String> {
     block_on(async {
@@ -2298,8 +2310,10 @@ pub(crate) fn keeper_survives_a_supersession() -> Result<(), String> {
         // Both dials are in flight: the collision is produced, not assumed.
         sim.link().resume(left_addr);
         sim.link().resume(right_addr);
-        let left_live = wait_live(&sim, &managed_left.connections, &right.peer_id(), None).await?;
-        let right_live = wait_live(&sim, &managed_right.connections, &left.peer_id(), None).await?;
+        let left_live =
+            wait_connected(&sim, &managed_left.connections, &right.peer_id(), None).await?;
+        let right_live =
+            wait_connected(&sim, &managed_right.connections, &left.peer_id(), None).await?;
         if left_keeper.is_finished() {
             let end = left_keeper.await.map_err(|error| error.to_string())?;
             right_keeper.abort();
@@ -2333,16 +2347,16 @@ pub(crate) fn keeper_survives_a_supersession() -> Result<(), String> {
                 ));
             }
         }
-        // The pair is one connection and it carries.
-        left_live
-            .send_datagram(b"paired".as_slice().into())
-            .map_err(|error| error.to_string())?;
-        let received = within(&sim, Duration::from_secs(10), right_live.read_datagram())
-            .await?
-            .map_err(|error| error.to_string())?;
-        if &received[..] != b"paired" {
-            return Err(format!("the datagram arrived as {received:?}"));
-        }
+        // The pair is one connection and it carries: the round trip is opened on the half of
+        // the machine that started it and read on the other's, once that other's own exchange
+        // has finished with the first stream.
+        let (client, server) = if small.peer_id() == left.peer_id() {
+            (&left_live, &right_live)
+        } else {
+            (&right_live, &left_live)
+        };
+        exchange_done(&sim, &large_managed.connections, &small.peer_id()).await?;
+        within(&sim, Duration::from_secs(10), round_trip(client, server)).await??;
         left_keeper.abort();
         right_keeper.abort();
         Ok(())
@@ -2375,12 +2389,13 @@ pub(crate) fn keeper_redials_a_link_failure() -> Result<(), String> {
         let managed_right = Managed::start(&sim, &beacon, &right, &right_store)?;
         let managed_left = Managed::start(&sim, &beacon, &left, &left_store)?;
         let keeper = spawn_keeper(&managed_left, &right);
-        let mut live = wait_live(&sim, &managed_left.connections, &right.peer_id(), None).await?;
+        let mut live =
+            wait_connected(&sim, &managed_left.connections, &right.peer_id(), None).await?;
         for round in 0..3 {
             // Nothing is carried and no keep-alive pings, so both idle timers fire
             // on a clean link: a link failure, not the peer closing.
             sim.clock().advance(idle + Duration::from_secs(1)).await;
-            live = wait_live(
+            live = wait_connected(
                 &sim,
                 &managed_left.connections,
                 &right.peer_id(),
@@ -2395,24 +2410,18 @@ pub(crate) fn keeper_redials_a_link_failure() -> Result<(), String> {
                 ));
             }
         }
-        live.send_datagram(b"after three link failures".as_slice().into())
-            .map_err(|error| error.to_string())?;
         let there = managed_right
             .connections
             .live(&left.peer_id())
             .ok_or("the far side holds no connection after the link failures")?;
-        let received = within(&sim, Duration::from_secs(10), there.read_datagram())
-            .await?
-            .map_err(|error| error.to_string())?;
-        if &received[..] != b"after three link failures" {
-            return Err(format!("the datagram arrived as {received:?}"));
-        }
+        exchange_done(&sim, &managed_right.connections, &left.peer_id()).await?;
+        within(&sim, Duration::from_secs(10), round_trip(&live, &there)).await??;
         keeper.abort();
         Ok(())
     })
 }
 
-/// A connection that carried a datagram and then died is a link failure, not a
+/// A connection that carried data and then died is a link failure, not a
 /// strike: the keeper re-dials it more times than the episode's cap of dials and keeps
 /// running.
 pub(crate) fn keeper_redials_a_used_connection() -> Result<(), String> {
@@ -2420,20 +2429,31 @@ pub(crate) fn keeper_redials_a_used_connection() -> Result<(), String> {
         let sim = Sim::new().map_err(io_error)?;
         let beacon = TestBeacon::start(&sim).map_err(io_error)?;
         let (left, right, left_store, _) = paired_machines(&sim)?;
-        // Every connection carries one datagram from the far side and is then closed
-        // inside the settle window. Under a lifetime rule these would be strikes in a
-        // row; carrying traffic makes each one a link failure.
-        let (closer, accepted) = closing_peer(&sim, &right, |connection, _| {
-            let _ = connection.send_datagram(b"used".as_slice().into());
-            Duration::from_secs(1)
-        })?;
+        // Every connection is used by the pair and is then closed inside the settle
+        // window. Under a lifetime rule these would be strikes in a row; carrying traffic
+        // makes each one a link failure.
+        let (closer, accepted) = closing_peer(&sim, &right, |_, _| Duration::from_secs(1))?;
         let managed_left = Managed::start(&sim, &beacon, &left, &left_store)?;
         let keeper = spawn_keeper(&managed_left, &right);
         let enough = RECOVERY_DIALS as usize + 2;
+        // Each connection is carried before the peer closes it: the stream is opened by
+        // this machine once the binding exchange is done, so it is traffic the pair made
+        // rather than part of the exchange the manager discounts.
+        let mut carried: Option<usize> = None;
         within(&sim, Duration::from_secs(600), async {
             loop {
                 if keeper.is_finished() || accepted.load(Ordering::SeqCst) >= enough {
                     return;
+                }
+                if let Some(traffic) = managed_left.connections.traffic(&right.peer_id())
+                    && traffic.exchange_done()
+                    && carried != Some(traffic.connection().stable_id())
+                {
+                    carried = Some(traffic.connection().stable_id());
+                    let connection = traffic.connection().clone();
+                    tokio::spawn(async move {
+                        let _ = carries(&connection).await;
+                    });
                 }
                 tokio::task::yield_now().await;
             }
@@ -2597,19 +2617,13 @@ pub(crate) fn a_cancelled_dial_is_given_back() -> Result<(), String> {
         // A keeper started afterwards dials, and the pair comes up once the peer answers.
         sim.link().resume(right.addr());
         let keeper = spawn_keeper(&managed_left, &right);
-        let live = wait_live(&sim, &managed_left.connections, &right.peer_id(), None).await?;
-        live.send_datagram(b"after a cancelled dial".as_slice().into())
-            .map_err(|error| error.to_string())?;
+        let live = wait_connected(&sim, &managed_left.connections, &right.peer_id(), None).await?;
         let there = managed_right
             .connections
             .live(&left.peer_id())
             .ok_or("the far side holds no connection after the cancelled dial")?;
-        let received = within(&sim, Duration::from_secs(10), there.read_datagram())
-            .await?
-            .map_err(|error| error.to_string())?;
-        if &received[..] != b"after a cancelled dial" {
-            return Err(format!("the datagram arrived as {received:?}"));
-        }
+        exchange_done(&sim, &managed_right.connections, &left.peer_id()).await?;
+        within(&sim, Duration::from_secs(10), round_trip(&live, &there)).await??;
         keeper.abort();
         // The same must hold when the pair has already had a connection and lost one the
         // keeper judged: past the settle window the connection the pair used is judged, and
@@ -2663,16 +2677,10 @@ pub(crate) fn a_cancelled_dial_is_given_back() -> Result<(), String> {
         // Not merely readable: a keeper dials it, and the pair comes up and carries again.
         sim.link().resume(right.addr());
         let keeper = spawn_keeper(&managed_left, &right);
-        let live = wait_live(&sim, &managed_left.connections, &right.peer_id(), None).await?;
-        let there = wait_live(&sim, &managed_right.connections, &left.peer_id(), None).await?;
-        live.send_datagram(b"after a judged connection".as_slice().into())
-            .map_err(|error| error.to_string())?;
-        let received = within(&sim, Duration::from_secs(10), there.read_datagram())
-            .await?
-            .map_err(|error| error.to_string())?;
-        if &received[..] != b"after a judged connection" {
-            return Err(format!("the datagram arrived as {received:?}"));
-        }
+        let live = wait_connected(&sim, &managed_left.connections, &right.peer_id(), None).await?;
+        let there = wait_connected(&sim, &managed_right.connections, &left.peer_id(), None).await?;
+        exchange_done(&sim, &managed_right.connections, &left.peer_id()).await?;
+        within(&sim, Duration::from_secs(10), round_trip(&live, &there)).await??;
         keeper.abort();
         // A keeper whose own task is cancelled mid-dial gives the pair back as well: no keeper
         // runs any more, so the pair must not keep claiming the dial.
@@ -2708,9 +2716,8 @@ pub(crate) fn a_cancelled_dial_is_given_back() -> Result<(), String> {
         // And a keeper started again dials it: the pair is not stuck, only unwatched.
         sim.link().resume(right.addr());
         let keeper = spawn_keeper(&managed_left, &right);
-        let live = wait_live(&sim, &managed_left.connections, &right.peer_id(), None).await?;
-        live.send_datagram(b"after a cancelled keeper".as_slice().into())
-            .map_err(|error| error.to_string())?;
+        let live = wait_connected(&sim, &managed_left.connections, &right.peer_id(), None).await?;
+        within(&sim, Duration::from_secs(10), carries(&live)).await??;
         keeper.abort();
         Ok(())
     })
@@ -2786,19 +2793,13 @@ pub(crate) fn a_keeper_that_stops_is_not_a_retry() -> Result<(), String> {
         // A keeper started again is what makes the wait a dial: the pair comes up and carries.
         sim.link().resume(right.addr());
         let keeper = spawn_keeper(&managed_left, &right);
-        let live = wait_live(&sim, &managed_left.connections, &peer, None).await?;
+        let live = wait_connected(&sim, &managed_left.connections, &peer, None).await?;
         if !managed_left.connections.watched(&peer) {
             return Err("a pair a keeper runs for does not read watched".to_owned());
         }
-        live.send_datagram(b"a keeper started again".as_slice().into())
-            .map_err(|error| error.to_string())?;
-        let there = wait_live(&sim, &managed_right.connections, &left.peer_id(), None).await?;
-        let received = within(&sim, Duration::from_secs(10), there.read_datagram())
-            .await?
-            .map_err(|error| error.to_string())?;
-        if &received[..] != b"a keeper started again" {
-            return Err(format!("the datagram arrived as {received:?}"));
-        }
+        let there = wait_connected(&sim, &managed_right.connections, &left.peer_id(), None).await?;
+        exchange_done(&sim, &managed_right.connections, &left.peer_id()).await?;
+        within(&sim, Duration::from_secs(10), round_trip(&live, &there)).await??;
         keeper.abort();
         Ok(())
     })
@@ -2945,7 +2946,7 @@ pub(crate) fn a_peer_dialling_in_does_not_restart_a_used_up_episode() -> Result<
         )
         .await?
         .map_err(|error| error.to_string())?;
-        wait_live(&sim, &managed_left.connections, &right.peer_id(), None).await?;
+        wait_connected(&sim, &managed_left.connections, &right.peer_id(), None).await?;
         // The dialling side holds the connection it dialled.
         let held = managed_right.connections.recovery(&left.peer_id());
         if held != Recovery::Connected {
@@ -3010,7 +3011,7 @@ pub(crate) fn a_vanished_peer_is_noticed_within_the_bound() -> Result<(), String
         // it rather than asserting the arithmetic.
         let stated = VANISH_BOUND + 2 * TRUST_POLL;
         let keeper = spawn_keeper(&managed_left, &right);
-        let first = wait_live(&sim, &managed_left.connections, &right.peer_id(), None).await?;
+        let first = wait_connected(&sim, &managed_left.connections, &right.peer_id(), None).await?;
         // Read once the manager's own reader has been heard from: before that nothing measures
         // the peer's silence and the reading is unmeasured.
         let read = measured_bound(&sim, &managed_left.connections).await?;
@@ -3113,7 +3114,7 @@ pub(crate) fn a_shorter_peer_timeout_is_not_a_strike() -> Result<(), String> {
         let managed_right = Managed::start(&sim, &beacon, &right, &right_store)?;
         let managed_left = Managed::start(&sim, &beacon, &left, &left_store)?;
         let keeper = spawn_keeper(&managed_left, &right);
-        let first = wait_live(&sim, &managed_left.connections, &right.peer_id(), None).await?;
+        let first = wait_connected(&sim, &managed_left.connections, &right.peer_id(), None).await?;
         // The pair goes quiet: nothing either side sends is delivered.
         sim.link().silence(right.addr());
         sim.link().silence(left.addr());
@@ -3187,26 +3188,19 @@ pub(crate) fn a_shorter_peer_timeout_is_not_a_strike() -> Result<(), String> {
         // dialling, and the new connection carries.
         sim.link().resume(right.addr());
         sim.link().resume(left.addr());
-        let second = wait_live(
+        let second = wait_connected(
             &sim,
             &managed_left.connections,
             &right.peer_id(),
             Some(first.stable_id()),
         )
         .await?;
-        second
-            .send_datagram(b"back".as_slice().into())
-            .map_err(|error| error.to_string())?;
         let there = managed_right
             .connections
             .live(&left.peer_id())
             .ok_or("the far side did not adopt the connection the keeper re-dialled")?;
-        let received = within(&sim, Duration::from_secs(10), there.read_datagram())
-            .await?
-            .map_err(|error| error.to_string())?;
-        if &received[..] != b"back" {
-            return Err(format!("the datagram arrived as {received:?}"));
-        }
+        exchange_done(&sim, &managed_right.connections, &left.peer_id()).await?;
+        within(&sim, Duration::from_secs(10), round_trip(&second, &there)).await??;
         keeper.abort();
         Ok(())
     })
@@ -3257,7 +3251,7 @@ pub(crate) fn a_silent_pair_without_a_keep_alive_is_noticed_within_the_bound() -
             ));
         }
         let keeper = spawn_keeper(&managed_left, &right);
-        let first = wait_live(&sim, &managed_left.connections, &right.peer_id(), None).await?;
+        let first = wait_connected(&sim, &managed_left.connections, &right.peer_id(), None).await?;
         // Neither machine says anything: the pair is quiet, as one behind an expired NAT
         // mapping is, and nothing but the transport's own timeout can notice. The keeper
         // re-dials at once when it does, so the signal is the first connection ending rather
@@ -3296,26 +3290,19 @@ pub(crate) fn a_silent_pair_without_a_keep_alive_is_noticed_within_the_bound() -
                 "a silent pair was counted against: the pair reads `{state}`"
             ));
         }
-        let second = wait_live(
+        let second = wait_connected(
             &sim,
             &managed_left.connections,
             &right.peer_id(),
             Some(first.stable_id()),
         )
         .await?;
-        second
-            .send_datagram(b"after the silence".as_slice().into())
-            .map_err(|error| error.to_string())?;
         let there = managed_right
             .connections
             .live(&left.peer_id())
             .ok_or("the far side did not adopt the connection the keeper re-dialled")?;
-        let received = within(&sim, Duration::from_secs(10), there.read_datagram())
-            .await?
-            .map_err(|error| error.to_string())?;
-        if &received[..] != b"after the silence" {
-            return Err(format!("the datagram arrived as {received:?}"));
-        }
+        exchange_done(&sim, &managed_right.connections, &left.peer_id()).await?;
+        within(&sim, Duration::from_secs(10), round_trip(&second, &there)).await??;
         keeper.abort();
         Ok(())
     })
@@ -3361,8 +3348,8 @@ pub(crate) fn a_stale_connection_does_not_outrank_a_fresh_one() -> Result<(), St
         )
         .await?
         .map_err(|error| error.to_string())?;
-        wait_live(&sim, &managed_left.connections, &right.peer_id(), None).await?;
-        wait_live(&sim, &managed_right.connections, &left.peer_id(), None).await?;
+        wait_connected(&sim, &managed_left.connections, &right.peer_id(), None).await?;
+        wait_connected(&sim, &managed_right.connections, &left.peer_id(), None).await?;
         // The held connection is the one the tie-break prefers — this machine started it,
         // and it has the smaller peer id — so a fresh dial can win only by the liveness rule.
         if managed_left.connections.started_by(&right.peer_id()) != Some(Started::Here) {
@@ -3446,16 +3433,11 @@ pub(crate) fn a_stale_connection_does_not_outrank_a_fresh_one() -> Result<(), St
         if first.close_reason().is_none() {
             return Err("the stale connection was not superseded".to_owned());
         }
-        // The fresh connection is the pair's path: a datagram from the peer crosses it.
-        fresh
-            .send_datagram(b"fresh".as_slice().into())
-            .map_err(|error| error.to_string())?;
-        let received = within(&sim, Duration::from_secs(10), kept.read_datagram())
-            .await?
-            .map_err(|error| error.to_string())?;
-        if &received[..] != b"fresh" {
-            return Err(format!("the datagram arrived as {received:?}"));
-        }
+        // The fresh connection is the pair's path: the peer dialled it, so a word written on
+        // the peer's half is read on this machine's, once this machine's own exchange has
+        // finished with the first stream.
+        exchange_done(&sim, &managed_left.connections, &right.peer_id()).await?;
+        within(&sim, Duration::from_secs(10), round_trip(&fresh, &kept)).await??;
         Ok(())
     })
 }
@@ -3466,7 +3448,7 @@ pub(crate) fn a_stale_connection_does_not_outrank_a_fresh_one() -> Result<(), St
 /// Initials arrive, the left answers, and the answer never reaches them, so each handshake
 /// stays unfinished at the left. The case asserts that the Initials and the left's unanswered
 /// flights are in the trace — the burst really is in flight — and then that a properly paired
-/// peer still connects and carries a datagram within a couple of seconds, which a serial
+/// peer still connects and carries data within a couple of seconds, which a serial
 /// accept loop could not do: the first stalled handshake would hold the place for the whole
 /// connect budget.
 pub(crate) fn a_burst_of_stalled_handshakes_is_accepted() -> Result<(), String> {
@@ -3545,19 +3527,16 @@ pub(crate) fn a_burst_of_stalled_handshakes_is_accepted() -> Result<(), String> 
             "a paired peer did not connect within two seconds of a burst of stalled handshakes"
                 .to_owned()
         })??;
-        live.send_datagram(b"accepted".as_slice().into())
-            .map_err(|error| error.to_string())?;
         let there = managed_right
             .connections
             .live(&left.peer_id())
             .ok_or("the accepting side adopted no connection during the burst")?;
-        let received = within(&sim, Duration::from_secs(2), there.read_datagram())
-            .await
-            .map_err(|_| "the datagram did not cross within two seconds of the burst".to_owned())?
-            .map_err(|error| error.to_string())?;
-        if &received[..] != b"accepted" {
-            return Err(format!("the datagram arrived as {received:?}"));
-        }
+        exchange_done(&sim, &managed_right.connections, &left.peer_id()).await?;
+        within(&sim, Duration::from_secs(2), round_trip(&live, &there))
+            .await?
+            .map_err(|error| {
+                format!("the pair carried nothing within two seconds of the burst: {error}")
+            })?;
         keeper.abort();
         Ok(())
     })
@@ -3779,7 +3758,7 @@ pub(crate) fn a_transient_record_fault_keeps_the_connection() -> Result<(), Stri
         let managed_right = Managed::start(&sim, &beacon, &right, &right_store)?;
         let managed_left = Managed::start(&sim, &beacon, &left, &left_store)?;
         let keeper = spawn_keeper(&managed_left, &right);
-        let first = wait_live(&sim, &managed_left.connections, &right.peer_id(), None).await?;
+        let first = wait_connected(&sim, &managed_left.connections, &right.peer_id(), None).await?;
         // Every record read under the left's root meets an operating-system fault.
         let hidden = left.storage().hide_records_dir().map_err(io_error)?;
         // The read really is failing, and it is the transient fault: a dial asked for anyway
@@ -3842,18 +3821,12 @@ pub(crate) fn a_transient_record_fault_keeps_the_connection() -> Result<(), Stri
                 first.stable_id()
             ));
         }
-        live.send_datagram(b"still here".as_slice().into())
-            .map_err(|error| error.to_string())?;
         let there = managed_right
             .connections
             .live(&left.peer_id())
             .ok_or("the far side lost its connection on a local record fault")?;
-        let received = within(&sim, Duration::from_secs(10), there.read_datagram())
-            .await?
-            .map_err(|error| error.to_string())?;
-        if &received[..] != b"still here" {
-            return Err(format!("the datagram arrived as {received:?}"));
-        }
+        exchange_done(&sim, &managed_right.connections, &left.peer_id()).await?;
+        within(&sim, Duration::from_secs(10), round_trip(&live, &there)).await??;
         // A refusal would have ended the keeper; a deferral leaves it asking every round.
         if keeper.is_finished() {
             let end = keeper.await.map_err(|error| error.to_string())?;
@@ -3875,19 +3848,12 @@ pub(crate) fn a_transient_record_fault_keeps_the_connection() -> Result<(), Stri
                 first.stable_id()
             ));
         }
-        after
-            .send_datagram(b"after the fault".as_slice().into())
-            .map_err(|error| error.to_string())?;
         let there = managed_right
             .connections
             .live(&left.peer_id())
             .ok_or("the far side lost its connection once the record was readable again")?;
-        let received = within(&sim, Duration::from_secs(10), there.read_datagram())
-            .await?
-            .map_err(|error| error.to_string())?;
-        if &received[..] != b"after the fault" {
-            return Err(format!("the datagram arrived as {received:?}"));
-        }
+        exchange_done(&sim, &managed_right.connections, &left.peer_id()).await?;
+        within(&sim, Duration::from_secs(10), round_trip(&after, &there)).await??;
         keeper.abort();
         Ok(())
     })
@@ -4379,7 +4345,7 @@ pub(crate) fn a_learned_address_reopens_a_stop() -> Result<(), String> {
             .connect_with(&left_endpoint, &right.fingerprint(), Some(right.addr()))
             .await
             .map_err(|error| format!("a hinted dial to a reachable peer failed: {error}"))?;
-        wait_live(&sim, &right_manager, &left.peer_id(), None).await?;
+        wait_connected(&sim, &right_manager, &left.peer_id(), None).await?;
         left_manager.disconnect(&right.peer_id());
         sim.clock().advance(KEEPER_SETTLE + TRUST_POLL).await;
         if matches!(
@@ -4416,7 +4382,7 @@ pub(crate) fn a_learned_address_reopens_a_stop() -> Result<(), String> {
             .connect(&right_endpoint, &left.fingerprint())
             .await
             .map_err(|error| format!("the right could not dial the left: {error}"))?;
-        wait_live(&sim, &left_manager, &right.peer_id(), None).await?;
+        wait_connected(&sim, &left_manager, &right.peer_id(), None).await?;
         // And the stop does not come back once that connection goes: the address it taught the
         // record is the pair's, so there is somewhere to dial again. This is the read that
         // shows the inbound connection re-opened the stop — while it was live the answer would
@@ -4484,7 +4450,7 @@ pub(crate) fn a_learned_address_reopens_a_stop() -> Result<(), String> {
             let peer = right.fingerprint();
             async move { connections.keep_connected(&endpoint, &peer).await }
         });
-        wait_live(&sim, &left_manager, &right.peer_id(), None).await?;
+        wait_connected(&sim, &left_manager, &right.peer_id(), None).await?;
         keeper.abort();
         left_accept.abort();
         right_accept.abort();
@@ -4505,7 +4471,7 @@ pub(crate) fn a_withdrawn_pair_is_never_retried() -> Result<(), String> {
         let _managed_right = Managed::start(&sim, &beacon, &right, &right_store)?;
         let managed_left = Managed::start(&sim, &beacon, &left, &left_store)?;
         let keeper = spawn_keeper(&managed_left, &right);
-        wait_live(&sim, &managed_left.connections, &right.peer_id(), None).await?;
+        wait_connected(&sim, &managed_left.connections, &right.peer_id(), None).await?;
         // A person on the left withdraws the machine it is connected to.
         left.rights()?
             .withdraw_trust(&right.peer_id(), person("egor")?, NOW)
@@ -4603,7 +4569,7 @@ pub(crate) fn a_withdrawn_pair_is_never_retried() -> Result<(), String> {
 /// [`ConnectFailure::NotTrusted`] with the withdrawal as its cause while the pair's readable
 /// state is [`Recovery::Stopped`] with that same cause — one reason, not two. The person then
 /// restores trust, and the same call re-opens the stop and dials: the pair becomes live and
-/// carries a datagram.
+/// carries data.
 pub(crate) fn a_restored_trust_is_dialled_again() -> Result<(), String> {
     block_on(async {
         let sim = Sim::new().map_err(io_error)?;
@@ -4676,18 +4642,14 @@ pub(crate) fn a_restored_trust_is_dialled_again() -> Result<(), String> {
             .connections
             .live(&right.peer_id())
             .ok_or("a restored trust dialled but the pair holds no connection")?;
-        live.send_datagram(b"trusted again".as_slice().into())
-            .map_err(|error| error.to_string())?;
         let there = managed_right
             .connections
             .live(&left.peer_id())
             .ok_or("the far side holds no connection after the trust was restored")?;
-        let received = within(&sim, Duration::from_secs(10), there.read_datagram())
-            .await?
-            .map_err(|error| error.to_string())?;
-        if &received[..] != b"trusted again" {
-            return Err(format!("the datagram arrived as {received:?}"));
-        }
+        // The manager's binding exchange owns the first stream the kept connection carries, so
+        // the side that accepted finishes it before the round trip accepts a stream of its own.
+        exchange_done(&sim, &managed_right.connections, &left.peer_id()).await?;
+        within(&sim, Duration::from_secs(10), round_trip(&live, &there)).await??;
         // A stop a keeper wrote is the state a person's restoration has to get past: the
         // keeper stops the pair naming the withdrawal, and the next ask re-opens it and dials
         // with no keeper running.
@@ -4902,23 +4864,30 @@ pub(crate) fn pair_recovers_after_the_beacon_returns() -> Result<(), String> {
                 "the pair came back without trying the address its record remembers".to_owned(),
             );
         }
-        // It is a real connection: a datagram crosses it.
+        // It is a real connection: application data crosses it.
         let here = managed_left
             .connections
             .live(&right.peer_id())
             .ok_or("the pair lost its connection the moment it came back")?;
-        here.send_datagram(b"back again".as_slice().into())
-            .map_err(|error| error.to_string())?;
         let there = managed_right
             .connections
             .live(&left.peer_id())
             .ok_or("the far side did not adopt the recovered connection")?;
-        let received = within(&sim, Duration::from_secs(10), there.read_datagram())
-            .await?
-            .map_err(|error| error.to_string())?;
-        if &received[..] != b"back again" {
-            return Err(format!("the datagram arrived as {received:?}"));
+        // Both keepers ran, so which half dialled is read rather than assumed: the round trip is
+        // opened on that half, and the half that accepted finishes its own exchange first.
+        let left_dialled =
+            managed_left.connections.started_by(&right.peer_id()) == Some(Started::Here);
+        if left_dialled {
+            exchange_done(&sim, &managed_right.connections, &left.peer_id()).await?;
+        } else {
+            exchange_done(&sim, &managed_left.connections, &right.peer_id()).await?;
         }
+        let (client, server) = if left_dialled {
+            (&here, &there)
+        } else {
+            (&there, &here)
+        };
+        within(&sim, Duration::from_secs(10), round_trip(client, server)).await??;
         drop(left_presence);
         drop(right_presence);
         left_keeper.abort();
@@ -4991,19 +4960,13 @@ pub(crate) fn pair_recovers_after_the_peer_moves() -> Result<(), String> {
                 live.remote_address()
             ));
         }
-        // It is a real connection: a datagram crosses it.
-        live.send_datagram(b"moved".as_slice().into())
-            .map_err(|error| error.to_string())?;
+        // It is a real connection: application data crosses it.
         let there = managed_right
             .connections
             .live(&left.peer_id())
             .ok_or("the far side did not adopt the connection")?;
-        let received = within(&sim, Duration::from_secs(10), there.read_datagram())
-            .await?
-            .map_err(|error| error.to_string())?;
-        if &received[..] != b"moved" {
-            return Err(format!("the datagram arrived as {received:?}"));
-        }
+        exchange_done(&sim, &managed_right.connections, &left.peer_id()).await?;
+        within(&sim, Duration::from_secs(10), round_trip(&live, &there)).await??;
         // The dialling side wrote nothing: the record still remembers the port the peer
         // left.
         let remembered = left

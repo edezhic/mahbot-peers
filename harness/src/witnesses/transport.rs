@@ -17,7 +17,7 @@ use crate::link::{AddressTaken, Fault, FaultPlan, Rates};
 use crate::machine::Machine;
 use crate::sim::Sim;
 
-use super::support::{endpoint_over, io_error, server_tls, within};
+use super::support::{endpoint_over, io_error, round_trip, server_tls, within};
 
 pub(crate) fn endpoint_from_injected_seams() -> Result<(), String> {
     block_on(async {
@@ -97,20 +97,15 @@ pub(crate) fn concurrent_dialers_pair_correctly() -> Result<(), String> {
             ));
         }
         // The halves must belong to the same connection, not merely to the same
-        // pair of addresses: a datagram sent on one half must arrive on the
-        // other.
-        for (pair, payload) in [(&one, b"one"), (&two, b"two")] {
-            pair.client
-                .send_datagram(payload.as_slice().into())
-                .map_err(|error| error.to_string())?;
-            let received = within(&sim, Duration::from_secs(1), pair.server.read_datagram())
-                .await?
-                .map_err(|error| error.to_string())?;
-            if &received[..] != payload {
-                return Err(format!(
-                    "a datagram arrived on the wrong connection as {received:?}"
-                ));
-            }
+        // pair of addresses: a word written on the client's half is read on the
+        // server's, which two connections that share an address could not do.
+        for pair in [&one, &two] {
+            within(
+                &sim,
+                Duration::from_secs(1),
+                round_trip(&pair.client, &pair.server),
+            )
+            .await??;
         }
         Ok(())
     })
@@ -128,15 +123,14 @@ pub(crate) fn pinned_handshake() -> Result<(), String> {
                 client.addr()
             ));
         }
-        pair.client
-            .send_datagram(b"hello".as_slice().into())
-            .map_err(|e| e.to_string())?;
-        let received = within(&sim, Duration::from_secs(1), pair.server.read_datagram())
-            .await?
-            .map_err(|e| e.to_string())?;
-        if &received[..] != b"hello" {
-            return Err(format!("the datagram arrived as {received:?}"));
-        }
+        // The halves belong to one connection: a word written on the client's half is read on
+        // the server's, which two connections that share an address could not do.
+        within(
+            &sim,
+            Duration::from_secs(1),
+            round_trip(&pair.client, &pair.server),
+        )
+        .await??;
         Ok(())
     })
 }
@@ -358,16 +352,14 @@ pub(crate) fn retry_after_a_timeout() -> Result<(), String> {
                 client.addr()
             ));
         }
-        // And it is a working connection, not merely a handshake.
-        pair.client
-            .send_datagram(b"retry".as_slice().into())
-            .map_err(|error| error.to_string())?;
-        let received = within(&sim, Duration::from_secs(1), pair.server.read_datagram())
-            .await?
-            .map_err(|error| error.to_string())?;
-        if &received[..] != b"retry" {
-            return Err(format!("the retried pair carried {received:?}"));
-        }
+        // And it is a working connection, not merely a handshake: a word written on the
+        // client's half is read on the server's.
+        within(
+            &sim,
+            Duration::from_secs(1),
+            round_trip(&pair.client, &pair.server),
+        )
+        .await??;
         if !server.unclaimed.is_empty() {
             return Err("the server kept an entry after the attempt took its own".to_owned());
         }

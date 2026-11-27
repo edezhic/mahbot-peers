@@ -237,6 +237,10 @@ pub const INBOX_FILE: &str = "src/peer/inbox.rs";
 /// The one file that registers the machine and reads what the beacon pushes to it.
 pub const PRESENCE_FILE: &str = "src/peer/presence.rs";
 
+/// The module that owns a transfer's name: the one place a name could be read rather than
+/// carried.
+pub const TRANSFER_MODULE: &str = "src/peer/transfer.rs";
+
 /// The two files that accept a stream of the pair's connection. They are the only entries
 /// [`EXEMPT`] excuses from `peer.one_stream_acceptor`, and the summary check proves the two
 /// lists name the same files.
@@ -473,6 +477,20 @@ pub const INVARIANTS: &[Invariant] = &[
         scope: &["src/peer/actions.rs", "src/peer/actions/"],
         control: r#"let capability = Capability::WORK;"#,
         check: layer_names_no_capability,
+    },
+    Invariant {
+        id: "transfers.name_decides_nothing",
+        claim: "the transfer layer names no `Capability` value of its own, asks no question of its own and reads no meaning into a name: its one decision is `Rights::may_take_file`, whose inputs are the transport's peer, the host's floor and the moment, so a transfer's name cannot select a permission or reach a grant; and in the module that owns the name it is never split, trimmed, matched by prefix or suffix, parsed or case-folded, because the crate only ever compares two names for equality",
+        scope: &["src/peer/transfer.rs", "src/peer/transfer/"],
+        control: r#"let capability = Capability::WORK;"#,
+        check: name_decides_nothing,
+    },
+    Invariant {
+        id: "transfers.name_is_not_a_path",
+        claim: "the transfer layer never turns a transfer's name into a filesystem path and never writes a file: it compares two names for equality and hands the bytes to the product's sink, which is the only thing that decides where they land",
+        scope: &["src/peer/transfer.rs", "src/peer/transfer/"],
+        control: r#"let path = std::path::Path::new(name.as_str());"#,
+        check: name_is_not_a_path,
     },
     Invariant {
         id: "peer.one_stream_acceptor",
@@ -808,16 +826,68 @@ fn one_beacon_registration(source: &Source) -> Vec<Finding> {
 /// property structural: a body enters as bytes, and the only capability is the one the rights
 /// method fixes on the receiver's side.
 fn layer_names_no_capability(source: &Source) -> Vec<Finding> {
+    forbidden(source, NAME_DECIDES)
+}
+
+/// The tokens that would let bytes select something here: a capability, a question, a grant or a
+/// decision taken in the layer itself.
+const NAME_DECIDES: &[&str] = &[
+    "Capability",
+    "Question",
+    "Authority",
+    "grant(",
+    "withdraw(",
+    "bind(",
+    "decide(",
+];
+
+/// The tokens that would make the layer read a meaning into a name rather than carry it.
+///
+/// The frame codec parses frames — a magic, a version, a stated length — so this scan is the
+/// layer's own module, where a name is a key: two names are compared for equality and nothing
+/// else. A name that is split, trimmed, prefix-matched, parsed or case-folded could select a
+/// path, a permission or a transfer.
+const NAME_IS_OPAQUE: &[&str] = &[
+    "split",
+    "trim",
+    "starts_with",
+    "ends_with",
+    "strip_prefix",
+    "strip_suffix",
+    "parse(",
+    "to_lowercase",
+    "to_uppercase",
+    "contains(",
+    "find(",
+];
+
+/// The transfer layer's one decision, and the name it carries: no capability of its own, and no
+/// meaning read into the name in the module that owns it.
+fn name_decides_nothing(source: &Source) -> Vec<Finding> {
+    let mut tokens = NAME_DECIDES.to_vec();
+    if source.path == TRANSFER_MODULE {
+        tokens.extend_from_slice(NAME_IS_OPAQUE);
+    }
+    forbidden(source, &tokens)
+}
+
+/// The transfer layer never turns a name into a path and never touches a file: the sink is
+/// the only thing that decides where bytes land.
+fn name_is_not_a_path(source: &Source) -> Vec<Finding> {
     forbidden(
         source,
         &[
-            "Capability",
-            "Question",
-            "Authority",
-            "grant(",
-            "withdraw(",
-            "bind(",
-            "decide(",
+            "Path",
+            "PathBuf",
+            "std::fs",
+            "fs::",
+            "File::",
+            "OpenOptions",
+            "tempfile",
+            "create_dir",
+            "remove_file",
+            ".join(",
+            "canonicalize",
         ],
     )
 }

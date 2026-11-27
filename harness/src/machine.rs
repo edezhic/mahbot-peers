@@ -276,6 +276,32 @@ impl Machine {
         )
     }
 
+    /// This machine's transfer layer, over its own root.
+    ///
+    /// The records and the log are this machine's, so the decision about a peer and the
+    /// record of it come from one root. The floor, the clock the layer reads moments from and
+    /// the sink a file lands in are the case's; the runtime is this machine's own, because the
+    /// layer's waits and its receiving tasks belong to the runtime the endpoint runs on.
+    ///
+    /// # Errors
+    ///
+    /// The log's refusal, as text: a gone root, an unreadable or insecure log.
+    pub fn transfers(
+        &self,
+        floor: Arc<dyn mahbot_peers::peer::Floor + Send + Sync>,
+        moment: Arc<dyn mahbot_peers::peer::Moment + Send + Sync>,
+        sink: Option<Arc<dyn mahbot_peers::peer::Sink + Send + Sync>>,
+    ) -> Result<mahbot_peers::peer::Transfers, String> {
+        Ok(mahbot_peers::peer::Transfers::open(
+            self.records.clone(),
+            self.audit()?,
+            floor,
+            moment,
+            sink,
+            self.clock.runtime(),
+        ))
+    }
+
     /// Remember `peer` as a machine this one may talk to.
     pub fn trust(&self, peer: &Machine) {
         self.trust.insert(peer.fingerprint());

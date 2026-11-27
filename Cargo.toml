@@ -2,7 +2,7 @@
 name = "mahbot-peers"
 version = "0.1.0"
 authors = ["edezhic <edezhic@gmail.com>"]
-description = "Direct peer layer between mahbot instances: identity, QUIC transport over raw public keys, the beacon, rights, peer messages, and at-most-once actions."
+description = "Direct peer layer between mahbot instances: identity, QUIC transport over raw public keys, the beacon, rights, peer messages, at-most-once actions, and whole-file transfer."
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/edezhic/mahbot-peers"

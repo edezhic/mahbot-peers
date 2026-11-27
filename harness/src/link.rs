@@ -64,6 +64,11 @@ pub enum FaultPlan {
     Seeded { seed: u64, rates: Rates },
     /// One list of faults per datagram, applied to datagrams 1, 2, 3, …
     Scripted(Vec<Vec<Fault>>),
+    /// Every datagram delayed by exactly this much, so a round trip is twice it.
+    ///
+    /// A constant latency rather than a scripted one: a case that wants to count round
+    /// trips on the link says how long one is and lets every datagram cost the same.
+    Latency(Duration),
 }
 
 impl FaultPlan {
@@ -77,6 +82,7 @@ impl FaultPlan {
     fn faults_for(&self, seq: u64) -> Vec<Fault> {
         match self {
             Self::Clean => Vec::new(),
+            Self::Latency(by) => vec![Fault::Delay(*by)],
             Self::Scripted(script) => usize::try_from(seq.saturating_sub(1))
                 .ok()
                 .and_then(|index| script.get(index))
@@ -122,6 +128,12 @@ pub struct TraceEvent {
     pub seq: u64,
     pub from: SocketAddr,
     pub to: SocketAddr,
+    /// The link clock's reading when the datagram was sent.
+    ///
+    /// The other half of [`Delivery::at`]: the two together are what
+    /// [`Link::round_trips`] measures, so a case counts a round trip by the link's own
+    /// reading rather than by how much virtual time the rig happened to spend.
+    pub sent_at: Duration,
     /// The faults applied, in the order the plan listed them.
     pub faults: Vec<Fault>,
     /// One entry per copy the link routed to `to`; whether a socket was
@@ -173,6 +185,11 @@ struct LinkState {
     /// still exists, but no datagram reaches it until the address is resumed.
     silenced: BTreeSet<SocketAddr>,
     held: Option<Datagram>,
+    /// Whether `send` records what happened; see [`Link::record_trace`].
+    tracing: bool,
+    /// How many datagrams were handed to their address, counted whether or not the
+    /// trace is recording: see [`Link::delivered`].
+    delivered: u64,
     trace: BTreeMap<u64, TraceEvent>,
 }
 
@@ -212,6 +229,8 @@ impl Link {
                     sockets: BTreeMap::new(),
                     silenced: BTreeSet::new(),
                     held: None,
+                    tracing: true,
+                    delivered: 0,
                     trace: BTreeMap::new(),
                 }),
             }),
@@ -244,6 +263,56 @@ impl Link {
     #[must_use]
     pub fn trace(&self) -> Trace {
         self.state().trace.values().cloned().collect()
+    }
+
+    /// Start or stop recording what happens to each datagram.
+    ///
+    /// With recording off, `send` still numbers the datagram, applies the plan and
+    /// delivers it — only the trace entry is skipped. A case that wants to prove
+    /// traffic without paying for a trace reads [`Self::delivered`] instead.
+    pub fn record_trace(&self, on: bool) {
+        self.state().tracing = on;
+    }
+
+    /// How many datagrams the link has handed to their address since it was created.
+    ///
+    /// One per copy routed — a duplicated datagram counts twice — counted whether or
+    /// not the trace is recording, so a case can prove traffic with the trace off.
+    #[must_use]
+    pub fn delivered(&self) -> u64 {
+        self.state().delivered
+    }
+
+    /// How many round trips of `rtt` the link carried after `since_seq`, by the link's own
+    /// clock.
+    ///
+    /// The windows are aligned to the **first delivered datagram after `since_seq`**: each
+    /// delivered datagram is placed in the window `(sent_at - first.sent_at) / rtt`, and the
+    /// answer is how many windows carried one. A datagram sent and delivered inside one round
+    /// trip is 1, and nothing delivered after `since_seq` is 0. An idle gap is no window at
+    /// all — no datagram, no window — so the second a service spends between the handshake
+    /// and the first byte of the file costs nothing, and the count is the link's own work
+    /// rather than the virtual time the rig happened to spend. Aligning to the first datagram
+    /// rather than to the link's creation is what keeps the count from moving by one when a
+    /// run's start shifts.
+    #[must_use]
+    pub fn round_trips(&self, since_seq: u64, rtt: Duration) -> u64 {
+        if rtt.is_zero() {
+            return 0;
+        }
+        let state = self.state();
+        let delivered = state
+            .trace
+            .values()
+            .filter(|event| event.seq > since_seq && !event.deliveries.is_empty());
+        let Some(first) = delivered.clone().map(|event| event.sent_at).min() else {
+            return 0;
+        };
+        let mut windows: BTreeSet<u128> = BTreeSet::new();
+        for event in delivered {
+            windows.insert(event.sent_at.saturating_sub(first).as_nanos() / rtt.as_nanos());
+        }
+        u64::try_from(windows.len()).unwrap_or(u64::MAX)
     }
 
     /// Register a socket at `addr`, which no live socket may hold.
@@ -352,6 +421,7 @@ impl Link {
 
     /// Send one datagram from one machine to another.
     pub fn send(&self, from: SocketAddr, to: SocketAddr, bytes: Vec<u8>) {
+        let sent_at = self.inner.clock.elapsed();
         let deliveries = {
             let mut state = self.state();
             state.seq += 1;
@@ -373,16 +443,19 @@ impl Link {
                     Fault::Reroute(addr) => destination = *addr,
                 }
             }
-            state.trace.insert(
-                seq,
-                TraceEvent {
+            if state.tracing {
+                state.trace.insert(
                     seq,
-                    from,
-                    to,
-                    faults,
-                    deliveries: Vec::new(),
-                },
-            );
+                    TraceEvent {
+                        seq,
+                        from,
+                        to,
+                        sent_at,
+                        faults,
+                        deliveries: Vec::new(),
+                    },
+                );
+            }
             if dropped {
                 Vec::new()
             } else {
@@ -455,6 +528,11 @@ impl Link {
                 socket.push(datagram.from, datagram.bytes.clone());
             }
         }
+        // Counted whether or not the trace is recording: a case that proves traffic
+        // with tracing off reads this instead.
+        state.delivered = state
+            .delivered
+            .saturating_add(u64::try_from(datagram.copies).unwrap_or(u64::MAX));
         if let Some(event) = state.trace.get_mut(&datagram.seq) {
             for _ in 0..datagram.copies {
                 event.deliveries.push(Delivery {

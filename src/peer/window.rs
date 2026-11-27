@@ -1,9 +1,9 @@
-//! The per-peer token window both peer services throttle with.
+//! The per-peer token window the three peer services throttle with.
 //!
-//! A service that answers a peer's requests keeps one window per peer: when the window started
-//! and how many requests it admitted. A request beyond the limit is answered with the delay
-//! until the window turns, and each service holds its own windows, so a flood of one service's
-//! requests cannot throttle the other's.
+//! A service that answers a peer's requests — a message, an action or a transfer — keeps one
+//! window per peer: when the window started and how many requests it admitted. A request
+//! beyond the limit is answered with the delay until the window turns, and each service holds
+//! its own windows, so a flood of one service's requests cannot throttle the other two.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -31,9 +31,10 @@ impl Windows {
     /// Count one request against `peer`'s window, answering the delay when it is over `limit`.
     ///
     /// The window turns `span` after it started. A request over the limit is not counted, so the
-    /// delay it is given does not grow. Counted once the frame's first bytes are read — the
-    /// earliest a stream is visible — so a peer that writes a request's first bytes and stalls
-    /// still spends one of its window.
+    /// delay it is given does not grow. Each service counts a request at the point its own frame
+    /// is read — for a message or an action the first bytes, which is the earliest a stream is
+    /// visible, and for a transfer the whole offer, because a transfer's name and length are
+    /// what the limits are about.
     pub(crate) fn admit(
         &self,
         peer: &PeerId,

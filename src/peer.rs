@@ -1,7 +1,7 @@
 //! The peer layer: what a machine remembers, how two become acquainted, how they
 //! stay connected, what a connected machine may do, and what it asks of another.
 //!
-//! Thirteen pieces, each with one job:
+//! Fourteen pieces, each with one job:
 //!
 //! - [`record`] is the durable memory: one file per peer under the storage root,
 //!   private to the account the product runs as, published atomically, and additive
@@ -9,7 +9,7 @@
 //!   identity — the fingerprint is derived from it, never stored beside it. The file
 //!   has two levels: the machine's and the connection's.
 //! - [`access`] is the connection level's vocabulary: the account on the instance,
-//!   the assistant, the pair, the four capabilities, the rights, and the small
+//!   the assistant, the pair, the five capabilities, the rights, and the small
 //!   versioned fact the binding travels as.
 //! - [`binding`] is the one exchange that carries that fact over a live connection:
 //!   best effort, bounded, and measured so it is not mistaken for the pair's traffic.
@@ -42,43 +42,45 @@
 //!   hands the body to the product's own [`actions::Executor`]; a request whose result
 //!   never came back is marked unknown and never offered again. It has no queue and
 //!   no automatic retry.
+//! - [`transfer`] is a whole file moving over the pair's connection: its own stream, an
+//!   offer, the receiver's decision once, then the bytes with resume, integrity and
+//!   backpressure. It is dispatched by its own frame magic, so a peer that does not know
+//!   transfers answers an offer as a message it cannot read. The crate moves the bytes; the
+//!   product's [`transfer::Source`] and [`transfer::Sink`] say where they come from and where
+//!   they land, and the crate never writes a file or turns a transfer's name into a path.
 //! - [`inbox`] is the one place a pair's connection is read: it accepts every stream
-//!   after the binding exchange, decides by the frame's magic whether it is a message
-//!   or an action, and hands it to the layer that owns it. It runs the message layer's
-//!   offer loop in the same task, so one service per peer answers both and one ending
-//!   reaches whoever started it.
-//! - [`moment`] is the clock both services read: one [`Moment`] the caller supplies, shared
-//!   by the message layer and the action layer, so both record the same moments.
+//!   after the binding exchange, decides by the frame's magic whether it is a message,
+//!   an action or a transfer, and hands it to the layer that owns it. It runs the message layer's
+//!   offer loop in the same task, so one service per peer answers for every layer it was opened
+//!   with and one ending reaches whoever started it.
+//! - [`moment`] is the clock every service reads: one [`Moment`] the caller supplies, shared
+//!   by the message, action and transfer layers, so all of them record the same moments.
 //! - [`rights`] is the decision — may this connection, as this assistant, exercise
 //!   this capability on this machine now — with the default, the host's floor and
 //!   the trust withdrawal.
 //! - [`audit`] is the record of every grant, refusal, ending, withdrawal, return,
-//!   attempt-lock clearing, refused message, dropped queue and executed action, written
-//!   before the act it describes.
+//!   attempt-lock clearing, refused message, dropped queue, executed action and authorised
+//!   transfer, written before the act it describes.
 //!
 //! The layer reads no ambient state and no wall clock: a caller hands in the
 //! storage root, the identity, the beacon, the runtime and the current moment.
 //! The beacon introduces and observes addresses; it never carries a ceremony
-//! result, a message or an action, never stores one, and is never a path.
+//! result, a message, an action or a transfer, never stores one, and is never a path.
 //!
-//! Every type is re-exported here, so a caller names one path. A constant is too when a
-//! caller acts on it — how many handshakes may be in flight at once, how long the keeper's
-//! windows are, how the retry policy's gaps grow and when it stops trying quickly,
-//! how long an exchange or a machine-to-machine flight may take, how many symbols a person
-//! is shown, how much a message may carry, how long a message and a taken identifier are
-//! kept, how often one may be offered and how many a peer's queue may hold, how much an
-//! action and its result may carry, how long its memory is kept, how often one may be
-//! asked and how long its execution may take — while a storage format's internal layout
-//! stays on the module that owns it: a caller never sizes a record, a log, a label, a
-//! queue's fields or an action memory's by hand, and a queue or memory file's byte cap is
-//! its own business. The layers' malformed reasons are [`MessageMalformed`] and
-//! [`ActionMalformed`] for a file and [`FramingFault`] for a frame: the four faults the
-//! framing shares are written once, [`Malformed`] already names the record's, and a frame
-//! cannot carry every fault a file can. The message wire types ([`Message`], [`Answer`]) are
-//! public like the beacon's closed message set: a case builds one and reads an answer by hand.
-//! [`ActionAnswer`] is public because [`Actions::request`] returns it; `Action` itself is
-//! crate-private, because no public entry point takes one and the action cases build raw
-//! frames. This crate writes the only answers there are.
+//! Every type is re-exported here, so a caller names one path. A constant is too when a caller
+//! acts on it — a bound it must plan around, a size it may fill, a window it may spend — and a
+//! constant a layer paces itself with, or one that spells a storage format's internal layout,
+//! stays on the module that owns it: a caller never sizes a record, a log, a label, a queue's
+//! fields, an action memory's or a transfer's frame by hand, and a queue or memory file's byte
+//! cap is its own business. The layers' malformed reasons are [`MessageMalformed`],
+//! [`ActionMalformed`] and [`Malformed`] for the record, with [`FramingFault`] for the faults the
+//! framing shares — except the transfer layer, which has none: no public entry point takes a
+//! frame, so a frame it cannot read is the sender's "not understood" and nothing more. The
+//! message wire types ([`Message`], [`Answer`]) are public like the beacon's closed message set: a
+//! case builds one and reads an answer by hand. [`ActionAnswer`] is public because
+//! [`Actions::request`] returns it; `Action` itself is crate-private, because no public entry
+//! point takes one and the action cases build raw frames. This crate writes the only answers
+//! there are.
 //!
 //! The functions that name what this crate owns on a root without opening or creating
 //! it — [`record::RecordStore::path_for`], [`record::RecordStore::dir_in`],
@@ -104,6 +106,7 @@ pub mod presence;
 pub mod record;
 pub mod recovery;
 pub mod rights;
+pub mod transfer;
 
 mod address;
 mod store;
@@ -154,4 +157,10 @@ pub use recovery::{
 pub use rights::{
     Closed, Decision, Floor, NoFloor, Question, Refusal, Restored, Rights, RightsError, Speaker,
     Step,
+};
+pub use transfer::{
+    Digest, Held, Incoming, MAX_RUNNING_TRANSFERS, MAX_TRANSFER_NAME_BYTES, MAX_TRANSFER_STARTS,
+    Offering, Read, Sink, Source, Stored, TRANSFER_CHUNK, TRANSFER_GRACE, TRANSFER_STALL,
+    TRANSFER_START_WINDOW, TRANSFER_THROTTLE_CAP, TRANSFER_WAIT, Transfer, TransferError,
+    TransferFailure, TransferLimit, TransferName, TransferState, Transfers,
 };

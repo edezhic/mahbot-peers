@@ -95,10 +95,12 @@
 //!
 //! # What it is not
 //!
-//! There is no product layer here: no files and no screen. A message is bytes a
-//! product composes and bytes a product is handed; what it means is the product's. The
-//! at-most-once command is [`crate::peer::actions`], and the one reader that tells a message
-//! from an action on the pair's connection is [`crate::peer::inbox`].
+//! There is no product layer here: what a message means is the product's, and the screen is
+//! nowhere in this crate. A message is not a file: a whole file is its own thing on the same
+//! connection, [`crate::peer::transfer`], with its own stream, its own decision and its own
+//! answer set, and the one reader that tells a message from an action from a transfer on the
+//! pair's connection is [`crate::peer::inbox`]. The at-most-once command is
+//! [`crate::peer::actions`].
 //!
 //! # The files
 //!
@@ -460,9 +462,9 @@ pub struct Sweep {
 /// Built once per storage root, like the records and the log: the store it holds names the
 /// root's queues, and a second layer over one root shares them rather than copying them. A
 /// product runs [`crate::peer::inbox::Inbox::serve`] once per paired peer — which offers this
-/// layer's queue and answers both services — calls [`Messages::send`] when it has something
-/// to say, and calls [`Messages::sweep`] at start-up and periodically; the receiver's
-/// deliveries arrive through the [`Deliveries`] it was built with.
+/// layer's queue and answers the connection's streams — calls [`Messages::send`] when it has
+/// something to say, and calls [`Messages::sweep`] at start-up and periodically; the
+/// receiver's deliveries arrive through the [`Deliveries`] it was built with.
 pub struct Messages {
     rights: Rights,
     floor: Arc<dyn Floor + Send + Sync>,
@@ -983,6 +985,7 @@ impl Messages {
             reply(&*self.runtime, send, &Answer::Throttled { retry_after }).await;
             return Ok(());
         }
+        let carried = !prefix.is_empty();
         let bytes = match stream::read_rest(
             &*self.runtime,
             &mut recv,
@@ -994,6 +997,14 @@ impl Messages {
         {
             Ok(bytes) => bytes,
             Err(ReadFault::TooLong) => {
+                reply(&*self.runtime, send, &Answer::Unreadable).await;
+                return Ok(());
+            }
+            // A frame that stalled after its first bytes is one this build cannot read
+            // whole: an older peer's transfer offer keeps its stream open for the file, and
+            // answering it `unreadable` is what tells that peer the offer was not understood.
+            // A stream that carried nothing has nobody to answer.
+            Err(ReadFault::Stalled) if carried => {
                 reply(&*self.runtime, send, &Answer::Unreadable).await;
                 return Ok(());
             }

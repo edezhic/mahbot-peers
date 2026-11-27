@@ -753,7 +753,7 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.tls.pinned_handshake",
-        "two endpoints that pin each other's fingerprint complete a TLS 1.3 raw-public-key handshake and carry an application datagram",
+        "two endpoints that pin each other's fingerprint complete a TLS 1.3 raw-public-key handshake and carry application data",
     ),
     Capability::witnessed(
         "library.tls.untrusted_peer_refused",
@@ -857,7 +857,7 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.net.quiet_pair_default",
-        "the default transport carries a keep-alive, so a quiet pair with nothing to carry stays connected for twice the idle timeout, and a datagram crosses the connection that survived",
+        "the default transport carries a keep-alive, so a quiet pair with nothing to carry stays connected for twice the idle timeout, and data crosses the connection that survived",
     ),
     Capability::witnessed(
         "library.tls.alpn",
@@ -903,6 +903,10 @@ const CAPABILITIES: &[Capability] = &[
     Capability::witnessed(
         "library.peer.record.oversized_write",
         "a record a newer build left near the size cap is refused with `TooLarge` before an additive write would cross it; the file is left byte for byte as it was and still opens",
+    ),
+    Capability::witnessed(
+        "library.peer.record.cap",
+        "nine accumulated pairs at the longest label a person can supply are what the record's cap must hold: one peer record holds nine pairs — the number of assistants a machine rebinds the same peer to, each with all five capabilities granted by a person whose name is the longest a label may be, which is the largest a pair can produce — every write succeeds, the file stays inside `MAX_RECORD_BYTES`, the record reopens holding nine pairs' rights and nine default markers, and one more right for the ninth pair in the largest form a right takes still fits",
     ),
     Capability::witnessed(
         "library.peer.record.empty_attempt",
@@ -982,7 +986,7 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.peer.connect.direct",
-        "after pairing, two machines connect at the peer's own address — the beacon is asked once for the address because the pairing stored none, and the data path that follows touches no beacon — and carry a datagram machine to machine",
+        "after pairing, two machines connect at the peer's own address — the beacon is asked once for the address because the pairing stored none, and the data path that follows touches no beacon — and carry data machine to machine",
     ),
     Capability::witnessed(
         "library.peer.connect.hint_first",
@@ -1022,7 +1026,7 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.peer.connect.ensure_stops_and_reopens",
-        "a service's dial to a pair this machine does not trust is answered with the refusal and the pair is stopped naming the same cause, so the answer and the readable state never name two reasons, and a trust a person restores is dialled by the next call: the restored pair is live and carries a datagram; a stop a keeper left for the withdrawal is re-opened by that next call, and a plain `Connections::connect` that reaches the peer re-opens it too, because the record and the handshake have both disproved its cause",
+        "a service's dial to a pair this machine does not trust is answered with the refusal and the pair is stopped naming the same cause, so the answer and the readable state never name two reasons, and a trust a person restores is dialled by the next call: the restored pair is live and carries data; a stop a keeper left for the withdrawal is re-opened by that next call, and a plain `Connections::connect` that reaches the peer re-opens it too, because the record and the handshake have both disproved its cause",
     ),
     Capability::witnessed(
         "library.peer.connect.watched",
@@ -1030,11 +1034,11 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.peer.connect.beacon_restart",
-        "a pair whose beacon went down recovers by itself when the beacon comes back: while it is down both sides report the beacon as unreachable rather than silence, and afterwards the pair reconnects and carries a datagram with no person and no restart",
+        "a pair whose beacon went down recovers by itself when the beacon comes back: while it is down both sides report the beacon as unreachable rather than silence, and afterwards the pair reconnects and carries data with no person and no restart",
     ),
     Capability::witnessed(
         "library.peer.connect.moved_address",
-        "a peer that restarted on a new port is found again through the beacon by the other machine's own re-check: the stale address is tried, the beacon answers the new one, the pair connects at it and carries a datagram, and the accepting side records the address authenticated data arrived from",
+        "a peer that restarted on a new port is found again through the beacon by the other machine's own re-check: the stale address is tried, the beacon answers the new one, the pair connects at it and carries data, and the accepting side records the address authenticated data arrived from",
     ),
     Capability::witnessed(
         "library.peer.presence.rearms",
@@ -1050,7 +1054,7 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.peer.connect.quiet_pair_outlives_the_bound",
-        "a healthy pair that carries nothing is not declared gone by its own keeper: with the default transport, both keepers run over a quiet connection for longer than `vanish_bound()`, the connection is the same one afterwards, the state reads connected, the keeper is still running, and a datagram still crosses",
+        "a healthy pair that carries nothing is not declared gone by its own keeper: with the default transport, both keepers run over a quiet connection for longer than `vanish_bound()`, the connection is the same one afterwards, the state reads connected, the keeper is still running, and data still crosses",
     ),
     Capability::witnessed(
         "library.peer.connect.shorter_timeout",
@@ -1066,11 +1070,11 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.peer.connect.fresh_wins",
-        "a connection that has stopped answering does not keep a working one out: a held connection that has shown no sign of life for the vanish bound loses the tie-break to a fresh one, which the pair keeps and which carries a datagram; the sign of life is sampled by the manager's own reader, so the rule holds for a pair nobody is watching and does not depend on how often anybody reads the connection",
+        "a connection that has stopped answering does not keep a working one out: a held connection that has shown no sign of life for the vanish bound loses the tie-break to a fresh one, which the pair keeps and which carries data; the sign of life is sampled by the manager's own reader, so the rule holds for a pair nobody is watching and does not depend on how often anybody reads the connection",
     ),
     Capability::witnessed(
         "library.peer.connect.accept_burst",
-        "a burst of half-finished handshakes does not stop the machine accepting new ones: with several stalled handshakes in flight a properly paired peer still connects and carries a datagram",
+        "a burst of half-finished handshakes does not stop the machine accepting new ones: with several stalled handshakes in flight a properly paired peer still connects and carries data",
     ),
     Capability::unproducible(
         "library.peer.connect.outcomes_extensible",
@@ -1092,11 +1096,11 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.peer.connect.one_per_pair",
-        "when both machines dial at once each keeps the connection started by the smaller fingerprint, both sides keep the same connection, each keeper is a direct path to the other machine's own address, and a datagram crosses it",
+        "when both machines dial at once each keeps the connection started by the smaller fingerprint, both sides keep the same connection, each keeper is a direct path to the other machine's own address, and data crosses it",
     ),
     Capability::witnessed(
         "library.peer.connect.asymmetric_liveness",
-        "a connection one side has closed and the other has not observed is not replaced by a connection the two sides would hold differently; once the stale one times out, the next dial reconnects the pair and a datagram crosses it",
+        "a connection one side has closed and the other has not observed is not replaced by a connection the two sides would hold differently; once the stale one times out, the next dial reconnects the pair and data crosses it",
     ),
     Capability::witnessed(
         "library.peer.connect.closed_not_trusted",
@@ -1104,11 +1108,11 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.peer.connect.same_starter",
-        "when both connections are started by the same machine, both sides keep the one whose TLS exporter is smaller — a value both endpoints derive identically — and a datagram crosses the keeper",
+        "when both connections are started by the same machine, both sides keep the one whose TLS exporter is smaller — a value both endpoints derive identically — and data crosses the keeper",
     ),
     Capability::witnessed(
         "library.peer.connect.tie_break_closes",
-        "the connection the tie-break does not keep is closed with the tie-break's reason and reports that close to its own side, while the kept connection carries a datagram: the pair is left with one connection, not two",
+        "the connection the tie-break does not keep is closed with the tie-break's reason and reports that close to its own side, while the kept connection carries data: the pair is left with one connection, not two",
     ),
     Capability::witnessed(
         "library.peer.connect.tie_break_teaches_no_address",
@@ -1120,7 +1124,7 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.peer.connect.keep_connected",
-        "the manager's keeper re-dials the pair when its connection is gone, with no caller dialling: it keeps the new connection, the old one is gone, and a datagram crosses the replacement",
+        "the manager's keeper re-dials the pair when its connection is gone, with no caller dialling: it keeps the new connection, the old one is gone, and data crosses the replacement",
     ),
     Capability::witnessed(
         "library.peer.connect.keeper_failed",
@@ -1158,19 +1162,19 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.peer.connect.transient_adoption",
-        "a dial that fails while an inbound connection has already been accepted does not stop the keeper: it asks whether the pair is connected before it reports the dial failure, and the pair it took carries a datagram",
+        "a dial that fails while an inbound connection has already been accepted does not stop the keeper: it asks whether the pair is connected before it reports the dial failure, and the pair it took carries data",
     ),
     Capability::witnessed(
         "library.peer.connect.keeper_link_failure",
-        "a connection the peer kept past the settle window is ordinary churn: when an idle timeout on both sides of a transport with no keep-alive ends it, the keeper re-dials after each of three such losses and is still running, and the pair carries a datagram afterwards",
+        "a connection the peer kept past the settle window is ordinary churn: when an idle timeout on both sides of a transport with no keep-alive ends it, the keeper re-dials after each of three such losses and is still running, and the pair carries data afterwards",
     ),
     Capability::witnessed(
         "library.peer.connect.keeper_carried",
-        "a connection that carried a datagram and then died inside the settle window is a link failure, not a strike: a peer that sends one datagram and closes each connection more times than the episode's cap of dials leaves the keeper running",
+        "a connection that carried data and then died inside the settle window is a link failure, not a strike: a peer that carries data once and closes each connection more times than the episode's cap of dials leaves the keeper running",
     ),
     Capability::witnessed(
         "library.peer.connect.keeper_after_restart",
-        "a pair made by a real ceremony and then broken by a restart of one machine reconnects with no caller dialling and no second ceremony: the restarted machine's own start is the trigger, its keeper dials the remembered address by itself, a datagram crosses the new connection, and the pairing is unchanged",
+        "a pair made by a real ceremony and then broken by a restart of one machine reconnects with no caller dialling and no second ceremony: the restarted machine's own start is the trigger, its keeper dials the remembered address by itself, data crosses the new connection, and the pairing is unchanged",
     ),
     Capability::witnessed(
         "library.peer.connect.remembered_cause",
@@ -1189,8 +1193,12 @@ const CAPABILITIES: &[Capability] = &[
         "a claim names the pair for the other machine's person and allows nothing on its strength: the decision on that pair refuses for want of a right",
     ),
     Capability::witnessed(
+        "library.peer.rights.put_files",
+        "\"put files on me\" is byte five, one no reader has used, and it is not \"take files from me\": the two read differently, the five capabilities are the whole list with no byte named twice, and a right stored for a byte this build does not know is kept on file and written back untouched",
+    ),
+    Capability::witnessed(
         "library.peer.rights.default_write",
-        "a pair's acquaintance issues exactly one right, `write to me` by the default, and the audit's last entry records that grant as created",
+        "a pair's acquaintance issues exactly one right, `write to me` by the default, and no other capability of the five — `put files on me` among them, so a default never grants file ingress — and the audit's last entry records that grant as created",
     ),
     Capability::witnessed(
         "library.peer.rights.default_once",
@@ -1235,6 +1243,10 @@ const CAPABILITIES: &[Capability] = &[
     Capability::witnessed(
         "library.peer.rights.trust_restored",
         "restoring trust reissues only the default `write to me` right, issued for the pair the binding names whatever pair the caller passed, leaves a person's earlier right gone, and is recorded with the return and the default's grant",
+    ),
+    Capability::witnessed(
+        "library.peer.rights.file_grant_withdrawn",
+        "a withdrawal of trust removes a person's \"put files on me\" grant with every other right, and the return reissues only the default `write to me`: the pair holds no file permission afterwards, the log names the withdrawal, the return and the default's grant and no grant of the file permission after the return, and a second return answers that the trust was not withdrawn",
     ),
     Capability::witnessed(
         "library.peer.rights.restore_binding",
@@ -1997,6 +2009,14 @@ const CAPABILITIES: &[Capability] = &[
         "the process-global-state scanner catches a `static` under every visibility, attribute and keyword form, and leaves look-alikes alone",
     ),
     Capability::witnessed(
+        "harness.invariant.transfer_permission",
+        "the claim that the transfer layer names no capability, asks no question of its own and reads no meaning into a name can fail: its own control is flagged, the snippets of the layer's one decision and of a name carried and compared are left alone, and every source under its scope is clean",
+    ),
+    Capability::witnessed(
+        "harness.invariant.transfer_name",
+        "the claim that the transfer layer never turns a name into a path and never touches a file can fail: its own control is flagged, a snippet that only reads a name is left alone, and every source under its scope is clean",
+    ),
+    Capability::witnessed(
         "harness.clock.deadline_order",
         "each deadline fires at its own virtual instant, even when a callback queues another for the instant just visited",
     ),
@@ -2085,6 +2105,316 @@ const CAPABILITIES: &[Capability] = &[
     Capability::witnessed(
         "harness.invariant.no_key_rotation",
         "the three source-scan invariants that forbid replacing, renaming or re-minting a key are in the table; the replacement claim judges every shipped source for a renamed or copied path and a removed directory, and the identity module for single-file writes; the name claim judges every shipped source, the mint claim the whole tree; and the name the crate writes is the name the scan looks for",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.arrives",
+        "a whole file offered over the pair's connection arrives at the receiving machine's sink byte for byte, its SHA-256 matching the one the sender offered, and the sender's transfer ends `Finished`",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.not_a_message",
+        "a completed transfer leaves the receiving machine's message queue and delivery sink untouched and takes no part of the message window, so a message composed afterwards still arrives, and the sending machine never queued the file",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.older_peer",
+        "a machine with no transfer layer answers an offer with the message layer's `unreadable` — and with `throttled` once its message window is used up — and the sender ends `not understood`, never refused at a step and never a store failure",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.resume",
+        "a transfer whose connection goes away waits for the pair, resumes from the offset the receiver states, and lands byte-exact with one write a chunk and nothing re-sent; an outage longer than `TRANSFER_STALL` is still a wait, because the stall bound is measured afresh on a live connection",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.wait_anchor",
+        "a transfer that has been moving bytes for longer than `TRANSFER_WAIT` still waits in full when its connection goes away there, is still waiting after a further `TRANSFER_STALL` with the pair gone, and then resumes and lands whole",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.wait_ends",
+        "a transfer that waits longer than `TRANSFER_WAIT` for a pair that never comes back is reported by the receiving machine as `no pair` rather than as waiting, and the sending machine's handle ends the same way",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.record_unreadable",
+        "a sending machine whose own record for the peer becomes unreadable mid-transfer ends the transfer `no progress` after `TRANSFER_WAIT`, never `no pair`, rather than retrying for ever and holding one of this machine's places for the peer",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.retry_not_running",
+        "a sender retrying a name the receiving machine's own earlier attempt still holds waits for it to let go, and ends on the receiving side's own failure or the stall bound, never `already running`",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.digest_unanswerable",
+        "a sink that cannot say what it assembled after every byte arrived is answered `store failed` on both sides, never `digest mismatch`",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.unbound",
+        "an offer to a pair with no binding and no claim is answered nothing — not refused at a step — and is neither stored nor authorised; each such offer spends a start, and the throttle it eventually meets is answered as a throttle with the delay the receiving machine named, not as an end; once the receiving machine decides the binding the same transfer proceeds and lands, and one that never binds ends `no pair` at the wait bound rather than as the limit its offers spent",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.retry_gap",
+        "the wait between offers a pair left unanswered starts at a second, doubles, and is capped at eight: a case reads every gap against that schedule, and an offer the pair answers without pacing the transfer puts the wait back to a second",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.split_answer",
+        "an answer frame the look at it cuts in half is kept and continued by the next look rather than read from its tail as a new frame: the sending side takes the file from a peer that writes its `resume` in two parts two seconds apart — all of it but the last byte, then the last byte — where a reader that started over would see a body byte where the answer's magic should be and end the transfer `not understood`",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.partial_answer",
+        "an answer frame the stream ends inside is a lost attempt and not a refusal: the sender asks again, and the answer it then gets is the one that counts, rather than a terminal `not understood` over a word the receiving side never finished",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.repeated_offset",
+        "a progress word counts only when the offset it states has grown: a peer that answers `resume` and then keeps stating the same offset on one open stream is abandoned one stall bound after the last real progress, exactly as a silent one is, instead of parking the transfer and one of this machine's places for the peer for ever",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.limit_not_pair",
+        "a pair that is there and answering, and whose start window is full before it ever took the transfer, is reported as the start limit it met with the delay the peer last named — never as a pair that was not there: the two readings of a throttle are told apart by whether the window it meets is one this machine's own unanswered offers filled",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.spent_wait",
+        "a connection that comes back and moves nothing gives the transfer no fresh wait budget: half the wait bound spent with the pair gone, then a live connection that answers every offer with nothing — offers that provably reached it after the pair returned — ends the transfer as `no pair` inside what is left of one wait bound rather than inside two, because waiting is a budget a transfer spends and not an episode that restarts",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.terminal_limit",
+        "a limit on running transfers is terminal and carries no delay: a frame that names a wait beside it reaches the product as `limit { which: transfers }` with nothing to wait for, because the answer ends the transfer rather than pacing it — one answer, one meaning",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.answered_progress",
+        "an offset the receiving side keeps growing in its answers to successive offers is progress and keeps the transfer alive: the stall bound runs from the last time that offset grew, so a receiver that holds the name and states a further offset every time is waited for past the bound itself, and then takes the file",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.verdict_margin",
+        "the sending side's bound is the receiver's own stall bound plus a stated margin, `TRANSFER_GRACE`, whose own doc states what that margin covers and what lies outside it, so a receiving machine that spends its whole bound before it answers is heard as the answer it gave — a `store failed` while the sending side is parked on a write, and a verdict arriving past the bound with every byte already written — instead of being timed out as `no progress` and the file offered again",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.stop_throttle",
+        "a stop during a throttle ends the transfer at once rather than when the peer's delay runs out: the throttle is the longest wait the layer has, it is slept in polls, and the stopped task gives one of this machine's places for the peer back, which two further transfers to that peer prove",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.stop_answer",
+        "a stop while the transfer waits for the answer to its offer is noticed within a poll or two rather than at the end of the thirty-second answer budget: the handle reads `stopped` at once and the place it held for the peer is back, which two further transfers to that peer prove — a task still parked in the answer wait would refuse the second of them",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.stop_dial",
+        "a stop made while this machine is dialling the pair takes effect when that dial returns: the handle reads `stopped` at once, the dial completes and the pair connects, and the place the task held for the peer is back by the time the later offers are made, which two further transfers to the same peer show",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.stop_tail",
+        "a stop reaches the tail as well as the bytes: a transfer whose every byte is written, waiting for a slow sink's verdict, ends `stopped` at its next look and gives one of this machine's places for the peer back, which two further transfers to that peer prove — a task still reading the tail would still hold it",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.store_failed",
+        "a sink that refuses the bytes is answered as the receiving side's own failure: the sender ends `store failed`, never `no progress` and never `digest mismatch`, and the sink keeps nothing",
+    ),
+    Capability::witnessed(
+        "library.peer.floor.by_permission",
+        "the host's floor is asked which permission is at stake, so a machine can allow a peer's messages while refusing its files: the message arrives, the file is refused at the floor rather than at the right, and the refusal is recorded naming the permission and the step",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.restart",
+        "the crate keeps no transfer state across a process restart on either side: a transfer interrupted by both machines restarting is gone from the transfer layer, the product's own sink still holds the bytes it took, and a fresh offer of the same name, length and digest resumes from the offset that sink states and lands byte-exact",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.stall",
+        "a transfer on a live connection that moves no byte for `TRANSFER_STALL` ends `no progress`, and the receiving machine records the same cause rather than showing it as waiting for the pair",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.no_pair",
+        "a transfer whose pair never comes back within `TRANSFER_WAIT` ends `no pair`: the receiving machine is paired and trusted, and no dial reaches it, so the transfer waits its own bound and names the pair rather than a refusal",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.answered_pair",
+        "the count of offers a pair left unanswered is cleared by any answer that is not a bare limit: a pair that lost a whole start window of offers and then answered one with a name it already holds is a pair that is there, so the throttle it meets afterwards ends as the start limit it names — the delay the peer last gave — and never as `no pair`",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.answered_then_silent",
+        "a pair that answers one offer with a `running` answer at an offset that has not grown and then stops answering altogether ends as `no pair` once the wait bound is spent — the cause `TransferFailure::NoPair`'s doc names — rather than at the first offer it left unanswered",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.first_offer",
+        "an attempt that could not open a stream never left this machine, so the attempt after it is still the transfer's first offer: a `running` answer to it names a transfer another of this machine's transfers holds there and ends the sender `already running`, rather than being read as this machine's own earlier attempt and waited out until the stall bound ends it `no progress`",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.wait_attempt",
+        "the wait bound is charged the time an attempt itself spends being answered with nothing, not only the pause between attempts: an offer the peer never answers costs the transfer one answer budget a round, so the bound is reached in a handful of rounds rather than the sixty a bound charged only for the pause would need",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.stall_attempt",
+        "the stall bound measures the time an attempt itself spends being answered with nothing, not only the pause between two attempts: a pair that answers every offer with the same offset after a long delay is abandoned one stall bound after the last real progress, after a handful of offers rather than one per second of the bound",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.already_complete",
+        "an offer of a file the receiving machine already holds whole and matching is answered complete, the sender ends `finished`, the sink is not written again, and no `transfer allowed` entry is written for a transfer that moved nothing",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.conflict",
+        "a name the receiving machine already holds with a different digest is answered `conflict`, the sender ends `conflict`, and the bytes it holds are left as they were; a name it holds part of but cannot name the digest for is a conflict too, and no byte is appended",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.running_name",
+        "a second offer of a name whose first stream is still being answered is answered `running` on the wire with how many bytes the receiver has stored, the receiving machine's sink takes no write for it, the machine still holds one transfer under that name, and the first transfer finishes undisturbed",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.digest_mismatch",
+        "a file the receiving machine holds whole with one byte damaged is answered `digest mismatch`, and the sender is never told it arrived; a sink that holds every byte toward the offered digest but cannot say what it assembled is answered `store failed` instead, never `digest mismatch`",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.offset_after_right",
+        "a peer with no `PUT_FILES` right is refused at the right step, and the sink is never asked what it holds",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.right_withdrawn",
+        "a right withdrawn while a transfer runs does not stop it, and a transfer offered afterwards is refused at the right step",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.binding_recheck",
+        "a transfer whose receiving machine is moved to another assistant before the pair comes back is refused at the right step on the resume, even when the new pair holds the same capability",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.trust_withdrawn",
+        "trust withdrawn in the peer ends a running transfer `trust withdrawn`",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.stopped",
+        "a transfer the sending machine's own person stops ends `stopped` and the receiving machine reads the sending side's reset as `stopped`, and the name is free afterwards: the same file offered again is a fresh transfer that lands rather than the receiving person's stop, which they never made; one the receiving machine's person stops ends the sender `stopped by the receiver`, including while that sink is answering `not now`, where the stop is answered instead of the sink's own store failure",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.stop_final",
+        "a stop the sending machine's own product makes is final: a transfer whose transport write is parked for the stall bound ends `stopped` rather than `no progress`, the handle stays `stopped` after the task that moves the file has ended, and nothing the task writes afterwards puts it back on its feet",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.stop_through_a_stalled_sink",
+        "a receiving machine whose sink has answered `not now` past its own bound reads the stream once more before concluding anything, so a stop from the sending side reaches it as `stopped` and never as `store failed`",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.dead_visible",
+        "a receiving-side transfer whose sender never comes back is reported as `no pair` once the wait bound passes, stays visible rather than going from failed to absent, and is no longer stoppable; the one expiry that decides it sweeps every peer's entries, not only the one being asked about",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.local_refusals",
+        "a zero-length file is refused `empty` and an empty or 129-byte name is refused, all before anything is offered, so the receiving machine's sink is never asked and never written",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.malformed_offer",
+        "an offer with an empty name, one of no length, one shorter than the bytes the sink already holds under that name and one whose stream ends before the body it states are each answered `malformed`, an offer of different content under a held name is answered `conflict`, nothing is appended to the sink, and a shorter file the sending machine's own layer offers under a held name ends the sender `malformed` — its own answer, never `not understood`",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.unknown_answer",
+        "a receiving side that answers an offer with a status this build does not know — 200, or 10, which no build ever wrote — or with a body carrying no status at all, leaves the sender `not understood`, never refused at a step and never a store failure",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.no_sink",
+        "a receiving machine whose transfer layer was built with no sink is refused at the layer's own floor while it holds the file permission — and that refusal is recorded, naming the permission and the step — and at the right step once that permission is withdrawn: no sink is never the same answer as no right",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.product_without_sink",
+        "a machine whose inbox has no transfer layer and whose transfer layer was never built still delivers a message and runs an action, answers an offer from the peer `unreadable`, and delivers the next message within the bound the message cases use and no later than the one sent before the offer, measured to one step of the message rig's wait",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.source_unreadable",
+        "a source that ends before the length it offered, and one that fails mid-file, each end the transfer `source unreadable` — the sending side's own answer, never the peer's",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.backpressure",
+        "a sink that takes nothing holds the sender still without ending the transfer or blocking the pair's messages, and the transfer finishes once the sink takes bytes again",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.progress",
+        "a transfer that keeps moving a byte inside `TRANSFER_STALL` finishes however long it takes overall, and a slow sink is progress too: the receiving side states its offset chunk by chunk while its sink stores, and the sender credits nothing else — bytes it handed to the transport and an attempt that timed out are not progress, and nothing takes progress back: an offset stated in an attempt that ended in a throttle is kept, so a later attempt restating it is not growth and clears neither bound — read in the verdict after the bytes and in the write loop while a write is parked, and a case pins each",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.state",
+        "a transfer's handle shows `waiting`, then `running`, then `finished`, and the receiving machine's `incoming` shows the same transfer while it runs",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.not_an_action",
+        "a transfer offer frame offered over the pair's connection is answered by the transfer layer and never handed to the action layer's executor",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.round_trips",
+        "a 100 MiB file arrives byte-exact within thirty round trips of a link with a constant 5 ms one-way delay — the handshake and the offer's authorisation inside the count, and nothing but the file on the connection — counted on the link's own trace with the windows aligned to the run's first delivered datagram, so an idle gap costs no round trip and a shift in the run's start does not move the count",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.one_go",
+        "a file four times the connection's window arrives in one transfer, byte-exact, in one write a chunk and with no restart, while the link keeps its trace off and still carries the file",
+    ),
+    Capability::witnessed(
+        "library.net.buffer_bound",
+        "a peer can make this machine buffer at most 32 MiB on one connection and 8 MiB on one stream, and at most 16 streams are open at once; quinn also retains at most `MAX_BUFFERED_BYTES` of this machine's own writes whatever the peer advertises — the crate's own numbers, since the transport's buffers cannot be read back",
+    ),
+    Capability::witnessed(
+        "library.net.streams_only",
+        "the pair's connection advertises no QUIC datagram and no unidirectional stream, and still carries a bidirectional one; the beacon's own endpoint is configured separately and is not changed",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.two_running",
+        "a third transfer to one peer is refused by the sending machine as `limit`, and a third offer while two are authorised and held is answered `limit` with the running-transfers limit; the receiving side counts the peer's running transfers and records the new one as one decision under one lock, so the limit holds when offers arrive together — a single-threaded rig cannot race the two, so that half is a structural guarantee and no case produces it",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.start_limit",
+        "`MAX_TRANSFER_STARTS` refused offers are each answered at the right step and each writes one refusal, and the next is answered the start limit with a wait inside `TRANSFER_START_WINDOW` and no entry: the limit is checked before the decision, and every offer that is not a resume spends a start",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.resume_not_counted",
+        "a transfer that resumes after a reconnect finishes with the start window already spent and writes no refusal, so a seventh start is what meets the start limit — and that limit is a throttle, not an end: the handle reads `throttled` with the wait the receiving machine named, no longer than its window, and the same transfer finishes once the window turns",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.audit",
+        "a transfer that is about to move bytes writes exactly one `transfer allowed` entry naming the pair, the permission, the name's bytes, the length, the digest, the issuer and the term, on the log's peer-driven part, so a person's grant still lands when that part is full",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.not_recorded",
+        "a transfer whose authorisation cannot be written is not run: the sender ends `not recorded` and the receiving machine's sink is never written",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.carried",
+        "a dialled connection that carried only a refused transfer offer is a dial that carried nothing and spends the pair's episode, while one that moved a byte is ordinary churn the keeper re-dials at once — including a transfer that moved a byte and then ended on its own side, and one that was still in flight when the connection went, which is the pair being used all the same",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.causes_dial",
+        "offering a file to a pair that is down makes the manager dial through the beacon, a second offer joins that episode instead of starting a fresh one, and both transfers finish once the peer is findable",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.slow_sink",
+        "a file one stream window wide offered into a sink that stores one chunk every nine polls arrives whole: the sender's writes fill the window and the write after them parks past the stall bound, the receiving machine reports its offset chunk by chunk while its sink stores, and the sender credits that offset rather than its own parked write — a slow sink slows the sender instead of dropping the file, and the receiving machine reads `finished` too",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.stopped_waiting",
+        "a receiving transfer whose connection goes away while it is in flight reads `waiting`, is stopped there, and answers every later offer under that name `stopped` until the wait bound passes, so the sender ends `stopped by the receiver` and the sink is handed no byte",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.stop_visible",
+        "a receiving transfer that waited for its pair long enough for the last moment it moved to be old is stopped there, and stays visible to the product as `stopped` for a whole `TRANSFER_WAIT` measured from the stop rather than from the last chunk",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.resume_without_progress",
+        "a receiving side that answers `resume` with nothing held and then throws every stream away moves no byte and states no offset, so the sender ends `no progress` after the stall bound instead of retrying for ever and holding one of this machine's places for the peer",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.offset_past_the_end",
+        "an answer that resumes past the file's own end is a state this crate never produces, so the sender ends `not understood` rather than trusting the offset and re-sending the file",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.throttle_bound",
+        "a start limit from the wire is clamped to `TRANSFER_THROTTLE_CAP` when it names a wait longer than that and to one second when it names none, so a peer cannot park a transfer for years or make it retry without pausing; a peer that keeps throttling for `TRANSFER_WAIT` ends the transfer with the limit it kept meeting rather than parking it for ever, unless the offset it states keeps growing — that ends the streak, because a peer throttling while it takes bytes is pacing a transfer that is moving, and a case of its own shows such a peer finishing instead",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.throttle_growth",
+        "a throttle that arrives with the receiving machine's stated offset grown ends the streak: eleven rounds of the whole throttle cap, each stating an offset further than the last, are six hundred and sixty seconds of throttling — past the `TRANSFER_WAIT` a streak counted without growth would end at — and the transfer is then taken and finishes, where the bound would have ended it as the start limit it kept meeting",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.frame_bound",
+        "a frame dribbled a byte at a time is answered `malformed` once the answer budget passes, because the read is bounded as a whole rather than re-armed on every read, so a peer cannot hold a stream slot for as long as it cares to dribble",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.partial_without_digest",
+        "a sink that holds part of a name but cannot name the digest it was assembling toward is answered `conflict`, and the sink is handed no byte",
+    ),
+    Capability::witnessed(
+        "library.peer.transfer.clean_end",
+        "a sending side that finished writing while the sink was still answering \"not now\" is the receiving machine's own store failure — answered `store failed`, not a failed peer source — and the sink holds nothing",
+    ),
+    Capability::unproducible(
+        "library.net.transfer_throughput",
+        "a transfer between two hosts on a real path runs at the rate the path allows and not at the rate the crate can hash, with the socket's buffers sized by the caller",
+        "no host here can produce a real link: the rig has no bandwidth model. The harness delivers every datagram through an in-memory socket on a clock the test moves, so a transfer's rate is the number of scheduler turns the case gave it, and no case can say what a gigabit path or a 100 ms round trip does to it. What the rig can pin is the part that decides the rate — the windows `MAX_BUFFERED_BYTES` and `MAX_STREAM_BYTES` and the one chunk the sender holds — and that is `library.net.buffer_bound` and `library.peer.transfer.round_trips`",
+        "On two hosts with a 1 Gbit/s path between them, install the product on each (or build a small binary against this crate) and give each its own storage root. Pair the two machines, and put a 1 GiB file in one product's source. Shape the path to a 100 ms round trip on both hosts with `tc qdisc add dev eth0 root netem delay 50ms`, naming the interface that carries the path in place of `eth0`, then start the transfer and read the product's own rate: it must be at least 50 MB/s. Repeat with the path shaped to 200 ms (`tc qdisc add dev eth0 root netem delay 100ms`), where it must be at least 25 MB/s. Sizing the socket's buffers is the caller's job: the product sets `SO_SNDBUF` and `SO_RCVBUF` on the socket before binding it, and the macOS defaults are far too small for a path like this, so a run with the defaults measures the kernel's buffer and not this crate. What the two runs must show is that the crate is not the bottleneck — the rate follows the path and the window, not the hashing",
     ),
 ];
 

@@ -166,10 +166,13 @@ const VERSION: u8 = 1;
 
 /// The most bytes a record may have. The machine level alone is under a hundred
 /// bytes; the connection level adds a binding, a claim, one default marker per pair
-/// and four rights per pair, and a machine moved between assistants keeps the pairs
-/// it left. The cap keeps a hostile file from being read into memory, and a write
-/// that would pass it is refused rather than producing a file the next open cannot
-/// read.
+/// and five rights per pair, and a machine moved between assistants keeps the pairs
+/// it left. Nine pairs with every right a person can grant, every label at its own cap,
+/// still fit beside the binding and the claim — about 13.6 KiB — and a product's
+/// ordinary labels cost a fifth of that per pair, so a machine that has moved between a
+/// few dozen assistants still fits. The cap keeps a hostile file from being read into
+/// memory, and a write that would pass it is refused rather than producing a file the
+/// next open cannot read.
 pub const MAX_RECORD_BYTES: u64 = 16 * 1024;
 
 /// The field tags of version 1. Unknown tags are preserved, not refused.
@@ -479,8 +482,8 @@ impl PeerRecord {
 
     /// Which of the three reasons [`Self::trusted`] rejected the pair, when it did.
     ///
-    /// [`Self::trusted`] is this predicate with the reason dropped, so the message and action
-    /// layers cannot disagree about what an untrusted pair is.
+    /// [`Self::trusted`] is this predicate with the reason dropped, so the message, action and
+    /// transfer layers cannot disagree about what an untrusted pair is.
     #[must_use]
     pub(crate) const fn untrusted(&self, limits: &Limits) -> Option<Untrusted> {
         if self.is_withdrawn() {
@@ -870,7 +873,7 @@ impl RecordStore {
 
     /// Put one right on file, replacing the right for the same pair and capability.
     ///
-    /// The store keeps one row per pair and capability: the four capabilities are
+    /// The store keeps one row per pair and capability: the five capabilities are
     /// granted separately, and a grant, a widening and a restore all write the one
     /// row the pair has for that capability.
     pub(crate) fn put_right(&self, peer: &PeerId, right: Right) -> Result<(), RecordError> {

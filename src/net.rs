@@ -61,8 +61,42 @@ pub fn refusal(error: &quinn::ConnectionError) -> Option<Refusal> {
     reason.and_then(Refusal::of)
 }
 
+/// How many bytes a peer may make this machine buffer on one connection: the
+/// connection-level flow-control credit every stream on it draws on.
+///
+/// This is a receive window, not a promise about heap: quinn's own bookkeeping sits on top
+/// of it, and it says what a peer can make this machine hold, not what this machine sends.
+/// It is shared by everything the connection carries — messages, actions and file
+/// transfers — so a stalled sink cannot take the credit a message needs.
+///
+/// Two transfers at [`MAX_STREAM_BYTES`] each account for half of it; the other half is
+/// left to messages and actions, whose frames are a few kilobytes.
+pub const MAX_BUFFERED_BYTES: usize = 32 * 1024 * 1024;
+
+/// How many bytes a peer may make this machine buffer on one stream: the per-stream
+/// credit a file transfer draws on.
+///
+/// It is also what this machine sends ahead of the peer's reading: quinn cannot buffer more
+/// than the peer's advertised stream window, so with this crate on both sides a transfer
+/// queues at most this much here. Eight mebibytes is one round trip's worth at 50 MB/s and
+/// a 100 ms round trip, and two of them fit in [`MAX_BUFFERED_BYTES`] beside the messages.
+pub const MAX_STREAM_BYTES: usize = 8 * 1024 * 1024;
+
+/// How many streams one connection may carry at once.
+///
+/// Two file transfers, one message offer or action request per round each way, and room for
+/// the binding exchange's stream. A peer that opens more is not refused: it is blocked for want
+/// of credit, because this machine advertises room for this many and no more.
+pub const MAX_STREAMS: u32 = 16;
+
 /// Everything about an endpoint that is not a seam: the idle timeout, and how
 /// often a quiet connection pings so it does not reach it.
+///
+/// The flow-control credit is not a field here: [`Self::endpoint`] sets it to
+/// [`MAX_BUFFERED_BYTES`], [`MAX_STREAM_BYTES`] and [`MAX_STREAMS`] for every endpoint it
+/// builds, so a product that constructs this struct as it always has gets the correct
+/// numbers without asking. A product that builds its own [`quinn::TransportConfig`] gets
+/// whatever it sets, and these bounds do not apply to it.
 #[derive(Clone, Debug)]
 pub struct Transport {
     /// How long a connection may carry nothing before QUIC gives up on it.
@@ -91,6 +125,18 @@ impl Default for Transport {
 impl Transport {
     /// Build an endpoint that both accepts and initiates connections, pinned to
     /// `policy` in both directions.
+    ///
+    /// This sets the flow control a pair's connection carries — the memory bound and the
+    /// throughput in one equation — and it is the transport a product should use. A product
+    /// that builds its own `quinn::TransportConfig` decides those numbers itself; the bound
+    /// stated here is what this one gives.
+    ///
+    /// The socket's own buffers are the caller's: the numbers above are what a peer may make
+    /// this machine buffer in this crate, and the operating system's send and receive buffers
+    /// sit on top of them. On a fast path they are the bottleneck — macOS defaults are far too
+    /// small for a gigabit at a hundred milliseconds — so a product that wants the throughput
+    /// sizes them where it makes the socket (`SO_SNDBUF`/`SO_RCVBUF`), which this crate cannot
+    /// do for it because it never makes one.
     pub fn endpoint(
         &self,
         socket: Arc<dyn AsyncUdpSocket>,
@@ -103,6 +149,28 @@ impl Transport {
             IdleTimeout::try_from(self.idle_timeout).map_err(|_| TransportError::IdleTimeout)?,
         ));
         transport.keep_alive_interval(self.keep_alive);
+        // The one equation behind the throughput and the memory bound: a peer may make
+        // this machine buffer at most `MAX_BUFFERED_BYTES` on a connection, at most
+        // `MAX_STREAM_BYTES` on one stream, and at most `MAX_STREAMS` streams at once.
+        // Two transfers therefore account for half the connection's credit, and the rest
+        // stays available to messages and actions, so a stalled sink cannot starve them.
+        // The same numbers bound what this machine sends: `send_window` is the most of its own
+        // writes quinn retains for the peer, so a peer that advertises an enormous window
+        // cannot make this machine queue a file. `MAX_BUFFERED_BYTES` is not smaller than
+        // `MAX_STREAM_BYTES`, which is what quinn recommends of the two: a stream window larger
+        // than the connection's would let one stream take credit the connection does not have.
+        let stream_window = u32::try_from(MAX_STREAM_BYTES)
+            .expect("the stream window fits a QUIC variable integer");
+        let connection_window = u32::try_from(MAX_BUFFERED_BYTES)
+            .expect("the connection window fits a QUIC variable integer");
+        transport.stream_receive_window(quinn::VarInt::from_u32(stream_window));
+        transport.receive_window(quinn::VarInt::from_u32(connection_window));
+        transport.send_window(connection_window.into());
+        transport.max_concurrent_bidi_streams(quinn::VarInt::from_u32(MAX_STREAMS));
+        // This crate sends no datagrams and opens no unidirectional stream on a pair's
+        // connection: advertising room for either would reserve buffers nothing uses.
+        transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
+        transport.datagram_receive_buffer_size(None);
         let transport = Arc::new(transport);
         // The crate builds the TLS configuration itself — TLS 1.3 only, with the
         // ring provider — so an initial cipher suite always exists and this

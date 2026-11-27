@@ -21,7 +21,9 @@
 //! anything, and the refusal is written down: a peer asking for a right is a fact
 //! worth keeping. The default has one act per pair: exactly "write to me", once,
 //! when the pair comes into being, and again only when a person returns the machine
-//! from a withdrawn trust. It never re-creates a right a person withdrew or one that
+//! from a withdrawn trust. It covers messages and the addressed reply and nothing
+//! else — file ingress is [`Capability::PUT_FILES`], a person's explicit grant on the
+//! machine that bears the effect. It never re-creates a right a person withdrew or one that
 //! ended, and it renews nothing; a right a person withdrew or one that ended stays
 //! on file, and its presence is what stops the default acting again. The default is
 //! not reachable through [`Rights::grant`]: its two moments are
@@ -45,15 +47,14 @@
 //! # The record of what happened
 //!
 //! Every grant, refusal, ending, withdrawal, return and attempt-lock clearing is
-//! appended to [`crate::peer::audit`] before the record changes, so a crash may
-//! leave a recorded act that did not happen and never an act nobody recorded. The
-//! entries a peer causes by asking — a refusal, a refused write, an ending a question
-//! notices — can be caused again and again, so the log keeps room below its cap for a
-//! person's acts: one that finds no room there is answered without an entry — a
-//! refusal changes nothing, and an ending is a fact of the clock whether or not its row
-//! records it — while a person's grant, withdrawal, trust withdrawal, return and
-//! attempt-lock clearing may use the whole file. A peer therefore cannot fill the log
-//! and take away the acts that stop it.
+//! appended to [`crate::peer::audit`] before the record changes, so a crash may leave a
+//! recorded act that did not happen and never an act nobody recorded. The entries a
+//! peer causes by asking — the audit module names them — can be caused again and again,
+//! so the log keeps room below its cap for a person's acts: one that finds no room
+//! there is answered without an entry — a refusal changes nothing, and an ending is a
+//! fact of the clock whether or not its row records it — while a person's grant,
+//! withdrawal, trust withdrawal, return and attempt-lock clearing may use the whole
+//! file. A peer therefore cannot fill the log and take away the acts that stop it.
 
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -204,13 +205,14 @@ pub(crate) enum Writing {
     Refused(Refusal),
 }
 
-/// Whether this machine may take a peer's message or run a peer's action now, and as which
-/// pair.
+/// Whether this machine may take a peer's message, run a peer's action or let a peer's file
+/// land now, and as which pair.
 ///
-/// The receiver's side of the decision: `Rights::may_take_message` and `Rights::may_run_action`
-/// answer it with the same fixed order and the same record as [`Rights::decide`], and the layer
-/// above turns it into one wire answer. The capability is the layer's, never the body's: a
-/// message asks "write to me" and an action asks "work on me", and neither names one.
+/// The receiver's side of the decision: `Rights::may_take_message`, `Rights::may_run_action` and
+/// `Rights::may_take_file` answer it with the same fixed order and the same record as
+/// [`Rights::decide`], and the layer above turns it into one wire answer. The capability is the
+/// layer's, never the body's: a message asks "write to me", an action asks "work on me" and a
+/// file asks "put files on me", and none of them names one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Admission {
     /// The request may be taken, as this pair and under this right.
@@ -259,6 +261,34 @@ pub struct NoFloor;
 impl Floor for NoFloor {
     fn refuses(&self, _pair: &Pair, _capability: Capability) -> Option<String> {
         None
+    }
+}
+
+/// A machine's own floor over the caller's: the caller's policy, plus the one refusal this
+/// machine makes for itself.
+///
+/// A product that gave the transfer layer nowhere to put a file has not granted "put files on
+/// me", and the refusal is a floor's — the same step, and the same recorded entry, as a host
+/// policy's. That is what keeps the crate from reading a product's configuration as a rights
+/// fact: it asks the floor, and the floor is where a machine's own policy lives.
+pub(crate) struct FileIngress {
+    floor: Arc<dyn Floor + Send + Sync>,
+    has_sink: bool,
+}
+
+impl FileIngress {
+    /// `floor`, with file ingress refused unless this machine has somewhere to put a file.
+    pub(crate) fn new(floor: Arc<dyn Floor + Send + Sync>, has_sink: bool) -> Self {
+        Self { floor, has_sink }
+    }
+}
+
+impl Floor for FileIngress {
+    fn refuses(&self, pair: &Pair, capability: Capability) -> Option<String> {
+        if !self.has_sink && capability == Capability::PUT_FILES {
+            return Some("this machine has nowhere to put a file".to_owned());
+        }
+        self.floor.refuses(pair, capability)
     }
 }
 
@@ -487,7 +517,34 @@ impl Rights {
         self.admission(peer, Capability::WORK, floor, now)
     }
 
-    /// The one admission both services ask: a fresh record, the pair it names, the decision.
+    /// The receiver's question: may a file from `peer` land on this machine now?
+    ///
+    /// The same order and the same record as [`Self::may_take_message`], with the right
+    /// the plan gives a file: "put files on me". It is never the default, so a pair
+    /// that holds only the default is refused at the right step and learns nothing
+    /// about what this machine holds. The capability is fixed here and never comes
+    /// from the transfer's name or its bytes, which is what the
+    /// `transfers.name_decides_nothing` invariant scans for: the layer above names
+    /// the permission only through the right this answer returns.
+    ///
+    /// The decision is asked once, when a transfer is authorised: a transfer that
+    /// resumes after a reconnect is the same transfer, and a right withdrawn while it
+    /// runs ends the next one, not this one. The binding is re-checked when it
+    /// resumes, by the transfer layer, against the pair this answer names.
+    ///
+    /// # Errors
+    ///
+    /// The record's and the log's own refusals.
+    pub(crate) fn may_take_file(
+        &self,
+        peer: &PeerId,
+        floor: &dyn Floor,
+        now: Timestamp,
+    ) -> Result<Admission, RightsError> {
+        self.admission(peer, Capability::PUT_FILES, floor, now)
+    }
+
+    /// The one admission every service asks: a fresh record, the pair it names, the decision.
     fn admission(
         &self,
         peer: &PeerId,

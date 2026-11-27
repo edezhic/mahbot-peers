@@ -1,4 +1,4 @@
-//! The connection level and the rights: the binding, the claim, the four
+//! The connection level and the rights: the binding, the claim, the five
 //! capabilities, the default, the host's floor, withdrawal, return, the audit, and
 //! the keeper's rule for a connection that only exchanged its binding.
 //!
@@ -224,7 +224,7 @@ pub(crate) fn connection_binding_is_decided_by_one_machine() -> Result<(), Strin
 }
 
 // ---------------------------------------------------------------------------
-// The default and the four capabilities
+// The default and the five capabilities
 // ---------------------------------------------------------------------------
 
 /// The log's entries, read fresh through the same handle the decision writes.
@@ -250,7 +250,8 @@ fn holds(
 }
 
 /// The default is one capability, `write to me`, issued once when a pair comes into
-/// being, and the log records it as a created grant by the default.
+/// being — and no other of the five, file ingress included — and the log records it as a
+/// created grant by the default.
 pub(crate) fn default_issues_write_to_me_and_nothing_else() -> Result<(), String> {
     block_on(async {
         let sim = Sim::new().map_err(io_error)?;
@@ -278,11 +279,19 @@ pub(crate) fn default_issues_write_to_me_and_nothing_else() -> Result<(), String
                 file.len()
             ));
         }
-        for capability in [
-            Capability::WORK,
-            Capability::SEE_SCREEN,
-            Capability::TAKE_FILES,
-        ] {
+        if file[0].capability() != Capability::WRITE {
+            return Err(format!(
+                "the default's one right is `{}`, not `write to me`",
+                file[0].capability()
+            ));
+        }
+        // Every capability this build knows, not a list a sixth would slip past: the default
+        // issues "write to me" and no other, and `PUT_FILES` in particular has no row — a
+        // default never grants file ingress.
+        for capability in Capability::ALL {
+            if capability == Capability::WRITE {
+                continue;
+            }
             if file.iter().any(|right| right.capability() == capability) {
                 return Err(format!("the default issued `{capability}` as well"));
             }
@@ -311,6 +320,88 @@ pub(crate) fn default_issues_write_to_me_and_nothing_else() -> Result<(), String
                     "the log's last entry is {other:?}, not the default's grant"
                 ));
             }
+        }
+        Ok(())
+    })
+}
+
+/// "Put files on me" and "take files from me" are two capabilities, not one read two ways.
+///
+/// The byte a record carries is five for file ingress, one no reader has used, and six and
+/// nine are no capability at all; the two names differ, because a reader that confused them
+/// would read a grant to land files as a grant to take them. The five are the whole list, and
+/// a right a newer build wrote for a byte this one does not know is kept on file and written
+/// back untouched, so the vocabulary can grow without losing what it does not yet read.
+pub(crate) fn the_two_file_permissions_are_distinct() -> Result<(), String> {
+    block_on(async {
+        if Capability::PUT_FILES.as_byte() != 5 {
+            return Err(format!(
+                "`put files on me` is byte {}, not five",
+                Capability::PUT_FILES.as_byte()
+            ));
+        }
+        if Capability::from_byte(5) != Some(Capability::PUT_FILES) {
+            return Err(format!(
+                "byte five reads as `{:?}`, not `put files on me`",
+                Capability::from_byte(5)
+            ));
+        }
+        for unknown in [6u8, 9u8] {
+            if let Some(capability) = Capability::from_byte(unknown) {
+                return Err(format!(
+                    "byte {unknown} reads as `{capability}`, a capability this build has"
+                ));
+            }
+        }
+        let put = Capability::PUT_FILES.to_string();
+        let take = Capability::TAKE_FILES.to_string();
+        if put != "put files on me" {
+            return Err(format!("`put files on me` reads as `{put}`"));
+        }
+        if take != "take files from me" {
+            return Err(format!("`take files from me` reads as `{take}`"));
+        }
+
+        // A right a newer build wrote for a byte this build does not know: it is not one of
+        // the pair's rights, and a later write of the record keeps its field byte for byte.
+        let sim = Sim::new().map_err(io_error)?;
+        let main = sim.machine().map_err(io_error)?;
+        let peer = sim.machine().map_err(io_error)?;
+        let guest = label("guest")?;
+        main.records()
+            .record_pairing(&peer.peer_id(), NOW)
+            .map_err(|error| error.to_string())?;
+        let pair = pair(&peer, &guest);
+        main.rights()?
+            .on_acquaintance(&pair, NOW)
+            .map_err(|error| error.to_string())?;
+        let crafted = craft_unknown_capability(&main, &peer.peer_id(), &guest)?;
+        let reopened = Rights::new(main.reopen_records()?, main.audit()?);
+        let file = rights_on_file(&reopened, &pair)?;
+        if file.len() != 1 || file[0].capability() != Capability::WRITE {
+            return Err(format!(
+                "the right for byte nine surfaced among {} rights",
+                file.len()
+            ));
+        }
+        reopened
+            .grant(
+                &pair,
+                Capability::WORK,
+                Authority::Person(person("egor")?),
+                None,
+                NOW.plus(Duration::from_secs(1)),
+            )
+            .map_err(|error| error.to_string())?;
+        let rewritten = main
+            .storage()
+            .read_record(&peer.peer_id())
+            .map_err(io_error)?;
+        if !rewritten
+            .windows(crafted.len())
+            .any(|window| window == crafted.as_slice())
+        {
+            return Err("the rewrite dropped the field for the unknown capability".to_owned());
         }
         Ok(())
     })
@@ -1135,6 +1226,125 @@ pub(crate) fn restoring_trust_reissues_only_the_default() -> Result<(), String> 
     })
 }
 
+/// A withdrawal takes the file grant with it, and the return does not give it back.
+///
+/// "Put files on me" is a person's grant like any other: withdrawing trust removes it with
+/// every other right, and returning the machine reissues only the default `write to me`, so
+/// file ingress has to be granted again by a person. The log says so: the withdrawal, the
+/// return, the default's grant — and no grant of the file permission at or after the return.
+/// A second return finds the trust already back and answers `NotWithdrawn`.
+pub(crate) fn a_withdrawal_removes_the_file_grant_and_a_return_does_not_reissue_it()
+-> Result<(), String> {
+    block_on(async {
+        let sim = Sim::new().map_err(io_error)?;
+        let (main, laptop) = paired_machines(&sim)?;
+        let guest = label("guest")?;
+        let rights = main.rights()?;
+        let pair = pair(&laptop, &guest);
+        let egor = person("egor")?;
+        rights
+            .on_acquaintance(&pair, NOW)
+            .map_err(|error| error.to_string())?;
+        rights
+            .grant(
+                &pair,
+                Capability::PUT_FILES,
+                Authority::Person(egor.clone()),
+                None,
+                NOW,
+            )
+            .map_err(|error| error.to_string())?;
+        let granted = rights_on_file(&rights, &pair)?;
+        if granted.len() != 2
+            || !granted
+                .iter()
+                .any(|right| right.capability() == Capability::PUT_FILES)
+        {
+            return Err(format!(
+                "the pair holds {} rights after the file grant, not the default and the file \
+                 permission",
+                granted.len()
+            ));
+        }
+        let removed = rights
+            .withdraw_trust(&laptop.peer_id(), egor.clone(), NOW)
+            .map_err(|error| error.to_string())?;
+        if removed != 2 {
+            return Err(format!(
+                "the withdrawal removed {removed} rights, not the two on file"
+            ));
+        }
+        let at = NOW.plus(Duration::from_secs(1));
+        let returned = rights
+            .restore_trust(&pair, egor.clone(), at)
+            .map_err(|error| error.to_string())?;
+        let issued = returned
+            .issued
+            .ok_or("the return did not reissue the default")?;
+        if issued.capability() != Capability::WRITE || issued.issuer() != &Issuer::Default {
+            return Err(format!(
+                "the return reissued `{}` by `{}`, not `write to me` by the default",
+                issued.capability(),
+                issued.issuer()
+            ));
+        }
+        let file = rights_on_file(&rights, &pair)?;
+        if file.len() != 1 || file[0].capability() != Capability::WRITE {
+            return Err(format!(
+                "the return left {} rights, not only the default",
+                file.len()
+            ));
+        }
+        if file
+            .iter()
+            .any(|right| right.capability() == Capability::PUT_FILES)
+        {
+            return Err("the return gave the file permission back".to_owned());
+        }
+        // A second return has nothing to do: the trust is back and the default is not owed.
+        match rights.restore_trust(&pair, egor.clone(), at) {
+            Err(RightsError::NotWithdrawn { peer }) if peer == laptop.peer_id() => {}
+            other => {
+                return Err(format!(
+                    "a second return answered `{other:?}`, not that the trust was not withdrawn"
+                ));
+            }
+        }
+        let entries = acts(&rights)?;
+        holds(
+            &entries,
+            NOW,
+            "a trust withdrawal by egor",
+            |act| matches!(act, Act::TrustWithdrawn { by, .. } if *by == egor),
+        )?;
+        holds(
+            &entries,
+            at,
+            "a trust return by egor",
+            |act| matches!(act, Act::TrustRestored { by, .. } if *by == egor),
+        )?;
+        holds(&entries, at, "the default's grant", |act| {
+            matches!(
+                act,
+                Act::Granted { capability, issuer, kind, .. }
+                    if *capability == Capability::WRITE
+                        && *issuer == Issuer::Default
+                        && *kind == GrantKind::Created
+            )
+        })?;
+        if entries.iter().any(|entry| {
+            entry.at >= at
+                && matches!(
+                    &entry.act,
+                    Act::Granted { capability, .. } if *capability == Capability::PUT_FILES
+                )
+        }) {
+            return Err("the log holds a grant of the file permission after the return".to_owned());
+        }
+        Ok(())
+    })
+}
+
 /// A machine moved to another assistant starts from the new pair's default and
 /// inherits nothing; the pair it left keeps the right a person granted.
 pub(crate) fn a_moved_machine_starts_from_the_new_pairs_default() -> Result<(), String> {
@@ -1584,6 +1794,37 @@ pub(crate) fn the_audit_records_every_act() -> Result<(), String> {
     })
 }
 
+/// Write a right for capability `9` — a byte this build does not know — into `machine`'s
+/// record for `peer`, and answer the field's bytes.
+///
+/// The shape is a newer build's: the assistant, no term, the default issuer, no withdrawal,
+/// and an ending with no term — which is a shape this build refuses for a capability it
+/// knows and keeps untouched for one it does not. The field is appended to the record as a
+/// newer build would have written it, because nothing in this build can produce it.
+fn craft_unknown_capability(
+    machine: &Machine,
+    peer: &PeerId,
+    assistant: &Label,
+) -> Result<Vec<u8>, String> {
+    let name = assistant.as_str().as_bytes();
+    let mut body = vec![9u8];
+    body.extend_from_slice(
+        &u16::try_from(name.len())
+            .map_err(|_| "the assistant's label is too long".to_owned())?
+            .to_be_bytes(),
+    );
+    body.extend_from_slice(name);
+    body.extend_from_slice(&[0, 1, 0, 1]); // no term, the default issuer, no withdrawal
+    body.extend_from_slice(&NOW.unix_seconds().to_be_bytes()); // the ending
+
+    let crafted = field(0x0a, &body);
+    let storage = machine.storage();
+    let mut bytes = storage.read_record(peer).map_err(io_error)?;
+    bytes.extend_from_slice(&crafted);
+    storage.write_record(peer, &bytes).map_err(io_error)?;
+    Ok(crafted)
+}
+
 /// A right for a capability this build does not know satisfies no question and is kept
 /// byte for byte when the record is rewritten.
 pub(crate) fn a_right_for_an_unknown_capability_is_never_satisfied() -> Result<(), String> {
@@ -1601,31 +1842,13 @@ pub(crate) fn a_right_for_an_unknown_capability_is_never_satisfied() -> Result<(
         rights
             .on_acquaintance(&pair, NOW)
             .map_err(|error| error.to_string())?;
-        // A newer build's right: capability 9, the assistant, no term, the default
-        // issuer, and an ending with no term — a shape this build refuses for a
-        // capability it knows, kept untouched for one it does not.
-        let name = guest.as_str().as_bytes();
-        let mut body = vec![9u8];
-        body.extend_from_slice(
-            &u16::try_from(name.len())
-                .map_err(|_| "the assistant's label is too long".to_owned())?
-                .to_be_bytes(),
-        );
-        body.extend_from_slice(name);
-        body.extend_from_slice(&[0, 1, 0, 1]); // no term, the default issuer, no withdrawal
-        body.extend_from_slice(&NOW.unix_seconds().to_be_bytes()); // the ending
-
-        let crafted = field(0x0a, &body);
-        let storage = main.storage();
-        let mut bytes = storage.read_record(&peer.peer_id()).map_err(io_error)?;
-        bytes.extend_from_slice(&crafted);
-        storage
-            .write_record(&peer.peer_id(), &bytes)
-            .map_err(io_error)?;
+        // A newer build's right, which this build cannot write itself.
+        let crafted = craft_unknown_capability(&main, &peer.peer_id(), &guest)?;
         drop(rights);
         drop(store);
 
         let reopened = Rights::new(main.reopen_records()?, main.audit()?);
+        let storage = main.storage();
         let file = rights_on_file(&reopened, &pair)?;
         if file.len() != 1 || file[0].capability() != Capability::WRITE {
             return Err(format!(

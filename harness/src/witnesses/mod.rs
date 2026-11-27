@@ -37,6 +37,7 @@ mod presence;
 mod rights;
 mod server;
 mod support;
+mod transfers;
 mod transport;
 
 /// Every recorded case this host can run, and the capability it speaks for.
@@ -365,6 +366,14 @@ const WITNESSES: &[Witness] = &[
         case: checks::global_state_forms_are_caught,
     },
     Witness {
+        id: "the_transfer_invariants_are_two_way",
+        capabilities: &[
+            "harness.invariant.transfer_permission",
+            "harness.invariant.transfer_name",
+        ],
+        case: checks::the_transfer_invariants_are_two_way,
+    },
+    Witness {
         id: "machines_are_distinct",
         capabilities: &["harness.machine.disjoint_roots_and_identities"],
         case: machines::machines_are_distinct,
@@ -573,6 +582,11 @@ const WITNESSES: &[Witness] = &[
         id: "peer_record_refuses_an_oversized_write",
         capabilities: &["library.peer.record.oversized_write"],
         case: peer::peer_record_refuses_an_oversized_write,
+    },
+    Witness {
+        id: "the_record_holds_many_pairs_at_their_largest",
+        capabilities: &["library.peer.record.cap"],
+        case: peer::the_record_holds_many_pairs_at_their_largest,
     },
     Witness {
         id: "peer_record_drops_an_empty_attempt",
@@ -921,6 +935,11 @@ const WITNESSES: &[Witness] = &[
         case: rights::default_issues_write_to_me_and_nothing_else,
     },
     Witness {
+        id: "the_two_file_permissions_are_distinct",
+        capabilities: &["library.peer.rights.put_files"],
+        case: rights::the_two_file_permissions_are_distinct,
+    },
+    Witness {
         id: "the_default_never_acts_again",
         capabilities: &["library.peer.rights.default_once"],
         case: rights::the_default_never_acts_again,
@@ -974,6 +993,11 @@ const WITNESSES: &[Witness] = &[
         id: "restoring_trust_reissues_only_the_default",
         capabilities: &["library.peer.rights.trust_restored"],
         case: rights::restoring_trust_reissues_only_the_default,
+    },
+    Witness {
+        id: "a_withdrawal_removes_the_file_grant_and_a_return_does_not_reissue_it",
+        capabilities: &["library.peer.rights.file_grant_withdrawn"],
+        case: rights::a_withdrawal_removes_the_file_grant_and_a_return_does_not_reissue_it,
     },
     Witness {
         id: "restoring_trust_issues_the_default_for_the_binding_pair",
@@ -1713,6 +1737,421 @@ const WITNESSES: &[Witness] = &[
         id: "a_stale_confirmation_is_not_obeyed_in_a_claimed_slot",
         capabilities: &["library.peer.presence.stale_confirmation_refused"],
         case: presence::a_stale_confirmation_is_not_obeyed_in_a_claimed_slot,
+    },
+    Witness {
+        id: "a_file_arrives_byte_exact",
+        capabilities: &["library.peer.transfer.arrives"],
+        case: transfers::a_file_arrives_byte_exact,
+    },
+    Witness {
+        id: "a_transfer_is_not_a_message",
+        capabilities: &["library.peer.transfer.not_a_message"],
+        case: transfers::a_transfer_is_not_a_message,
+    },
+    Witness {
+        id: "an_older_peer_answers_in_the_message_vocabulary",
+        capabilities: &["library.peer.transfer.older_peer"],
+        case: transfers::an_older_peer_answers_in_the_message_vocabulary,
+    },
+    Witness {
+        id: "a_transfer_resumes_after_a_reconnect",
+        capabilities: &["library.peer.transfer.resume"],
+        case: transfers::a_transfer_resumes_after_a_reconnect,
+    },
+    Witness {
+        id: "a_transfer_that_ran_past_the_wait_bound_still_resumes",
+        capabilities: &["library.peer.transfer.wait_anchor"],
+        case: transfers::a_transfer_that_ran_past_the_wait_bound_still_resumes,
+    },
+    Witness {
+        id: "a_waiting_transfer_that_never_resumes_ends",
+        capabilities: &["library.peer.transfer.wait_ends"],
+        case: transfers::a_waiting_transfer_that_never_resumes_ends,
+    },
+    Witness {
+        id: "a_record_that_cannot_be_read_ends_the_transfer",
+        capabilities: &["library.peer.transfer.record_unreadable"],
+        case: transfers::a_record_that_cannot_be_read_ends_the_transfer,
+    },
+    Witness {
+        id: "a_retry_never_reports_its_own_transfer_as_running",
+        capabilities: &["library.peer.transfer.retry_not_running"],
+        case: transfers::a_retry_never_reports_its_own_transfer_as_running,
+    },
+    Witness {
+        id: "a_sink_that_cannot_answer_the_digest_is_a_store_failure",
+        capabilities: &["library.peer.transfer.digest_unanswerable"],
+        case: transfers::a_sink_that_cannot_answer_the_digest_is_a_store_failure,
+    },
+    Witness {
+        id: "an_offer_to_an_unbound_pair_is_answered_nothing",
+        capabilities: &["library.peer.transfer.unbound"],
+        case: transfers::an_offer_to_an_unbound_pair_is_answered_nothing,
+    },
+    Witness {
+        id: "a_sink_that_refuses_is_its_own_answer",
+        capabilities: &["library.peer.transfer.store_failed"],
+        case: transfers::a_sink_that_refuses_is_its_own_answer,
+    },
+    Witness {
+        id: "the_hosts_floor_can_allow_messages_and_refuse_files",
+        capabilities: &["library.peer.floor.by_permission"],
+        case: transfers::the_hosts_floor_can_allow_messages_and_refuse_files,
+    },
+    Witness {
+        id: "a_restart_forgets_the_transfer_and_the_product_offers_again",
+        capabilities: &["library.peer.transfer.restart"],
+        case: transfers::a_restart_forgets_the_transfer_and_the_product_offers_again,
+    },
+    Witness {
+        id: "a_stalled_transfer_is_abandoned",
+        capabilities: &["library.peer.transfer.stall"],
+        case: transfers::a_stalled_transfer_is_abandoned,
+    },
+    Witness {
+        id: "a_transfer_without_a_pair_ends",
+        capabilities: &["library.peer.transfer.no_pair"],
+        case: transfers::a_transfer_without_a_pair_ends,
+    },
+    Witness {
+        id: "an_already_complete_transfer_is_not_sent_again",
+        capabilities: &["library.peer.transfer.already_complete"],
+        case: transfers::an_already_complete_transfer_is_not_sent_again,
+    },
+    Witness {
+        id: "a_name_held_with_different_content_is_a_conflict",
+        capabilities: &["library.peer.transfer.conflict"],
+        case: transfers::a_name_held_with_different_content_is_a_conflict,
+    },
+    Witness {
+        id: "a_second_offer_of_a_running_name_is_answered_running",
+        capabilities: &["library.peer.transfer.running_name"],
+        case: transfers::a_second_offer_of_a_running_name_is_answered_running,
+    },
+    Witness {
+        id: "a_digest_mismatch_is_never_complete",
+        capabilities: &["library.peer.transfer.digest_mismatch"],
+        case: transfers::a_digest_mismatch_is_never_complete,
+    },
+    Witness {
+        id: "the_receiver_states_its_offset_only_after_the_right",
+        capabilities: &["library.peer.transfer.offset_after_right"],
+        case: transfers::the_receiver_states_its_offset_only_after_the_right,
+    },
+    Witness {
+        id: "a_withdrawn_right_does_not_stop_a_running_transfer",
+        capabilities: &["library.peer.transfer.right_withdrawn"],
+        case: transfers::a_withdrawn_right_does_not_stop_a_running_transfer,
+    },
+    Witness {
+        id: "a_moved_machine_refuses_the_resume",
+        capabilities: &["library.peer.transfer.binding_recheck"],
+        case: transfers::a_moved_machine_refuses_the_resume,
+    },
+    Witness {
+        id: "a_withdrawn_trust_ends_the_transfer",
+        capabilities: &["library.peer.transfer.trust_withdrawn"],
+        case: transfers::a_withdrawn_trust_ends_the_transfer,
+    },
+    Witness {
+        id: "a_product_stops_its_own_transfer",
+        capabilities: &["library.peer.transfer.stopped"],
+        case: transfers::a_product_stops_its_own_transfer,
+    },
+    Witness {
+        id: "a_stop_during_a_stalled_write_is_stopped",
+        capabilities: &["library.peer.transfer.stop_final"],
+        case: transfers::a_stop_during_a_stalled_write_is_stopped,
+    },
+    Witness {
+        id: "a_receiver_learns_the_senders_stop_while_its_sink_says_not_now",
+        capabilities: &["library.peer.transfer.stop_through_a_stalled_sink"],
+        case: transfers::a_receiver_learns_the_senders_stop_while_its_sink_says_not_now,
+    },
+    Witness {
+        id: "a_dead_receiving_transfer_stays_visible_as_failed",
+        capabilities: &["library.peer.transfer.dead_visible"],
+        case: transfers::a_dead_receiving_transfer_stays_visible_as_failed,
+    },
+    Witness {
+        id: "a_zero_length_file_and_an_empty_name_are_refused_locally",
+        capabilities: &["library.peer.transfer.local_refusals"],
+        case: transfers::a_zero_length_file_and_an_empty_name_are_refused_locally,
+    },
+    Witness {
+        id: "a_malformed_offer_is_answered_malformed",
+        capabilities: &["library.peer.transfer.malformed_offer"],
+        case: transfers::a_malformed_offer_is_answered_malformed,
+    },
+    Witness {
+        id: "an_unknown_answer_status_is_not_understood",
+        capabilities: &["library.peer.transfer.unknown_answer"],
+        case: transfers::an_unknown_answer_status_is_not_understood,
+    },
+    Witness {
+        id: "a_peer_with_no_sink_is_refused_at_the_floor",
+        capabilities: &["library.peer.transfer.no_sink"],
+        case: transfers::a_peer_with_no_sink_is_refused_at_the_floor,
+    },
+    Witness {
+        id: "a_product_that_only_wants_messages_still_works",
+        capabilities: &["library.peer.transfer.product_without_sink"],
+        case: transfers::a_product_that_only_wants_messages_still_works,
+    },
+    Witness {
+        id: "a_source_that_ends_early_is_its_own_answer",
+        capabilities: &["library.peer.transfer.source_unreadable"],
+        case: transfers::a_source_that_ends_early_is_its_own_answer,
+    },
+    Witness {
+        id: "a_slow_sink_slows_the_sender",
+        capabilities: &["library.peer.transfer.backpressure"],
+        case: transfers::a_slow_sink_slows_the_sender,
+    },
+    Witness {
+        id: "a_transfer_that_makes_progress_is_never_abandoned",
+        capabilities: &["library.peer.transfer.progress"],
+        case: transfers::a_transfer_that_makes_progress_is_never_abandoned,
+    },
+    Witness {
+        id: "the_transfer_state_is_visible",
+        capabilities: &["library.peer.transfer.state"],
+        case: transfers::the_transfer_state_is_visible,
+    },
+    Witness {
+        id: "a_transfer_frame_is_not_an_action",
+        capabilities: &["library.peer.transfer.not_an_action"],
+        case: transfers::a_transfer_frame_is_not_an_action,
+    },
+    Witness {
+        id: "a_hundred_mebibytes_arrive_within_thirty_round_trips",
+        capabilities: &["library.peer.transfer.round_trips"],
+        case: transfers::a_hundred_mebibytes_arrive_within_thirty_round_trips,
+    },
+    Witness {
+        id: "a_file_beyond_every_window_arrives_in_one_transfer",
+        capabilities: &["library.peer.transfer.one_go"],
+        case: transfers::a_file_beyond_every_window_arrives_in_one_transfer,
+    },
+    Witness {
+        id: "the_transport_bounds_what_a_peer_can_buffer",
+        capabilities: &["library.net.buffer_bound"],
+        case: transfers::the_transport_bounds_what_a_peer_can_buffer,
+    },
+    Witness {
+        id: "the_peer_connection_advertises_only_what_it_serves",
+        capabilities: &["library.net.streams_only"],
+        case: transfers::the_peer_connection_advertises_only_what_it_serves,
+    },
+    Witness {
+        id: "a_third_transfer_to_one_peer_is_refused",
+        capabilities: &["library.peer.transfer.two_running"],
+        case: transfers::a_third_transfer_to_one_peer_is_refused,
+    },
+    Witness {
+        id: "the_start_limit_is_checked_before_the_decision",
+        capabilities: &["library.peer.transfer.start_limit"],
+        case: transfers::the_start_limit_is_checked_before_the_decision,
+    },
+    Witness {
+        id: "a_resume_does_not_count_against_the_start_limit",
+        capabilities: &["library.peer.transfer.resume_not_counted"],
+        case: transfers::a_resume_does_not_count_against_the_start_limit,
+    },
+    Witness {
+        id: "an_allowed_transfer_is_recorded_before_it_starts",
+        capabilities: &["library.peer.transfer.audit"],
+        case: transfers::an_allowed_transfer_is_recorded_before_it_starts,
+    },
+    Witness {
+        id: "a_transfer_that_cannot_be_recorded_is_not_run",
+        capabilities: &["library.peer.transfer.not_recorded"],
+        case: transfers::a_transfer_that_cannot_be_recorded_is_not_run,
+    },
+    Witness {
+        id: "a_transfer_counts_as_carried_only_once_it_moved",
+        capabilities: &["library.peer.transfer.carried"],
+        case: transfers::a_transfer_counts_as_carried_only_once_it_moved,
+    },
+    Witness {
+        id: "a_transfer_causes_a_dial",
+        capabilities: &["library.peer.transfer.causes_dial"],
+        case: transfers::a_transfer_causes_a_dial,
+    },
+    Witness {
+        id: "a_slow_sink_never_makes_the_sender_abandon_the_file",
+        capabilities: &["library.peer.transfer.slow_sink"],
+        case: transfers::a_slow_sink_never_makes_the_sender_abandon_the_file,
+    },
+    Witness {
+        id: "a_stopped_waiting_transfer_stays_stopped",
+        capabilities: &["library.peer.transfer.stopped_waiting"],
+        case: transfers::a_stopped_waiting_transfer_stays_stopped,
+    },
+    Witness {
+        id: "a_stop_is_visible_from_the_stop",
+        capabilities: &["library.peer.transfer.stop_visible"],
+        case: transfers::a_stop_is_visible_from_the_stop,
+    },
+    Witness {
+        id: "a_peer_that_answers_resume_and_resets_is_abandoned",
+        capabilities: &["library.peer.transfer.resume_without_progress"],
+        case: transfers::a_peer_that_answers_resume_and_resets_is_abandoned,
+    },
+    Witness {
+        id: "a_resume_past_the_end_is_not_understood",
+        capabilities: &["library.peer.transfer.offset_past_the_end"],
+        case: transfers::a_resume_past_the_end_is_not_understood,
+    },
+    Witness {
+        id: "a_throttle_from_the_wire_is_bounded",
+        capabilities: &["library.peer.transfer.throttle_bound"],
+        case: transfers::a_throttle_from_the_wire_is_bounded,
+    },
+    Witness {
+        id: "a_dribbled_frame_does_not_hold_a_stream",
+        capabilities: &["library.peer.transfer.frame_bound"],
+        case: transfers::a_dribbled_frame_does_not_hold_a_stream,
+    },
+    Witness {
+        id: "a_partial_name_with_no_digest_is_a_conflict",
+        capabilities: &["library.peer.transfer.partial_without_digest"],
+        case: transfers::a_partial_name_with_no_digest_is_a_conflict,
+    },
+    Witness {
+        id: "a_peer_that_keeps_throttling_ends_the_transfer",
+        capabilities: &["library.peer.transfer.throttle_bound"],
+        case: transfers::a_peer_that_keeps_throttling_ends_the_transfer,
+    },
+    Witness {
+        id: "a_growing_offset_ends_a_throttle_streak",
+        capabilities: &["library.peer.transfer.throttle_growth"],
+        case: transfers::a_growing_offset_ends_a_throttle_streak,
+    },
+    Witness {
+        id: "a_clean_stream_end_at_a_slow_sink_is_a_store_failure",
+        capabilities: &["library.peer.transfer.clean_end"],
+        case: transfers::a_clean_stream_end_at_a_slow_sink_is_a_store_failure,
+    },
+    Witness {
+        id: "a_pair_that_never_binds_ends_as_the_pair",
+        capabilities: &["library.peer.transfer.unbound"],
+        case: transfers::a_pair_that_never_binds_ends_as_the_pair,
+    },
+    Witness {
+        id: "a_stop_during_the_tail_is_stopped",
+        capabilities: &["library.peer.transfer.stop_tail"],
+        case: transfers::a_stop_during_the_tail_is_stopped,
+    },
+    Witness {
+        id: "a_truncated_answer_is_a_lost_attempt",
+        capabilities: &["library.peer.transfer.partial_answer"],
+        case: transfers::a_truncated_answer_is_a_lost_attempt,
+    },
+    Witness {
+        id: "an_answer_cut_by_a_poll_is_continued",
+        capabilities: &["library.peer.transfer.split_answer"],
+        case: transfers::an_answer_cut_by_a_poll_is_continued,
+    },
+    Witness {
+        id: "a_terminal_limit_carries_no_delay",
+        capabilities: &["library.peer.transfer.terminal_limit"],
+        case: transfers::a_terminal_limit_carries_no_delay,
+    },
+    Witness {
+        id: "a_growing_offset_in_answers_keeps_the_transfer_alive",
+        capabilities: &["library.peer.transfer.answered_progress"],
+        case: transfers::a_growing_offset_in_answers_keeps_the_transfer_alive,
+    },
+    Witness {
+        id: "a_verdict_past_the_receivers_stall_bound_is_heard",
+        capabilities: &["library.peer.transfer.verdict_margin"],
+        case: transfers::a_verdict_past_the_receivers_stall_bound_is_heard,
+    },
+    Witness {
+        id: "a_stop_during_a_throttle_is_stopped",
+        capabilities: &["library.peer.transfer.stop_throttle"],
+        case: transfers::a_stop_during_a_throttle_is_stopped,
+    },
+    Witness {
+        id: "a_stop_while_waiting_for_the_answer_is_stopped",
+        capabilities: &["library.peer.transfer.stop_answer"],
+        case: transfers::a_stop_while_waiting_for_the_answer_is_stopped,
+    },
+    Witness {
+        id: "a_stop_during_a_dial_is_stopped",
+        capabilities: &["library.peer.transfer.stop_dial"],
+        case: transfers::a_stop_during_a_dial_is_stopped,
+    },
+    Witness {
+        id: "a_peer_that_repeats_one_offset_is_abandoned",
+        capabilities: &["library.peer.transfer.repeated_offset"],
+        case: transfers::a_peer_that_repeats_one_offset_is_abandoned,
+    },
+    Witness {
+        id: "a_bound_pair_with_no_room_is_the_limit_it_met",
+        capabilities: &["library.peer.transfer.limit_not_pair"],
+        case: transfers::a_bound_pair_with_no_room_is_the_limit_it_met,
+    },
+    Witness {
+        id: "a_pair_that_comes_back_and_moves_nothing_spends_the_wait",
+        capabilities: &["library.peer.transfer.spent_wait"],
+        case: transfers::a_pair_that_comes_back_and_moves_nothing_spends_the_wait,
+    },
+    Witness {
+        id: "an_offer_answered_with_nothing_new_is_abandoned",
+        capabilities: &["library.peer.transfer.stall_attempt"],
+        case: transfers::an_offer_answered_with_nothing_new_is_abandoned,
+    },
+    Witness {
+        id: "a_hanging_offer_spends_the_wait_bound",
+        capabilities: &["library.peer.transfer.wait_attempt"],
+        case: transfers::a_hanging_offer_spends_the_wait_bound,
+    },
+    Witness {
+        id: "a_silent_pair_is_asked_again_at_a_doubling_gap",
+        capabilities: &["library.peer.transfer.retry_gap"],
+        case: transfers::a_silent_pair_is_asked_again_at_a_doubling_gap,
+    },
+    Witness {
+        id: "an_answer_without_pacing_restarts_the_retry_gap",
+        capabilities: &["library.peer.transfer.retry_gap"],
+        case: transfers::an_answer_without_pacing_restarts_the_retry_gap,
+    },
+    Witness {
+        id: "a_pair_that_answered_is_not_a_pair_that_was_not_there",
+        capabilities: &["library.peer.transfer.answered_pair"],
+        case: transfers::a_pair_that_answered_is_not_a_pair_that_was_not_there,
+    },
+    Witness {
+        id: "a_pair_that_answered_and_then_went_silent_ends_as_the_pair",
+        capabilities: &["library.peer.transfer.answered_then_silent"],
+        case: transfers::a_pair_that_answered_and_then_went_silent_ends_as_the_pair,
+    },
+    Witness {
+        id: "an_attempt_that_never_left_is_still_the_first_offer",
+        capabilities: &["library.peer.transfer.first_offer"],
+        case: transfers::an_attempt_that_never_left_is_still_the_first_offer,
+    },
+    Witness {
+        id: "a_store_that_spends_its_whole_bound_is_heard",
+        capabilities: &["library.peer.transfer.verdict_margin"],
+        case: transfers::a_store_that_spends_its_whole_bound_is_heard,
+    },
+    Witness {
+        id: "an_offset_stated_before_a_throttle_is_not_growth",
+        capabilities: &["library.peer.transfer.progress"],
+        case: transfers::an_offset_stated_before_a_throttle_is_not_growth,
+    },
+    Witness {
+        id: "an_offset_stated_while_parked_is_not_growth",
+        capabilities: &["library.peer.transfer.progress"],
+        case: transfers::an_offset_stated_while_parked_is_not_growth,
+    },
+    Witness {
+        id: "a_write_the_stream_accepts_is_not_progress",
+        capabilities: &["library.peer.transfer.progress"],
+        case: transfers::a_write_the_stream_accepts_is_not_progress,
     },
 ];
 

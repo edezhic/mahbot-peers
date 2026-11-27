@@ -193,6 +193,18 @@ impl MockClock {
     /// spins without parking. A handshake on a clean link finishes inside the
     /// first few scheduler turns, so driving it costs no virtual time at all.
     pub async fn drive<F: Future>(&self, budget: Duration, future: F) -> Option<F::Output> {
+        self.drive_in(budget, DRIVE_STEP, future).await
+    }
+
+    /// The one walking loop behind [`Self::drive`] and [`Self::advance_until`]: yield
+    /// `DRIVE_YIELDS` times, then move this clock by `step`, until `future` resolves or
+    /// `budget` of virtual time is spent.
+    async fn drive_in<F: Future>(
+        &self,
+        budget: Duration,
+        step: Duration,
+        future: F,
+    ) -> Option<F::Output> {
         tokio::pin!(future);
         let mut spent = Duration::ZERO;
         loop {
@@ -206,10 +218,33 @@ impl MockClock {
             if spent >= budget {
                 return None;
             }
-            let step = DRIVE_STEP.min(budget - spent);
+            let step = step.min(budget - spent);
             self.advance(step).await;
             spent += step;
         }
+    }
+
+    /// Yield `DRIVE_YIELDS` times, then move this clock by `step`, until `done` holds or
+    /// `budget` of virtual time is spent: `true` when it held.
+    ///
+    /// The yields before each jump are what lets a task with no timer make its pass; the jump
+    /// is what lets the layers' own waits — a poll interval, a retry gap — pass. A case that
+    /// has to cross a minute-long bound hands in a step of seconds, so the poll budget is not
+    /// spent walking a clock nobody waits on.
+    pub async fn advance_until(
+        &self,
+        budget: Duration,
+        step: Duration,
+        mut done: impl FnMut() -> bool,
+    ) -> bool {
+        let reached = std::future::poll_fn(|_| {
+            if done() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        });
+        self.drive_in(budget, step, reached).await.is_some()
     }
 
     /// The earliest deadline strictly after `cursor`, or the earliest of all.
@@ -300,7 +335,7 @@ impl mahbot_beacon::clock::Clock for MockClock {
 pub(crate) const DRIVE_YIELDS: usize = 4;
 
 /// How much virtual time one drive moves per round while it waits.
-const DRIVE_STEP: Duration = Duration::from_millis(10);
+pub(crate) const DRIVE_STEP: Duration = Duration::from_millis(10);
 
 /// How many instants one walk may process before it is called runaway.
 ///

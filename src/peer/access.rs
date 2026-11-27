@@ -6,7 +6,7 @@
 //! [`crate::peer::record`]'s: the key, the pairing, the address, the trust. This
 //! module is the connection level's vocabulary: which account on which instance a
 //! machine is connected to, which assistant it is bound to, the claim the other
-//! side's decision left here, the four capabilities, the rights this machine holds
+//! side's decision left here, the five capabilities, the rights this machine holds
 //! for the pair, and the moments that decide them. The record stores them in the
 //! same per-peer file; [`crate::peer::rights`] is the decision and
 //! [`crate::peer::audit`] is the record of it.
@@ -21,10 +21,10 @@
 //! [`Claim`], which names the pair for its own person and grants nothing.
 //!
 //! The plan's guest rule is the default's own shape: one capability, "write to me",
-//! for every assistant, so a guest is never defaulted "work on me" or "see the
-//! screen". Which assistant the product calls a guest therefore changes no decision
-//! here, and the crate keeps the assistant's name without the declaration; see
-//! [`Binding`].
+//! for every assistant, so a guest is never defaulted "work on me", "see the
+//! screen" or "put files on me". Which assistant the product calls a guest therefore
+//! changes no decision here, and the crate keeps the assistant's name without the
+//! declaration; see [`Binding`].
 //!
 //! # Labels
 //!
@@ -36,17 +36,32 @@
 //! would break or reorder the line a person reads it on: no control character, no
 //! line or paragraph separator, no direction mark.
 //!
-//! # The four capabilities
+//! # The five capabilities
 //!
-//! Write to me, take files from me, work on me, see the screen. The list is closed: a
-//! capability that is not one of the four is never satisfied by anything. "See the
-//! screen" is one capability covering both watching and acting. A right stored by a
-//! newer build for a capability this build does not know is kept and written back
-//! untouched, and no question this build can ask matches it.
+//! Write to me, take files from me, work on me, see the screen, put files on me. The
+//! list is closed: a capability that is not one of the five is never satisfied by
+//! anything. "See the screen" is one capability covering both watching and acting.
+//! A right stored by a newer build for a capability this build does not know is kept
+//! and written back untouched, and no question this build can ask matches it.
+//!
+//! The two file capabilities are different rights and are named so a person cannot
+//! confuse them: "put files on me" is a peer landing a file on this machine, and
+//! "take files from me" is a peer fetching one from it. Only the first is served by
+//! anything, and by [`crate::peer::transfer`] alone: "take files from me" is inert
+//! until a peer may ask this machine for a file of its own, and granting it changes
+//! nothing today. "Put files on me" is byte `5`, a value no reader has used, so an
+//! older reader cannot read a file-ingress grant as permission to take files.
+//!
+//! The automatic default at a pair's coming-into-being is "write to me" and nothing
+//! else: it covers messages and the addressed reply, and it never authorises a file
+//! landing here. File ingress is a person's explicit grant, on the machine that bears
+//! the effect.
 //!
 //! # What is not here
 //!
-//! The plan's scope field. No capability yet names a resource it would narrow, and
+//! The plan's scope field. No capability yet names a resource it would narrow —
+//! "put files on me" included: it grants an undirected push into a place the product
+//! chooses, so there is no resource the crate could name in a right — and
 //! an invented vocabulary would fix a permanent format on a guess; the record is
 //! additive, so the field arrives as its own tag when the first capability needs
 //! it, and nothing written before it has to be unmade. A later field is a new tag of
@@ -317,28 +332,49 @@ impl Pair {
     }
 }
 
-/// The four capabilities, as a closed list.
+/// The five capabilities, as a closed list.
 ///
 /// A value outside the list exists only in a right a newer build wrote: it is kept
-/// in the record and never matches a question, so a name that is not one of the four
+/// in the record and never matches a question, so a name that is not one of the five
 /// is satisfied by nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Capability(u8);
 
 impl Capability {
-    /// Write to me: a message addressed to this machine's assistant.
+    /// Write to me: a message addressed to this machine's assistant, and the addressed
+    /// reply. The one capability the default grants.
     pub const WRITE: Self = Self(1);
-    /// Take files from me.
+    /// Take files from me. Inert: nothing serves it, and granting it changes nothing
+    /// until a peer may ask this machine for a file of its own.
     pub const TAKE_FILES: Self = Self(2);
     /// Work on me: run a tool, act on this machine.
     pub const WORK: Self = Self(3);
     /// See the screen: one capability covering watching and acting.
     pub const SEE_SCREEN: Self = Self(4);
+    /// Put files on me: a peer lands a file on this machine, through
+    /// [`crate::peer::transfer`]. Never granted by the default.
+    ///
+    /// The value is one no reader has used. It is not "take files from me": an older
+    /// reader would read a file-ingress grant as permission to take files.
+    pub const PUT_FILES: Self = Self(5);
 
-    /// The capability with this byte, when it is one of the four.
+    /// Every capability this build knows, in the order the plan lists them.
+    ///
+    /// A product shows this list to a person; a case that has to cover "no other
+    /// capability" iterates it instead of naming the others by hand, so a sixth
+    /// capability cannot slip past either.
+    pub const ALL: [Self; 5] = [
+        Self::WRITE,
+        Self::TAKE_FILES,
+        Self::WORK,
+        Self::SEE_SCREEN,
+        Self::PUT_FILES,
+    ];
+
+    /// The capability with this byte, when it is one of the five.
     #[must_use]
     pub const fn from_byte(byte: u8) -> Option<Self> {
-        if byte >= Self::WRITE.0 && byte <= Self::SEE_SCREEN.0 {
+        if byte >= Self::WRITE.0 && byte <= Self::PUT_FILES.0 {
             Some(Self(byte))
         } else {
             None
@@ -368,6 +404,7 @@ impl fmt::Display for Capability {
             Self::TAKE_FILES => f.write_str("take files from me"),
             Self::WORK => f.write_str("work on me"),
             Self::SEE_SCREEN => f.write_str("see the screen"),
+            Self::PUT_FILES => f.write_str("put files on me"),
             Self(byte) => write!(f, "capability {byte}"),
         }
     }

@@ -31,9 +31,10 @@
 //!   hint through the dial that carries it. A hint is a claim and not proof: waiting a minute
 //!   to test an address a caller has just been given is a bound nobody needs, so the episode
 //!   starts over on the claim, while the dial that reaches the peer is what disproves a stop.
-//! - *A dial now*, keeping the episode: a message waiting to be delivered. It is a standing
-//!   condition rather than news, so it moves the next dial to now without resetting the
-//!   count. The crate's own queue is what hands it in, and no other path does.
+//! - *A dial now*, keeping the episode: a message waiting to be delivered, or a transfer
+//!   waiting for the pair. Each is a standing condition rather than news, so it moves the
+//!   next dial to now without resetting the count. The crate's own queue and the crate's
+//!   own transfer layer are what hand it in, and no other path does.
 //!
 //! An authenticated inbound connection from the peer is a reason for neither: the pair is
 //! already connected. It is folded in as the next dial of the episode — an inbound connection
@@ -541,10 +542,11 @@ impl Recovery {
     }
 
     /// A reason to dial that is a standing condition rather than news: a message waiting to
-    /// be delivered. The next dial is due now; the episode goes on.
+    /// be delivered, or a transfer waiting for the pair. The next dial is due now; the
+    /// episode goes on.
     ///
     /// The count is kept, because a peer that keeps dropping a connection while the queue
-    /// waits must not escape the bound by having the queue re-arm it every time.
+    /// or the transfer waits must not escape the bound by having it re-armed every time.
     pub(crate) fn hurry(&mut self, now: Instant) {
         match self {
             Self::Waiting { until, .. } | Self::Exhausted { until, .. } => *until = now,

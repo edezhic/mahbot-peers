@@ -10,10 +10,12 @@ use std::time::Duration;
 
 use mahbot_peers::beacon::Introduction;
 use mahbot_peers::identity::PeerId;
+use mahbot_peers::peer::access::MAX_LABEL_BYTES;
 use mahbot_peers::peer::pair::{self, Ceremony, Opening, Outcome};
 use mahbot_peers::peer::{
-    COMPARISON_SYMBOLS, Comparison, ConnectFailure, Connections, Limits, Malformed,
-    NotTrustedCause, Person, Presence, RecordError, RecordStore, Rights, Timestamp,
+    Authority, COMPARISON_SYMBOLS, Capability, Comparison, ConnectFailure, Connections, Limits,
+    Malformed, NotTrustedCause, Pair, Person, Presence, RecordError, RecordStore, Rights,
+    Timestamp,
 };
 
 use crate::beacon::TestBeacon;
@@ -22,8 +24,8 @@ use crate::machine::Machine;
 use crate::pair::Mediator;
 use crate::sim::Sim;
 
-use super::rights::person;
-use super::support::{BUDGET, io_error, keep_findable, within};
+use super::rights::{label, person};
+use super::support::{BUDGET, binding, io_error, keep_findable, within};
 
 /// A moment a case uses; the library never reads one.
 pub(super) const NOW: Timestamp = Timestamp::from_unix_seconds(1_000_000);
@@ -1939,6 +1941,136 @@ pub(crate) fn peer_record_refuses_an_oversized_write() -> Result<(), String> {
         // The file is still a record this build opens.
         if machine.reopen_records()?.get(&peer.peer_id()).is_none() {
             return Err("the refused write left the record unreadable".to_owned());
+        }
+        Ok(())
+    })
+}
+
+/// How many pairs one peer record accumulates before the cap has to hold: the number of
+/// assistants a machine rebinds the same peer to, each with all five capabilities at the
+/// longest label a person can supply.
+const ACCUMULATED_PAIRS: usize = 9;
+
+/// The `index`-th assistant's label, as long as a label may be.
+///
+/// Nine distinct names of [`MAX_LABEL_BYTES`], because the label is what a pair's rows carry:
+/// a shorter name would leave room the cap does not have to hold.
+fn longest_assistant(index: usize) -> String {
+    let head = format!("assistant-{index}-");
+    let mut name = head.clone();
+    name.push_str(&"x".repeat(MAX_LABEL_BYTES - head.len()));
+    name
+}
+
+/// Nine accumulated pairs, at the longest label, are what the record's cap must hold.
+///
+/// One peer record keeps every pair the machine has bound it under, and the largest a pair can
+/// be is all five capabilities granted by a person whose name is the longest a label may be.
+/// Nine such pairs fit: every write succeeds, the file stays inside `MAX_RECORD_BYTES`, the
+/// record reopens holding nine pairs' rights and nine default markers, and one more right for
+/// the ninth pair — in the largest form a right takes, a person's grant with a term — still
+/// fits.
+pub(crate) fn the_record_holds_many_pairs_at_their_largest() -> Result<(), String> {
+    block_on(async {
+        let sim = Sim::new().map_err(io_error)?;
+        let machine = sim.machine().map_err(io_error)?;
+        let peer = sim.machine().map_err(io_error)?;
+        machine
+            .records()
+            .record_pairing(&peer.peer_id(), NOW)
+            .map_err(|error| error.to_string())?;
+        let rights = machine.rights()?;
+        let operator = person(&"p".repeat(MAX_LABEL_BYTES))?;
+        for index in 0..ACCUMULATED_PAIRS {
+            let assistant = label(&longest_assistant(index))?;
+            rights
+                .bind(
+                    &peer.peer_id(),
+                    binding("an-account", "an-instance", &assistant)?,
+                    NOW,
+                )
+                .map_err(|error| error.to_string())?;
+            for capability in Capability::ALL {
+                rights
+                    .grant(
+                        &Pair::new(peer.peer_id(), &assistant),
+                        capability,
+                        Authority::Person(operator.clone()),
+                        None,
+                        NOW,
+                    )
+                    .map_err(|error| {
+                        format!("pair {index}'s `{capability}` was refused: {error}")
+                    })?;
+            }
+        }
+        let storage = machine.storage();
+        let cap = usize::try_from(mahbot_peers::peer::record::MAX_RECORD_BYTES)
+            .expect("the cap fits usize");
+        let bytes = storage.read_record(&peer.peer_id()).map_err(io_error)?;
+        if bytes.len() > cap {
+            return Err(format!(
+                "{ACCUMULATED_PAIRS} pairs at the longest label made a {}-byte record, more \
+                 than the {cap}-byte cap",
+                bytes.len()
+            ));
+        }
+        // The record reopens, and holds every pair's rights and every pair's default marker.
+        drop(rights);
+        let reopened = machine.reopen_records()?;
+        let record = reopened
+            .get(&peer.peer_id())
+            .ok_or("the record of nine pairs did not reopen")?;
+        let want = ACCUMULATED_PAIRS * Capability::ALL.len();
+        if record.rights().len() != want {
+            return Err(format!(
+                "the reopened record holds {} rights, not the {want} nine pairs were given",
+                record.rights().len()
+            ));
+        }
+        let mut markers = 0;
+        for index in 0..ACCUMULATED_PAIRS {
+            let assistant = label(&longest_assistant(index))?;
+            let pair = Pair::new(peer.peer_id(), &assistant);
+            if record.default_spent(&pair).is_some() {
+                markers += 1;
+            }
+            if record.rights_of(&pair).count() != Capability::ALL.len() {
+                return Err(format!(
+                    "pair {index} holds {} rights, not the five it was granted",
+                    record.rights_of(&pair).count()
+                ));
+            }
+        }
+        if markers != ACCUMULATED_PAIRS {
+            return Err(format!("{markers} of the nine pairs kept a default marker"));
+        }
+        // One more right for the ninth pair: a person's grant with a term, which is the
+        // largest a single right's body can be, still fits inside the cap.
+        let ninth = label(&longest_assistant(ACCUMULATED_PAIRS - 1))?;
+        let at = NOW.plus(Duration::from_secs(1));
+        Rights::new(reopened, machine.audit()?)
+            .grant(
+                &Pair::new(peer.peer_id(), &ninth),
+                Capability::WRITE,
+                Authority::Person(operator),
+                Some(Duration::from_secs(86_400)),
+                at,
+            )
+            .map_err(|error| format!("one more right for the ninth pair was refused: {error}"))?;
+        let grown = storage.read_record(&peer.peer_id()).map_err(io_error)?;
+        if grown.len() > cap {
+            return Err(format!(
+                "one more right for the ninth pair made a {}-byte record, more than the \
+                 {cap}-byte cap",
+                grown.len()
+            ));
+        }
+        if grown.len() <= bytes.len() {
+            return Err(format!(
+                "one more right for the ninth pair wrote nothing: the record is still {} bytes",
+                grown.len()
+            ));
         }
         Ok(())
     })

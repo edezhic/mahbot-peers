@@ -4,7 +4,7 @@
 use std::fmt;
 
 use crate::invariants::{
-    Invariant, Violation as InvariantViolation, check as check_invariants, forbidden,
+    Invariant, Source, Violation as InvariantViolation, check as check_invariants, forbidden,
 };
 use crate::inventory::{
     Capability, Violation as InventoryViolation, Witness, check as check_inventory,
@@ -283,6 +283,83 @@ pub(crate) fn ambient_forms_are_caught() -> Result<(), String> {
     for clean in crate::invariants::AMBIENT_LOOKALIKES {
         if !(invariant.check)(&source("test.rs", clean)).is_empty() {
             return Err(format!("the scanner flagged the clean line `{clean}`"));
+        }
+    }
+    Ok(())
+}
+
+/// The two transfer invariants must be able to fail as well as pass.
+///
+/// Each is checked three ways: its own positive control is flagged, snippets of the code the
+/// layer really holds are not, and every source under its scope — the transfer module and its
+/// submodules, which the summary scan reads too — is clean. A checker that had gone blind fails
+/// here instead of passing over nothing. The name's opacity is a second claim inside the first
+/// invariant, so an interpretation of the text is checked against the module that owns a name
+/// and against the frame codec, which parses frames and not names.
+pub(crate) fn the_transfer_invariants_are_two_way() -> Result<(), String> {
+    let sources = crate::invariants::workspace_sources();
+    for (id, clean) in [
+        (
+            "transfers.name_decides_nothing",
+            "let right = rights.may_take_file(&peer, &*floor, now)?;",
+        ),
+        // A name carried, and two names compared: the whole of what the layer may do with one.
+        (
+            "transfers.name_decides_nothing",
+            "let key = (peer, offer.name.clone());",
+        ),
+        (
+            "transfers.name_decides_nothing",
+            "if authorised.name == offer.name {",
+        ),
+        (
+            "transfers.name_is_not_a_path",
+            "let name = offer.name.as_str();",
+        ),
+    ] {
+        let invariant = crate::invariants::find(id)
+            .ok_or_else(|| format!("{id} is not in the invariant table"))?;
+        if (invariant.check)(&source("test.rs", invariant.control)).is_empty() {
+            return Err(format!("{id} does not flag its own control"));
+        }
+        if !(invariant.check)(&source("test.rs", clean)).is_empty() {
+            return Err(format!("{id} flags the clean line `{clean}`"));
+        }
+        let covered: Vec<&Source> = sources
+            .iter()
+            .filter(|each| invariant.covers(&each.path))
+            .collect();
+        if covered.is_empty() {
+            return Err(format!("{id} covers no source in this workspace"));
+        }
+        for each in covered {
+            if let Some(finding) = (invariant.check)(each).first() {
+                return Err(format!("{id} does not hold in {}: {finding}", each.path));
+            }
+        }
+    }
+    // A name is opaque in the module that owns it: an interpretation of the text — a split, a
+    // trim, a prefix or suffix match, a parse, a case fold — is flagged there, and the same
+    // line elsewhere in the layer is not, because the frame codec parses frames.
+    let opaque = crate::invariants::find("transfers.name_decides_nothing")
+        .ok_or_else(|| "transfers.name_decides_nothing is not in the invariant table".to_owned())?;
+    for control in [
+        r#"let stem = name.as_str().split('.').next();"#,
+        r#"let trimmed = name.as_str().trim();"#,
+        r#"if name.as_str().starts_with("report") {"#,
+        r#"let offset: u64 = name.as_str().parse()?;"#,
+    ] {
+        if (opaque.check)(&source(crate::invariants::TRANSFER_MODULE, control)).is_empty() {
+            return Err(format!(
+                "transfers.name_decides_nothing does not flag `{control}` in the module that \
+                 owns a name"
+            ));
+        }
+        if !(opaque.check)(&source("src/peer/transfer/wire.rs", control)).is_empty() {
+            return Err(format!(
+                "transfers.name_decides_nothing flags `{control}` in the frame codec, which \
+                 parses frames"
+            ));
         }
     }
     Ok(())

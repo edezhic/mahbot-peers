@@ -303,6 +303,70 @@ pub(super) async fn wait_live(
     .await?
 }
 
+/// Prove the connection carries application data: open one bidirectional stream, write a
+/// few bytes and finish it. The far side need not read it.
+///
+/// The write is answered locally the moment quinn buffers it, so the proof is the wait
+/// after it: [`quinn::SendStream::stopped`] resolves when the peer's transport has
+/// acknowledged every byte, which a connection that carries nothing never does. A case
+/// bounds that wait with [`within`], like any other await that may never resolve.
+pub(crate) async fn carries(connection: &quinn::Connection) -> Result<(), String> {
+    let (mut send, _recv) = connection
+        .open_bi()
+        .await
+        .map_err(|error| format!("the connection opened no stream: {error}"))?;
+    send.write_all(TRAFFIC)
+        .await
+        .map_err(|error| format!("the stream took no bytes: {error}"))?;
+    send.finish()
+        .map_err(|error| format!("the stream could not be finished: {error}"))?;
+    send.stopped()
+        .await
+        .map_err(|error| format!("the peer never acknowledged the stream: {error}"))?;
+    Ok(())
+}
+
+/// The bytes [`carries`] writes: enough to be a stream frame, few enough to fit any
+/// window.
+const TRAFFIC: &[u8] = b"traffic";
+
+/// Write a word on `client`'s half of a connection and read it on `server`'s.
+///
+/// [`carries`] proves a connection takes data; this proves the two halves a case holds are one
+/// connection and not two that merely share an address, which is what a case about a dialer
+/// receiving the wrong half has to show.
+///
+/// A connection a manager keeps carries the manager's own binding exchange first, on the half
+/// that accepted it, so a case that round-trips such a connection waits for
+/// [`Connections::traffic`] to report the exchange done before it accepts: the exchange's stream
+/// is not the word.
+pub(crate) async fn round_trip(client: &Connection, server: &Connection) -> Result<(), String> {
+    let (mut send, _recv) = client
+        .open_bi()
+        .await
+        .map_err(|error| format!("the connection opened no stream: {error}"))?;
+    send.write_all(TRAFFIC)
+        .await
+        .map_err(|error| format!("the stream took no bytes: {error}"))?;
+    send.finish()
+        .map_err(|error| format!("the stream could not be finished: {error}"))?;
+    let (_, mut recv) = server
+        .accept_bi()
+        .await
+        .map_err(|error| format!("the other half accepted no stream: {error}"))?;
+    let read = recv
+        .read_to_end(TRAFFIC.len())
+        .await
+        .map_err(|error| format!("the other half read nothing: {error}"))?;
+    if read != TRAFFIC {
+        return Err(format!(
+            "the other half read {} bytes that are not the word written on the first",
+            read.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Offer one frame's bytes over `connection` and read up to `limit` bytes of the answer,
 /// so a case can send a frame the typed layer would not produce.
 pub(super) async fn offer_frame(
