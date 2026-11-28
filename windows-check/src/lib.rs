@@ -7,9 +7,14 @@
 //! `src/identity/access/` sources with only the dependencies the access-list code
 //! uses, so both Windows targets type-check without a Windows host.
 //!
-//! `rust-toolchain.toml` pins the channel and the components, not the targets, so a
-//! fresh `rustup` installation needs this once; without it the check stops in "can't
-//! find crate for `std`":
+//! `rust-toolchain.toml` pins the channel and the components, not the targets. A target
+//! that is not installed stops the check in
+//!
+//! ```text
+//! error[E0463]: can't find crate for `core`
+//! ```
+//!
+//! with a note naming the target, so a fresh `rustup` installation needs this once:
 //!
 //! ```sh
 //! rustup target add x86_64-pc-windows-msvc x86_64-pc-windows-gnu
@@ -26,7 +31,9 @@
 //!
 //! The lint runs per target too: on a host that is not Windows,
 //! `cargo clippy --workspace --all-targets` never compiles the Windows module at all,
-//! so a Windows-only lint failure would otherwise pass here.
+//! so a Windows-only lint failure would otherwise pass here. The crate root enables
+//! `clippy::pedantic` under the same allowances the library gives these sources, so the
+//! gate lints the Windows reader to the same standard as the code it belongs to.
 //!
 //! This proves the code compiles; it runs nothing. The reader and writer are exercised
 //! on a Windows host, and the capability inventory records that procedure.
@@ -47,8 +54,17 @@
 //! only where the platform applies the access list after the creation, and the Windows arm of
 //! that is reached by neither this crate nor a case on this host. What it does check is every
 //! access decision either layer makes.
-#![allow(dead_code)]
+// The same lint set the library's root enables, with the same allowances: these are the
+// library's own sources, and this crate is the only one that lints their Windows half.
+#![warn(clippy::pedantic)]
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::doc_markdown,
+    clippy::module_name_repetitions
+)]
 // The library calls these; this crate only compiles them.
+#![allow(dead_code)]
 // The included module's documentation links into `mahbot_peers`, which this crate is
 // not: the links are correct where the module lives, and resolving them here would
 // mean a second copy of the crate.
