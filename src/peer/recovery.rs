@@ -31,10 +31,13 @@
 //!   hint through the dial that carries it. A hint is a claim and not proof: waiting a minute
 //!   to test an address a caller has just been given is a bound nobody needs, so the episode
 //!   starts over on the claim, while the dial that reaches the peer is what disproves a stop.
-//! - *A dial now*, keeping the episode: a message waiting to be delivered, or a transfer
-//!   waiting for the pair. Each is a standing condition rather than news, so it moves the
-//!   next dial to now without resetting the count. The crate's own queue and the crate's
-//!   own transfer layer are what hand it in, and no other path does.
+//! - *A dial now*, keeping the episode: a message waiting to be delivered, a transfer
+//!   waiting for the pair, or a coordination payload from the peer asking for a punch. Each
+//!   is a standing condition rather than news, so it moves the next dial to now without
+//!   resetting the count. The crate's own queue, its own transfer layer and its own punch
+//!   re-arm are what hand it in, and no other path does. The re-arm is rate-limited to one
+//!   per [`PUNCH_REARM`](crate::peer::PUNCH_REARM) and never moves a used-up episode, so a
+//!   peer that sends a list a second cannot force a dial a second.
 //!
 //! An authenticated inbound connection from the peer is a reason for neither: the pair is
 //! already connected. It is folded in as the next dial of the episode — an inbound connection
@@ -47,12 +50,17 @@
 //!
 //! # What is retried and what is not
 //!
-//! Beacon unreachable, peer unknown and no direct path are retried: each of them is a
-//! network state that can pass, and a machine that has been switched off, a beacon that was
-//! down and a path that changed all look like one of them for a while. "No direct path" is
-//! still reported as itself and still carries the honest advice that another network may
-//! work — being retried does not make it a different failure, it makes it one that may
-//! stop being true.
+//! Beacon unreachable, peer unknown, no direct path and a key that is not the peer's are
+//! retried: each of them is a state that can pass, and a machine that has been switched off, a
+//! beacon that was down and a path that changed all look like one of them for a while. "No
+//! direct path" is still reported as itself — being retried does not make it a different failure,
+//! it makes it one that may stop being true — and it carries the honest advice that another
+//! network may work only where the network is what failed: silence from every address it tried. A
+//! handshake that completed and lost the tie-break is not a network failure, and it carries no
+//! advice to change networks. A wrong key is retried for the same reason and never decides trust:
+//! the address that answered that way may be a stale mapping the peer's network has since given to
+//! another machine, the peer may be somewhere else entirely, and the peer's own key is still the
+//! only one this machine accepts.
 //!
 //! A refusal of trust is never retried, and neither is a pair with no beacon and no remembered
 //! address: the first is decided locally and only a person changes it, and the second is
@@ -81,7 +89,7 @@ use crate::peer::connect::TRUST_POLL;
 
 /// Why the pair could not be connected.
 ///
-/// The four failures of [`crate::peer::connect`]'s note, plus the two answers that are not a
+/// The five failures of [`crate::peer::connect`]'s note, plus the two answers that are not a
 /// network state at all: [`Self::Nowhere`], which is configuration, and [`Self::Deferred`],
 /// which is this machine's own fault. The policy records the last of them beside a wait, so a
 /// caller can read why the pair is down without a second source.
@@ -89,9 +97,9 @@ use crate::peer::connect::TRUST_POLL;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectFailure {
     /// The beacon leg failed: no beacon is configured, the beacon did not answer,
-    /// or it refused the lookup. `cause` names which, and the remembered addresses
-    /// that did not answer before it, because the four failures are classes and the
-    /// cause is the detail a reader acts on.
+    /// or it refused the lookup. `cause` names which, and the addresses tried before it
+    /// that did not answer, because the failures are classes and the cause is the detail a
+    /// reader acts on.
     BeaconUnreachable { peer: Fingerprint, cause: String },
     /// The beacon has no address for the peer: it is not registered. `cause` names
     /// the addresses tried before the beacon, because the remembered dial's detail
@@ -99,12 +107,47 @@ pub enum ConnectFailure {
     PeerUnknown { peer: Fingerprint, cause: String },
     /// The peer's address is known and no connection could be made — or a dial's
     /// handshake completed but the tie-break dropped it while the pair held nothing.
-    /// `cause` is diagnostic: the text may have been written by the far side, or name
-    /// the tie-break that dropped the dial.
+    ///
+    /// `candidates` is every address the dial failed at, in the order it tried them and without
+    /// repeats: a punch dials several at once and each of them is a place the peer was not. It is
+    /// empty when every dial of this one completed a handshake and the pair kept none — there is
+    /// then no address to name. `cause` names only what this
+    /// machine has not ruled out: the text may have been written by the far side. What each
+    /// address did — a timeout, a failed handshake, no key — is a diagnostic and does not travel
+    /// with this set, because a product shows one honest cause beside the addresses; the beacon
+    /// failures carry no set, so theirs name the remembered addresses and their faults, which is
+    /// the only place those appear. The one per-address fault reported as its own answer is a key
+    /// that is not the peer's: that is [`Self::WrongPeer`], a security fact and not a network one.
     NoDirectPath {
         peer: Fingerprint,
-        address: SocketAddr,
+        /// Every address this dial failed at, in the order it tried them.
+        candidates: Vec<SocketAddr>,
         cause: String,
+    },
+    /// An address answered, and the key it proved is not the peer's.
+    ///
+    /// A security fact and not a network one: something is listening at an address this machine
+    /// was told is the peer's, and the key it proved is not the one a person paired with. It is
+    /// decided from the handshake alone, never from text, and it is not [`Self::NotTrusted`]:
+    /// nothing is decided about the peer, which may be somewhere else entirely.
+    ///
+    /// [`crate::peer::Connections::connect_with`] answers it even when the pair holds a connection:
+    /// the pair being up says nothing about an address that answered with another machine's key,
+    /// and a caller that wants the connection reads it from [`crate::peer::Connections::live`].
+    /// [`crate::peer::Connections::ensure`] answers it beside [`crate::peer::Recovery::Connected`]
+    /// when its own dial met it, because that caller asks for the policy's pace and a pair that is
+    /// already up has nothing to pace.
+    ///
+    /// The address is dropped from the peer's record when this answer is made, best effort: a
+    /// failed write leaves it, and the next dial meets the same key and gives the same answer once
+    /// more, at the keeper's pace rather than in a loop. The pair itself is untouched, because a
+    /// stale mapping says nothing about the peer.
+    WrongPeer {
+        peer: Fingerprint,
+        /// The key the address proved.
+        presented: Fingerprint,
+        /// The address that answered with it.
+        address: SocketAddr,
     },
     /// This machine does not trust the peer. Decided locally and only locally;
     /// `cause` names the local state it is.
@@ -134,21 +177,45 @@ impl fmt::Display for ConnectFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BeaconUnreachable { peer, cause } => {
-                write!(
-                    f,
-                    "the beacon is not available, so {peer} cannot be looked up: {cause}"
-                )
+                // The prefix claims nothing the cause has not: no beacon may be configured, one
+                // may have refused, and one may have answered with another version. Naming the
+                // beacon here would assert one the first case rules out, and calling it
+                // unreachable would name a cause the other two just ruled out.
+                write!(f, "could not reach {peer}: {cause}")
             }
             Self::PeerUnknown { peer, cause } => {
                 write!(f, "the beacon does not know {peer}: {cause}")
             }
             Self::NoDirectPath {
                 peer,
-                address,
+                candidates,
                 cause,
+            } => {
+                // The set is a list and not a count: a reader acts on which addresses were
+                // tried, and one address renders exactly as it did before there was a list. An
+                // empty set is a dial that completed and whose connection was gone before the
+                // pair could keep it, so there is no address to name and no advice to give: the
+                // cause already says the handshake completed. The advice, where there is any, is
+                // the cause's own, because only the cause knows whether the network is what
+                // failed.
+                if candidates.is_empty() {
+                    return write!(f, "no direct path to {peer}: {cause}");
+                }
+                let tried = candidates
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "no direct path to {peer} at {tried}: {cause}")
+            }
+            Self::WrongPeer {
+                peer,
+                presented,
+                address,
             } => write!(
                 f,
-                "no direct path to {peer} at {address}: {cause}; another network may work"
+                "the address {address} proved {presented}, not {peer}: something other than the \
+                 peer is at an address this machine was told is the peer's"
             ),
             Self::NotTrusted { peer, cause } => {
                 write!(f, "{peer} is not trusted: {cause}")
@@ -542,8 +609,8 @@ impl Recovery {
     }
 
     /// A reason to dial that is a standing condition rather than news: a message waiting to
-    /// be delivered, or a transfer waiting for the pair. The next dial is due now; the
-    /// episode goes on.
+    /// be delivered, a transfer waiting for the pair, or a coordination payload's re-arm. The
+    /// next dial is due now; the episode goes on.
     ///
     /// The count is kept, because a peer that keeps dropping a connection while the queue
     /// or the transfer waits must not escape the bound by having it re-armed every time.

@@ -29,7 +29,7 @@ The library (`src/`) holds:
 | `tls` | TLS 1.3 with raw public keys (RFC 7250), pinned to the peer's fingerprint instead of a certificate chain, with a per-service ALPN and resumption off so the pin always runs |
 | `net` | endpoint construction over an injected datagram socket and an injected clock — no default for either |
 | `beacon` | the beacon: the closed message set (`wire`), the client half (`Beacon`, `Session`) — register, look an id up, learn the address observed on this path, hand a signed introduction over, take the ones pushed to a live session — and the one deadline combinator the client and the server share (`timeout`, whose documentation says why there is one copy and not two) |
-| `peer` | the peer layer: `record` is the durable memory of another machine, at both levels; `access` is the connection level's vocabulary — the account on the instance, the assistant, the pair, the five capabilities, the rights and the small versioned fact; `pair` the acquaintance ceremony, `connect` the per-machine connection manager, `recovery` the one retry policy for a pair, `presence` the machine's one registration at the beacon — kept alive by itself, and the one reader of what the beacon pushes to it, `binding` the exchange that carries the connection level over a live connection, `rights` the decision, `audit` the record of what happened, `messages` the queue a machine keeps for a peer and the offer it makes over the pair's own connection, `actions` the at-most-once command with its durable journal and unknown marks, `transfer` the whole-file transfer over the pair's own connection — an offer, the receiver's one decision, then the bytes with resume, a SHA-256 the product reports at each end and the crate compares, and a backpressure that is the transport's — and `inbox` the one reader that tells a message from an action from a transfer on that connection. Each is documented where it is enforced |
+| `peer` | the peer layer: `record` is the durable memory of another machine, at both levels; `access` is the connection level's vocabulary — the account on the instance, the assistant, the pair, the five capabilities, the rights and the small versioned fact; `pair` the acquaintance ceremony, `connect` the per-machine connection manager and the punch, `traverse` the punch's candidate set, its signed payload and its filter (private, and no protocol of its own), `recovery` the one retry policy for a pair, `presence` the machine's one registration at the beacon — kept alive by itself, and the one reader of what the beacon pushes to it, dispatching each payload by kind: a ceremony flight, a candidate list, or a stranger's bytes it drops, `binding` the exchange that carries the connection level over a live connection, `rights` the decision, `audit` the record of what happened, `messages` the queue a machine keeps for a peer and the offer it makes over the pair's own connection, `actions` the at-most-once command with its durable journal and unknown marks, `transfer` the whole-file transfer over the pair's own connection — an offer, the receiver's one decision, then the bytes with resume, a SHA-256 the product reports at each end and the crate compares, and a backpressure that is the transport's — and `inbox` the one reader that tells a message from an action from a transfer on that connection. Each is documented where it is enforced |
 
 The key-replacement invariant covers every shipped source: no `fs::rename`,
 `remove_dir` or `fs::copy` anywhere, and no write form in the identity module. The
@@ -105,9 +105,14 @@ compromised beacon cannot pass one off under another id or alter it. Trust
 between machines comes from pinned keys and the ceremony, never from the beacon.
 
 The address answer is the beacon protocol's own request, asked over the same
-connection the peers use. That is the point: an answer obtained over some other
-socket would name an address the peers cannot reach, and hole punching depends on
-the answer being the peer-facing path, so no second socket is opened for it.
+connection the peers use. It keeps that shape, and it is one input to a punch, not
+a check: the check is the authenticated handshake the two machines run themselves.
+An answer obtained over some other socket would name an address the peers cannot
+reach, so no second socket is opened for it. The beacon never sees a punch and
+gains no duty from one: it relays the candidate list in the signed introduction
+payload as it relays a ceremony flight, without acting on it — and because that
+payload is signed and not encrypted, it can read the list, private LAN addresses
+included.
 
 A session is bounded in both directions. It pings every `BEACON_KEEP_ALIVE` so an
 idle session keeps its connection and its NAT binding, and every request — the
@@ -122,8 +127,9 @@ first is the caller's.
 
 ## The connection level and the rights
 
-A peer record has two levels. The machine's is the key, the pairing, the address, the
-failures and the trust. The connection's is `peer::access`: which account on which
+A peer record has two levels. The machine's is the key, the pairing, the addresses
+it remembers — a bounded newest-first list — the failures and the trust. The
+connection's is `peer::access`: which account on which
 instance the machine is connected to, which assistant it is bound to, the claim the
 other side's decision left here, and one right per pair and capability. The unit is the
 plan's: a machine together with the assistant it is connected to.
@@ -254,15 +260,99 @@ different port, with no person and no restart. A bounded, visible, paced retry i
 silent retry loop: that forbids a loop nobody can see and nothing bounds, and this one is bounded
 by the episode, paced by the gap and readable while it runs.
 
-A queued message and a running transfer dial, and neither dials once a second:
-`Connections::ensure` makes one dial only when the policy is due, so the queue's poll, the
-transfer's wait and the keeper cannot hammer a peer between them and a beacon session is not
-opened per poll. A product with news the crate cannot see — a person asking
+A queued message, a running transfer and a coordination payload from the peer make a dial due,
+and none of them dials once a second: `Connections::ensure` makes one dial only when the policy is
+due, so the queue's poll, the transfer's wait and the keeper cannot hammer a peer between them and
+a beacon session is not opened per poll. A product with news the crate cannot see — a person asking
 again — hands it in through `Connections::wake`, which starts a fresh episode. A stop is not
 permanent while its cause is: `ensure` re-opens a stopped pair once the cause has gone and dials it
 once, and self-recovery resumes when the caller runs `keep_connected` again — `watched` is how a
 product knows it is the one that has to. A stop whose cause is still there is answered as the stop,
 with its cause, and that is the same cause the readable state shows.
+
+### A punch
+
+One dial tries, in this order: the caller's hint when there is one; then every
+address the record remembers for the peer, newest first and all dialled at once,
+because each of them completed a handshake once and waiting for four ten-second
+dials in turn would spend the budget on an order that says nothing; then the
+beacon, and only when nothing above worked, so the beacon is not consulted while
+an earlier address works. The third step is the punch: two machines behind network
+address translation dial each other's beacon-observed address at the same time,
+plus the candidate list the peer sends inside the signed, opaque introduction
+payload the beacon already relays. The connectivity check is the authenticated
+handshake itself — there is no STUN exchange, no second socket, no second protocol
+and no separate check phase — so a punch dials addresses with exactly the code a
+remembered address is dialled with, and the handshake that proves the key is the
+same handshake that proves the path. `DIAL_BUDGET` (60 s) is the product-facing
+bound on how long one dial, and therefore the wait before an honest failure, may
+take; the punch fits inside it rather than extending it.
+
+One punch dials at most `MAX_CANDIDATES` (8) candidates, and `PUNCH_REARM` (5 s) is the
+least time between two re-arms of the same pair from coordination payloads. A used-up
+recovery episode is never re-armed, and a punch counts as one dial of the episode, not
+one per candidate. Only addresses that arrive from the peer are filtered: the caller's
+hint and the beacon's observed address are dialled as they come. A stored candidate list
+is used for a minute and no longer — a list is worth what the moment it arrived is worth
+— and a punch that finds none waits a short window for a fresh one rather than dialling
+an old one. The filter refuses loopback, link-local, multicast, the limited broadcast,
+unspecified, this machine's own address and port, and a private address unless the product
+declared an address of this machine in the same block — the whole RFC 1918 block
+(10/8, 172.16/12, 192.168/16) or the carrier-shared 100.64/10, not a subnet of it. Two
+things follow, and both are accepted: a candidate from a neighbour on the same block is
+dialled, and a subnet-directed broadcast inside the block cannot be told from a host
+address without the block's prefix. A paired peer can also name a global address, or this
+machine's own external one — which the crate never learns — and make this machine send a
+padded handshake to it or dial itself: bounded by the ceiling and the re-arm interval.
+Coordination is never sent to a peer while a ceremony with that peer is running,
+because an older build ends its ceremony on an unknown payload; a pairing nobody
+finished is not a ceremony, so an opening whose sender has given up stops holding the
+punch off once it is older than a machine flight is waited for, and a person who walked
+away from a comparison does not keep the pair from punching for ever. A payload from a
+peer this machine no longer trusts causes no dial: the keeper reads the record before it
+dials, and the re-arm asks the record first. A payload can still reach an older build in
+the window before that build's opening arrives here, and end its ceremony: the local
+check covers only what this machine can see, and that window is accepted rather than
+hidden. The beacon can read each machine's candidate list, private LAN addresses
+included, because the payload is signed and not encrypted, and it learns that two
+specific machines are reconnecting at a moment; the relay already reveals the reconnect
+timing, and the list is the accepted cost beside it.
+
+The record keeps up to `MAX_REMEMBERED_ADDRESSES` (4) addresses per peer, newest first,
+in a new tag beside the single-address field; the single field keeps the newest, so an
+older build still finds one. The rule for what may be written is one rule: the source
+address of an accepted connection the tie-break kept, or the address a completed dial
+reached when the pair kept that dial's connection — a completed authenticated handshake
+is authenticated data — and never an address that arrived only as a hint from the
+network. A dial that loses the tie-break writes nothing, so it cannot overwrite the
+address the pair's connection is at. An address leaves the list when a handshake at it
+proves a key which is not the peer's: the record's claim is then disproved, so the
+address is dropped and the next dial does not meet it again. A dial that tried its
+addresses and reached none is refused as `ConnectFailure::NoDirectPath`, which carries
+the candidate set it tried rather than one address; what each address did — a timeout, a
+failed handshake, no key — stays on this machine, and the product shows one cause beside
+the set. A refusal with no evidence names both that the beacon cannot be reached and that
+this network may block UDP; a beacon that answered — a version mismatch, a refusal, a
+malformed frame — is never called unreachable, and no cause the crate has just ruled out
+is named. A network that blocks UDP entirely reports the beacon unreachable; one that
+blocks UDP towards the peer only reports no direct path. The one per-address fault that
+becomes an answer of its own is a key that is not the peer's: `ConnectFailure::WrongPeer`
+names the peer asked for, the key that answered and the address, because that is a
+security fact and not a network one, and it outranks the beacon and network answers the
+same dial went on to collect. It is answered even when the pair is already up, and when the
+peer's own dial brought it up while this one was still trying — `connect_with` answers it in
+both cases, and `ensure` answers it beside `Recovery::Connected` when its own dial met it —
+because the pair being up says nothing about an address that proved another machine's key. The
+record then forgets that address, so the fact is reported once and the next dial does not
+meet it again; the pair itself is untouched. The outcome table in `connect`'s module
+documentation is the contract: 18 rows naming the mapping, filtering and pooling classes
+and what this one dial does with them, every combination of the three the rig can
+configure in a row, and every row a recorded case or a declared gap with its reason. The
+classes are named and not counted, and
+nothing in the crate branches on them; a class that does not connect is refused honestly
+with the product's advice where the network is what failed, never with a NAT diagnosis the
+crate cannot make — and a handshake that completed and lost the tie-break is not a network
+failure at all, so it carries no advice to change networks.
 
 The machine stays findable by itself too, and has exactly one registration: `Presence` is built once
 per machine, registers at once and keeps itself registered — refreshing at a third of the answered
@@ -376,6 +466,31 @@ called keeps waiting for as long as its person might still start on the other ma
 no cause about the peer: a machine whose own registration is not held cannot be reached by the other
 side at all, and says so through `Presence::state`, which is where a product reads a beacon outage
 during a ceremony.
+
+The punch adds its own surface. `Connections::with_presence` hands the manager the
+machine's one `Presence`, shared as an `Arc` with the ceremony that compares under the
+same registration — which is what lets the manager step aside while a ceremony with
+that peer is running — so a candidate list can travel both ways; a manager built
+without one still sends its candidates and dials the beacon's address, but cannot
+receive the peer's, so its punch is one-sided. `Connections::declares` states the
+addresses the product knows this machine has — the only way a private candidate is
+dialled, because nothing here reads the interfaces. `PeerRecord::addresses` is the
+bounded newest-first list the record keeps, `RecordStore::record_address` now maintains
+that list rather than one address, and `RecordStore::forget_address` drops one the
+handshake disproved — an address that answered with another machine's key is no longer
+dialled and refused on every later call. `ConnectFailure::NoDirectPath` carries
+`candidates`, every address the dial failed at, in the order it tried them and without
+repeats. A key that is not the peer's is the one address fault that leaves the refusal
+and becomes an answer of its own: `ConnectFailure::WrongPeer` carries the peer asked for,
+the key that answered and the address it answered from. `connect_with` answers it even
+when the pair holds a connection, and `ensure` answers it beside `Recovery::Connected`
+when its own dial met it, because `ensure` asks for the policy's pace and a pair that is
+already up has nothing to pace. `peer::{MAX_CANDIDATES,
+MAX_REMEMBERED_ADDRESSES, PUNCH_REARM}` are public
+because each is a bound a caller plans against: the most candidates one punch may dial,
+the most addresses one record keeps — a permanent format bound, so a later build that needs
+more adds a record tag rather than raising it — and the least time between two re-arms of a
+punch.
 
 `BeaconError::UnknownPeer`'s text says the beacon did not hand the payload over where it used to say
 the peer was not reachable, which the beacon's one answer does not prove; a ceremony flight it did
@@ -859,6 +974,29 @@ The harness (`harness/`, never published) is the test rig:
   the clock itself, so a link that drops everything ends at a
   deterministic virtual instant instead of hanging the test, and one machine can
   serve several dialers at once.
+- **Networks.** The link can also put a translating network between the machines: one
+  network is a NAT described by its mapping (endpoint-independent, address-dependent or
+  address-and-port-dependent), its filtering (the same three), its address pooling
+  (shared or per destination), whether it carries a hairpin, and whether it stands in a
+  row of two. It is off by default, IPv4 only, and deterministic: a case configures the
+  network and the translation answers where each datagram goes from the traffic before
+  it, so a run replays. `Link::traversal()` reports the mappings, the holes and the
+  hairpins the translation left behind: a hole is opened by a datagram a machine sends
+  out through its network, so a punch shows one on each side towards the other's
+  address. A one-sided dial leaves one on the dialling side, and one on the dialled side
+  only where that side's filter admits the handshake it did not ask for and it replies;
+  a machine behind no network opens none. The rig surface is
+  `Sim::machine_behind`, `Sim::machines_behind_one`, `Machine::network`,
+  `Link::network`, `Link::attach_on`, `Link::network_of`, `Link::external`,
+  `Link::blocks` and `Link::traversal`. One thing the rig cannot prove is stated rather
+  than assumed: it binds each machine to a concrete address, while a real product that
+  binds the wildcard gets an unspecified one, so the local-network row and the
+  own-address gate prove the crate's logic given a product that declares its address.
+  Convergence is a recorded case rather than an argument:
+  `several_dials_end_with_one_connection` completes two handshakes per side, and
+  `more_than_two_completed_dials_end_with_one_connection` gives one identity three
+  addresses, so three handshakes complete on one side and the pair still ends with
+  exactly one connection.
 - **Clock.** Time moves only when the test moves it. `quinn` reads the clock and
   creates its timers through it, so an idle timeout fires on `advance` and never
   on wall time. The harness's tokio has no `time` feature and its runtime has no

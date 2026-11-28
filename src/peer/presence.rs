@@ -37,30 +37,50 @@
 //! [`BeaconError::Unavailable`] rather than opening a session of its own: the retry cadence is the
 //! keeper's, so a caller that asks again and again does not become it.
 //!
-//! # One reader, and where a flight goes
+//! # One reader, and where a payload goes
 //!
-//! The second task reads every introduction the beacon pushes. One from a peer a ceremony waits
-//! on goes to that ceremony — [`Presence::flights`] — and never to another: a flight is
-//! delivered to the ceremony for the peer it comes from, never first-come. A peer's flights wait
-//! for its ceremony in the order they arrive, which for this crate's ceremony is the order they
-//! were sent — every flight is awaited before the next — [`MAX_PENDING`] of them at most,
-//! because the next flight of an exchange is not a peer that gave up: taking the newer one first
-//! would lose the step before it and end the ceremony as out of order. An opening from a peer
-//! nobody waits on yet is held instead, one per peer, for [`MAX_HELD`] peers at most, because the
-//! other machine may start the ceremony before this machine's person does;
+//! The second task reads every introduction the beacon pushes, and what it does with one is
+//! decided by the payload's own bytes before anything acts on it — `crate::peer::traverse`
+//! classifies it. There are three kinds and no fourth.
+//!
+//! A *ceremony flight* — one of the closed set of pair messages — goes to the ceremony for the
+//! peer it came from: [`Presence::flights`], never to another ceremony and never first-come. A
+//! peer's flights wait for its ceremony in the order they arrive, which for this crate's ceremony
+//! is the order they were sent — every flight is awaited before the next — [`MAX_PENDING`] of them
+//! at most, because the next flight of an exchange is not a peer that gave up: taking the newer
+//! one first would lose the step before it and end the ceremony as out of order. An opening from
+//! a peer nobody waits on yet is held instead, one per peer, for [`MAX_HELD`] peers at most,
+//! because the other machine may start the ceremony before this machine's person does;
 //! [`Presence::openings`] takes those newest first, because an opening that has been sitting is
 //! one whose initiator is likelier to have given up already. Only an opening is held: no other
 //! flight can start a ceremony, so no other flight is worth keeping for one. A cancelled ceremony
 //! takes its waiting slot with it, and the flights waiting in it go with the slot.
 //!
+//! A *coordination payload* is a candidate list, and it is never a ceremony flight: it is stored
+//! here under the peer that sent it — 32 peers at most, the oldest evicted — and wakes whoever
+//! waits for it, through `candidates` and `wait_for_candidates`. It is not delivered to a
+//! ceremony even when one waits on that peer, it does not open one, and it is not written
+//! anywhere durable: a candidate list is worth what the moment it arrived is worth, so one older
+//! than `COORDINATION_FRESH` is not read at all.
+//!
+//! Anything else is *unrecognised* and is dropped: it wakes nobody, is stored nowhere and cannot
+//! end a ceremony. That is a rule rather than a courtesy. An older build ends its ceremony on any
+//! payload outside its closed set, so coordination is never sent to a peer while a ceremony with
+//! it is running — `busy_with` is that question, and [`crate::peer::connect`] is the one sender —
+//! and a payload this build does not understand has to be as harmless as one that never arrived.
+//! A ceremony whose opening is still in flight is the one window this cannot see; it closes as
+//! soon as the opening arrives, and the rule is what the crate can enforce rather than a promise
+//! about a machine it has not heard from yet.
+//!
 //! A frame the reader refuses costs it nothing: the beacon relays what any machine hands it,
 //! without looking at the signature, so the reader takes such a frame, drops it, and is ready for
 //! the next one rather than sleeping out an idle period on a stranger's bad bytes.
 //!
-//! One rule decides whether a flight is handed over, on either path, and it is the wait its sender
-//! is under: a machine flight is dropped once it is older than `PAIR_FLIGHT_TIMEOUT`, while a
-//! confirmation is not, because its sender waits for as long as the peer's person compares the
-//! same string — the attempt's own lifetime, which the ceremony that claimed the peer bounds.
+//! One rule decides whether a flight is a live one, on every path — handed to a person, or counted
+//! as a ceremony the punch must not disturb — and it is the wait its sender is under: a machine
+//! flight is dropped once it is older than `PAIR_FLIGHT_TIMEOUT`, while a confirmation is not,
+//! because its sender waits for as long as the peer's person compares the same string — the
+//! attempt's own lifetime, which the ceremony that claimed the peer bounds.
 //!
 //! A session a product opens for itself is not prevented from registering, and it would displace
 //! the machine's registration: the crate cannot hold one registration per machine without
@@ -79,8 +99,17 @@ use quinn::Runtime;
 
 use crate::beacon::{BEACON_REQUEST_TIMEOUT, Beacon, BeaconError, Introduction, Session, timeout};
 use crate::identity::PeerId;
-use crate::peer::pair::{PAIR_FLIGHT_TIMEOUT, opens_a_ceremony, waits_for_the_attempt};
+use crate::peer::pair::{PAIR_FLIGHT_TIMEOUT, waits_for_the_attempt};
 use crate::peer::recovery::{RECOVERY_DIALS, after, recheck};
+use crate::peer::traverse::{self, Candidates};
+
+/// How long a stored candidate list is used.
+///
+/// A list is worth what the moment it arrived is worth: the peer's mapping can move, so a list
+/// older than this is treated as absent and a caller that needs one waits for a fresh one. A
+/// minute is longer than any punch window and shorter than a registration's life, which is what
+/// keeps a stale list from being dialled in place of the peer's current addresses.
+const COORDINATION_FRESH: Duration = Duration::from_secs(60);
 
 /// The shortest refresh interval: a third of a tiny lifetime must not become a
 /// busy loop, so the wait never falls below this.
@@ -89,6 +118,12 @@ const MIN_REFRESH: Duration = Duration::from_secs(1);
 /// How long the reader waits on a live session with nothing pushed before it looks at the
 /// session again, so a session that was replaced is noticed.
 const READER_IDLE: Duration = Duration::from_secs(10);
+
+/// How many peers a candidate list is kept for: a chosen bound, enough for the peers a machine
+/// is actually dialling and small enough that a stranger cannot fill this machine's memory by
+/// sending payloads it never answers. The oldest entry is the one evicted, and a peer that sends
+/// again replaces its own.
+const MAX_COORDINATED: usize = 32;
 
 /// How many peers an opening is held for: a chosen bound, enough for the ceremonies a person can
 /// be starting at once and small enough that a stranger cannot fill this machine's memory. The
@@ -193,6 +228,9 @@ impl Presence {
             live: Mutex::new(None),
             mail: Mutex::new(Mail::default()),
             changed: Gate::default(),
+            coord: Mutex::new(HashMap::new()),
+            coord_changed: Gate::default(),
+            next_coord: AtomicU64::new(1),
             stopped: AtomicBool::new(false),
             next_id: AtomicU64::new(0),
         });
@@ -310,6 +348,74 @@ impl Presence {
         .await
         .ok_or(BeaconError::Unavailable)
     }
+
+    /// The candidates last heard from `peer`, and the generation they arrived at.
+    ///
+    /// The generation is what a caller reads before it sends its own list and hands to
+    /// [`Self::wait_for_candidates`] afterwards: a payload that arrives between the two carries a
+    /// later one, so the wait does not miss it. Nothing here reads the record — the presence has
+    /// no store, and whether the peer is trusted is the manager's decision, made where the record
+    /// is.
+    pub(crate) fn candidates(&self, peer: &PeerId) -> Option<(Candidates, u64)> {
+        let now = self.inner.runtime().now();
+        self.inner
+            .coord()
+            .get(peer)
+            .filter(|coordinated| {
+                now.saturating_duration_since(coordinated.at) < COORDINATION_FRESH
+            })
+            .map(|coordinated| (coordinated.candidates.clone(), coordinated.generation))
+    }
+
+    /// Wait until a coordination payload from `peer` arrives at a generation past `after`, or
+    /// until `within` runs out.
+    ///
+    /// Cancellable: dropping the future leaves nothing behind and wakes nobody. The gate is
+    /// opened by every stored payload, another peer's included, so a wake that finds nothing new
+    /// for this peer goes back to waiting rather than answering an empty list.
+    pub(crate) async fn wait_for_candidates(
+        &self,
+        peer: &PeerId,
+        after: u64,
+        within: Duration,
+    ) -> Option<Candidates> {
+        timeout(&**self.runtime(), within, async {
+            loop {
+                // Read before the check, so a payload stored between the two moves the gate past
+                // what was read and the wait below returns at once.
+                let seen = self.inner.coord_changed.generation();
+                if let Some((candidates, generation)) = self.candidates(peer)
+                    && generation > after
+                {
+                    return candidates;
+                }
+                self.inner.coord_changed.wait_past(seen).await;
+            }
+        })
+        .await
+    }
+
+    /// Whether a ceremony with `peer` is running here, or a fresh opening from it is held.
+    ///
+    /// Coordination is never sent to a peer while this is true. An older build ends its ceremony
+    /// on any payload outside its closed set, so "must not be driven into aborting its ceremony"
+    /// is met by not sending, not by hoping: a candidate list is worth one dial later, and a
+    /// person's comparison is not. An opening whose sender has given up is not a ceremony — it is
+    /// retired rather than left to hold the punch off for that peer — so the rule costs one
+    /// attempt's worth of waiting and no more.
+    pub(crate) fn busy_with(&self, peer: &PeerId) -> bool {
+        let now = self.inner.runtime().now();
+        self.inner.mail().busy_with(peer, now)
+    }
+
+    /// The beacon this presence speaks to: one session, one registration, one identity.
+    ///
+    /// The manager reads it to know that a machine keeping a presence has a beacon to ask, so a
+    /// manager built without a beacon handle of its own still has one — and the address the beacon
+    /// observes on this presence's registration is the one peers dial.
+    pub(crate) fn beacon(&self) -> &Beacon {
+        &self.inner.beacon
+    }
 }
 
 impl Drop for Presence {
@@ -381,10 +487,29 @@ struct Inner {
     mail: Mutex<Mail>,
     /// Opened whenever the registration or the session changed, so a waiter looks again.
     changed: Gate,
+    /// The candidate list each peer last sent, bounded at [`MAX_COORDINATED`].
+    coord: Mutex<HashMap<PeerId, Coordinated>>,
+    /// Opened whenever a coordination payload is stored, so a waiter looks again. The same gate
+    /// as `changed` would do, but a payload is not a registration change and a request waiting
+    /// for a session must not be woken by one.
+    coord_changed: Gate,
+    /// The generation the next stored payload takes; never reused, so "past what I have seen" is
+    /// one question a single count can answer for every peer.
+    next_coord: AtomicU64,
     stopped: AtomicBool,
     /// The next id for a handle waiting for any opening, so a cancelled one can be found among
     /// the waiters.
     next_id: AtomicU64,
+}
+
+/// The candidate list one peer last sent, when it arrived, and the generation it took.
+struct Coordinated {
+    candidates: Candidates,
+    /// The generation this payload was stored at, from [`Inner::next_coord`].
+    generation: u64,
+    /// When it arrived: the oldest entry is what an eviction takes, and one older than
+    /// [`COORDINATION_FRESH`] is not read at all.
+    at: Instant,
 }
 
 /// The introductions that have arrived and not been taken, by the peer they wait on.
@@ -492,6 +617,29 @@ impl Mail {
             self.waiting.remove(&peer);
         }
     }
+
+    /// Whether a ceremony with `peer` is running here, or a fresh opening from it is held.
+    ///
+    /// [`Held::fresh`] is the rule here as it is in [`Self::poll_next`]: an opening whose sender
+    /// has given up is not a ceremony. A stale one is retired on the way, because a held opening
+    /// otherwise leaves only through a [`Flights`] handle, a newer opening from the same peer or
+    /// [`MAX_HELD`]'s eviction — so a person who started a pairing, walked away and never
+    /// confirmed would hold the punch off for that peer for good.
+    fn busy_with(&mut self, peer: &PeerId, now: Instant) -> bool {
+        if self.waiting.contains_key(peer) {
+            return true;
+        }
+        let mut busy = false;
+        self.held_openings.retain(|held| {
+            if held.introduction.from() != *peer {
+                return true;
+            }
+            let fresh = held.fresh(now);
+            busy |= fresh;
+            fresh
+        });
+        busy
+    }
 }
 
 impl Inner {
@@ -501,6 +649,12 @@ impl Inner {
 
     fn mail(&self) -> MutexGuard<'_, Mail> {
         self.mail.lock().expect("the beacon's mail is not poisoned")
+    }
+
+    fn coord(&self) -> MutexGuard<'_, HashMap<PeerId, Coordinated>> {
+        self.coord
+            .lock()
+            .expect("the coordination store is not poisoned")
     }
 
     fn stopped(&self) -> bool {
@@ -583,16 +737,65 @@ impl Inner {
         timeout(&*self.runtime(), READER_IDLE, self.changed.wait_past(seen)).await;
     }
 
-    /// Where an introduction the beacon pushed goes.
+    /// Where an introduction the beacon pushed goes, by the kind of its payload.
+    ///
+    /// The kind is decided once, here, before anything acts on the payload: a candidate list is
+    /// stored and never delivered to a ceremony, a ceremony flight is delivered or held, and
+    /// anything else is dropped. See the module note for the rule and why it is one.
     fn route(&self, introduction: Introduction) {
         let from = introduction.from();
-        let now = self.runtime().now();
+        match traverse::classify(introduction.payload()) {
+            traverse::Payload::Coordination(candidates) => {
+                self.store_coordination(from, candidates);
+            }
+            traverse::Payload::Ceremony { opens } => {
+                let held = Held {
+                    introduction,
+                    at: self.runtime().now(),
+                };
+                self.deliver(from, held, opens);
+            }
+            traverse::Payload::Unknown => {}
+        }
+    }
+
+    /// Store the candidate list `from` just sent, and wake whoever waits on one.
+    ///
+    /// The generation is taken before the entry is written, so a waiter that read the old one
+    /// sees the new entry rather than a wake with nothing behind it. A peer that sends again
+    /// replaces its own entry; a new peer at the bound takes the place of the oldest arrival. Any
+    /// machine can send a list, so strangers can take the places — the cost is one punch window
+    /// without the peer's candidates, and the beacon's observed address is dialled either way.
+    fn store_coordination(&self, from: PeerId, candidates: Candidates) {
+        let at = self.runtime().now();
+        let generation = self.next_coord.fetch_add(1, Ordering::Relaxed);
+        let mut coord = self.coord();
+        if !coord.contains_key(&from) && coord.len() >= MAX_COORDINATED {
+            let oldest = coord
+                .iter()
+                .min_by_key(|(_, coordinated)| coordinated.at)
+                .map(|(peer, _)| *peer);
+            if let Some(oldest) = oldest {
+                coord.remove(&oldest);
+            }
+        }
+        coord.insert(
+            from,
+            Coordinated {
+                candidates,
+                generation,
+                at,
+            },
+        );
+        drop(coord);
+        self.coord_changed.open();
+    }
+
+    /// Hand a ceremony flight to the ceremony that waits for it, or hold it for one that may
+    /// start, and wake whoever it is for.
+    fn deliver(&self, from: PeerId, held: Held, opens: bool) {
         let wakers = {
             let mut mail = self.mail();
-            let held = Held {
-                introduction,
-                at: now,
-            };
             if let Some(slot) = mail.waiting.get_mut(&from) {
                 // In the order the peer sent them, and at the bound the oldest goes rather than
                 // the newest: a peer that keeps sending has moved on from its oldest flight.
@@ -601,7 +804,7 @@ impl Inner {
                 }
                 slot.flights.push_back(held);
                 std::mem::take(&mut slot.wakers)
-            } else if opens_a_ceremony(held.introduction.payload()) {
+            } else if opens {
                 mail.hold(held);
                 std::mem::take(&mut mail.any_openings)
                     .into_values()

@@ -1,7 +1,7 @@
 //! The peer layer: what a machine remembers, how two become acquainted, how they
 //! stay connected, what a connected machine may do, and what it asks of another.
 //!
-//! Fourteen pieces, each with one job:
+//! Fifteen pieces, each with one job:
 //!
 //! - [`record`] is the durable memory: one file per peer under the storage root,
 //!   private to the account the product runs as, published atomically, and additive
@@ -17,11 +17,16 @@
 //!   six symbols two people compare, flights bound to the attempt, and a record
 //!   written only after both people confirmed. It is the one place a peer becomes
 //!   trusted.
-//! - [`connect`] is the per-machine connection manager: the remembered address
-//!   first, the beacon second; one connection per pair with an asymmetric tie-break
-//!   both sides compute the same way, and a fresh connection preferred over one that
-//!   has stopped answering; four failures, each reported as itself; and a keeper that
-//!   recovers the pair in paced episodes rather than stopping at the first failed dial.
+//! - [`connect`] is the per-machine connection manager: the caller's hint, then every
+//!   address the record remembers, then the beacon — and, at the beacon, the punch that lets two
+//!   machines behind network address translation meet; one connection per pair with an asymmetric
+//!   tie-break both sides compute the same way, and a fresh connection preferred over one that has
+//!   stopped answering; five failures, each reported as itself; and a keeper that recovers the
+//!   pair in paced episodes rather than stopping at the first failed dial.
+//! - `traverse` is what the punch may dial and nothing else: the candidate set one dial tries,
+//!   bounded by `MAX_CANDIDATES`; the signed payload that carries it between machines, which the
+//!   beacon relays without reading it; and the one filter a candidate that arrived from the
+//!   network is judged by. It holds no state, reads no clock and opens no socket.
 //! - [`recovery`] is the one retry policy for a pair: episodes with growing gaps, a
 //!   stated cap, a slow re-check once an episode is used up, the reasons that start a
 //!   new one, the two states that are never retried, and the state a product reads to
@@ -29,7 +34,9 @@
 //! - [`presence`] is the machine's one registration at the beacon: it registers itself and stays
 //!   registered while it exists, takes the beacon up again after an outage, and is the one reader
 //!   of what the beacon pushes, so a peer that remembers its address can still find it after a
-//!   move and a ceremony's flight reaches the ceremony for the peer it came from.
+//!   move. It decides every pushed payload by its kind — a ceremony flight reaches the ceremony
+//!   for the peer it came from, a candidate list is stored and handed to the punch, and anything
+//!   else is dropped — so no payload can reach the wrong one of them.
 //! - [`messages`] is what one machine says to another: a body queued durably at the
 //!   sender, offered over the pair's live direct connection, decided by the receiver
 //!   through the rights layer, deduplicated by envelope, delivered at least once,
@@ -113,6 +120,7 @@ mod store;
 mod stream;
 mod sweep;
 mod tlv;
+mod traverse;
 mod window;
 
 /// How often a service sweeps the durable state it serves: the message queue's retention and
@@ -149,7 +157,10 @@ pub use pair::{
     Person, Role, Turn,
 };
 pub use presence::{Flights, MAX_HELD, MAX_PENDING, Presence, Registration};
-pub use record::{Attempt, Limits, Malformed, PeerRecord, RecordError, RecordStore, Timestamp};
+pub use record::{
+    Attempt, Limits, MAX_REMEMBERED_ADDRESSES, Malformed, PeerRecord, RecordError, RecordStore,
+    Timestamp,
+};
 pub use recovery::{
     ConnectFailure, NotTrustedCause, RECOVERY_DIALS, RECOVERY_FIRST_GAP, RECOVERY_RECHECK,
     Recovery, StopCause,
@@ -164,3 +175,4 @@ pub use transfer::{
     TRANSFER_START_WINDOW, TRANSFER_THROTTLE_CAP, TRANSFER_WAIT, Transfer, TransferError,
     TransferFailure, TransferLimit, TransferName, TransferState, Transfers,
 };
+pub use traverse::{MAX_CANDIDATES, PUNCH_REARM};

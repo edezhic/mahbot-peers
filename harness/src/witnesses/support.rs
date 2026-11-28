@@ -4,7 +4,8 @@ use std::future::Future;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
 use mahbot_peers::identity::PeerId;
@@ -466,4 +467,44 @@ pub(crate) fn drain(socket: &crate::link::LinkedSocket) -> Vec<Vec<u8>> {
         };
         out.push(buffer[..len].to_vec());
     }
+}
+
+/// A waker that counts the wakes delivered through it.
+///
+/// A future polled by hand leaves its waker in whatever it waits on, so counting wakes is how a
+/// case tells a waiter that is gone from one that is still waiting.
+#[derive(Default)]
+pub(super) struct Woken(Arc<Counter>);
+
+#[derive(Default)]
+struct Counter(AtomicUsize);
+
+impl Wake for Counter {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl Woken {
+    /// The waker to poll a future with: every wake through it lands in this counter.
+    pub(super) fn waker(&self) -> Waker {
+        Waker::from(Arc::clone(&self.0))
+    }
+
+    /// How many wakes have been delivered through it.
+    pub(super) fn wakes(&self) -> usize {
+        self.0.0.load(Ordering::SeqCst)
+    }
+}
+
+/// Poll `future` once with `woken`'s waker and drop it.
+pub(super) fn poll_once<F: Future>(future: F, woken: &Woken) -> Poll<F::Output> {
+    let waker = woken.waker();
+    let mut context = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    future.as_mut().poll(&mut context)
 }

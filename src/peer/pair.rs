@@ -261,10 +261,22 @@ impl Body {
     }
 }
 
-/// Whether a flight can start a ceremony: only an opening does, so only an opening is worth
-/// holding for a person who has not started yet.
-pub(crate) fn opens_a_ceremony(payload: &[u8]) -> bool {
-    matches!(Message::parse(payload), Ok(message) if message.kind() == Kind::Commit)
+/// Whether `payload` is one of the closed set of ceremony flights — a message this crate's
+/// ceremony sends or reads, and nothing else — and whether it can start a ceremony, which only an
+/// opening can: it is the one flight worth holding for a person who has not started yet.
+///
+/// `None` when the payload is not a ceremony flight at all; `Some(opens)` when it is, where
+/// `opens` says whether it can start one.
+///
+/// The one question an introduction payload that arrived from the network is asked before it is
+/// allowed near a ceremony. A payload that is not one of these must never reach a ceremony: an
+/// older build ends its ceremony on any payload outside the set, so a payload this build does not
+/// understand is dropped rather than delivered. One parse answers both.
+pub(crate) fn ceremony_flight(payload: &[u8]) -> Option<bool> {
+    match Message::parse(payload) {
+        Ok(message) => Some(message.kind() == Kind::Commit),
+        Err(_) => None,
+    }
 }
 
 /// Whether a flight's sender waits for the attempt's own lifetime rather than for one machine

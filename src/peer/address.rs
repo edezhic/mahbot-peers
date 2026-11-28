@@ -55,3 +55,20 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<(Option<SocketAddr>, &[u8])> {
         _ => None,
     }
 }
+
+/// The first `cap` distinct addresses of `front`, in the order given.
+///
+/// One implementation of "distinct, in order, capped", shared by the record's list and the set a
+/// punch dials, so the two cannot disagree about what a repeat or the bound does.
+pub(crate) fn distinct(front: impl IntoIterator<Item = SocketAddr>, cap: usize) -> Vec<SocketAddr> {
+    let mut addresses: Vec<SocketAddr> = Vec::with_capacity(cap);
+    for address in front {
+        if addresses.len() >= cap {
+            break;
+        }
+        if !addresses.contains(&address) {
+            addresses.push(address);
+        }
+    }
+    addresses
+}

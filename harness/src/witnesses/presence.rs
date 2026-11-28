@@ -5,10 +5,7 @@
 //! case here pins one consequence of that, or one rule of the single registration and its one
 //! reader that replaced it.
 
-use std::future::Future;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::Poll;
 use std::time::Duration;
 
 use mahbot_beacon::core::REGISTRATION_TTL;
@@ -27,7 +24,7 @@ use crate::raw::RawClient;
 use crate::sim::Sim;
 
 use super::peer::{NOW, Pairing, Shown, now, pair_together, pair_with_delay, paired};
-use super::support::{io_error, keep_findable, within};
+use super::support::{Woken, io_error, keep_findable, poll_once, within};
 
 /// Push one opaque introduction from `sender` to `target` over `beacon`.
 async fn push(
@@ -53,7 +50,7 @@ async fn push(
 /// Push one opening — a real ceremony's first flight — from `sender` to `target`, so the
 /// target's presence has something it can hold for a person who has not started, and answer what
 /// was sent.
-async fn push_opening(
+pub(super) async fn push_opening(
     sim: &Sim,
     beacon: &TestBeacon,
     sender: &Machine,
@@ -855,7 +852,7 @@ pub(crate) fn a_dropped_handle_takes_its_waiting_with_it() -> Result<(), String>
                 return Err("a claim was handed a flight before anything was pushed".to_owned());
             }
         }
-        push(&sim, &beacon, &other, &target, b"not a ceremony opening").await?;
+        push_opening(&sim, &beacon, &other, &target).await?;
         sim.clock().advance(Duration::from_secs(2)).await;
         if slot_gone.wakes() != 0 {
             return Err(format!(
@@ -864,12 +861,15 @@ pub(crate) fn a_dropped_handle_takes_its_waiting_with_it() -> Result<(), String>
             ));
         }
         // The control for that one: a claim that is still there is woken by the same flight.
+        // A third peer, because the opening the dropped claim did not take is still held for
+        // the second one and would be handed over before anything was pushed.
+        let third = sim.machine().map_err(io_error)?;
         let slot_stays = Woken::default();
-        let claimed = presence.flights(peer);
+        let claimed = presence.flights(third.peer_id());
         if poll_once(claimed.next(), &slot_stays).is_ready() {
             return Err("a claim was handed a flight before anything was pushed".to_owned());
         }
-        push(&sim, &beacon, &other, &target, b"not a ceremony opening").await?;
+        push_opening(&sim, &beacon, &third, &target).await?;
         sim.clock().advance(Duration::from_secs(2)).await;
         if slot_stays.wakes() == 0 {
             return Err("a flight woke neither the dropped claim nor the live one".to_owned());
@@ -896,7 +896,7 @@ pub(crate) fn a_flight_wakes_every_handle_waiting_on_the_peer() -> Result<(), St
         if poll_once(one.next(), &first).is_ready() || poll_once(two.next(), &second).is_ready() {
             return Err("a claim was handed a flight before anything was pushed".to_owned());
         }
-        push(&sim, &beacon, &sender, &target, b"the flight").await?;
+        push_opening(&sim, &beacon, &sender, &target).await?;
         sim.clock().advance(Duration::from_secs(2)).await;
         for (which, woken) in [("first", &first), ("second", &second)] {
             if woken.wakes() == 0 {
@@ -907,48 +907,6 @@ pub(crate) fn a_flight_wakes_every_handle_waiting_on_the_peer() -> Result<(), St
         }
         Ok(())
     })
-}
-
-/// A waker that counts the wakes delivered through it.
-///
-/// For a handle waiting for any opening, its waker is the only thing it leaves in the presence, so
-/// counting wakes is how a case tells a handle that is gone from one that is still waiting: both
-/// are just wakers to the reader. A handle on one peer leaves a claim as well, and that is counted
-/// by the slot instead.
-#[derive(Default)]
-struct Woken(Arc<Counter>);
-
-#[derive(Default)]
-struct Counter(AtomicUsize);
-
-impl Wake for Counter {
-    fn wake(self: Arc<Self>) {
-        self.0.fetch_add(1, Ordering::SeqCst);
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.0.fetch_add(1, Ordering::SeqCst);
-    }
-}
-
-impl Woken {
-    /// The waker to poll a handle with: every wake through it lands in this counter.
-    fn waker(&self) -> Waker {
-        Waker::from(Arc::clone(&self.0))
-    }
-
-    /// How many wakes have been delivered through it.
-    fn wakes(&self) -> usize {
-        self.0.0.load(Ordering::SeqCst)
-    }
-}
-
-/// Poll `future` once with `woken`'s waker and drop it.
-fn poll_once<F: Future>(future: F, woken: &Woken) -> Poll<F::Output> {
-    let waker = woken.waker();
-    let mut context = Context::from_waker(&waker);
-    let mut future = std::pin::pin!(future);
-    future.as_mut().poll(&mut context)
 }
 
 /// One installed session releases every request that was waiting for one.
@@ -1019,12 +977,12 @@ pub(crate) fn a_second_handle_keeps_the_flight_when_the_first_is_dropped() -> Re
         // waiting for the same peer.
         let first = target_presence.flights(sender.peer_id());
         let second = target_presence.flights(sender.peer_id());
-        push(&sim, &beacon, &sender, &target, b"the flight").await?;
+        let opening = push_opening(&sim, &beacon, &sender, &target).await?;
         sim.clock().advance(Duration::from_secs(2)).await;
         // The first ceremony is cancelled after the flight arrived; the other still takes it.
         drop(first);
         let flight = within(&sim, Duration::from_secs(120), second.next()).await?;
-        if flight.payload() != b"the flight" {
+        if flight.payload() != opening.as_slice() {
             return Err(format!(
                 "the remaining handle took `{}`, not the peer's flight",
                 String::from_utf8_lossy(flight.payload())

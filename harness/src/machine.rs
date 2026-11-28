@@ -150,9 +150,24 @@ impl Machine {
     }
 
     /// Where this machine currently appears on the link.
+    ///
+    /// The address it sends from, which is what [`crate::link::Link::silence`] and
+    /// [`Machine::rebind`] take. A machine behind a network sits at a private one, so
+    /// what a peer outside dials is [`crate::link::Link::external`] of this.
     #[must_use]
     pub fn addr(&self) -> SocketAddr {
         self.socket.addr()
+    }
+
+    /// The network this machine is behind, as a handle a second machine can join.
+    ///
+    /// Read from the address it sits at, so a machine that moved keeps the answer true:
+    /// [`Machine::rebind_next`] moves it inside the same network, and a
+    /// [`Machine::restart`] comes back behind the same one. A case uses it to put
+    /// another machine behind the same router.
+    #[must_use]
+    pub fn network(&self) -> Option<crate::link::Network> {
+        self.link.network_of(self.addr())
     }
 
     /// The capability to this machine's own storage, and to nothing else.
@@ -302,7 +317,11 @@ impl Machine {
         ))
     }
 
-    /// Remember `peer` as a machine this one may talk to.
+    /// Admit `peer`'s certificate at this machine's endpoint, whatever its record says.
+    ///
+    /// [`crate::connect::Policy`] states what that does and does not decide: the endpoint's
+    /// admission is not the trust decision, and the connection manager still decides from the
+    /// record — a case uses this to separate the two.
     pub fn trust(&self, peer: &Machine) {
         self.trust.insert(peer.fingerprint());
     }
@@ -350,16 +369,20 @@ impl Machine {
     /// connections: everything a process restart keeps is the root, and everything it
     /// loses is in memory.
     ///
-    /// Every endpoint, connection and manager handle a case holds must be dropped
-    /// before this call: they keep the old socket alive, and the wait would end in
-    /// the budget expiring instead of a restart. A record store holds no socket and
-    /// may be kept; the restart reopens the machine's own anyway.
+    /// The new address is on the same side of the wire as the old one: a machine
+    /// behind a network comes back inside that network, with a new address and,
+    /// because a run's mappings went with the old one, nothing outside naming it until
+    /// it sends again. Every endpoint, connection and manager handle a case holds must
+    /// be dropped before this call: they keep the old socket alive, and the wait would
+    /// end in the budget expiring instead of a restart. A record store holds no socket
+    /// and may be kept; the restart reopens the machine's own anyway.
     ///
     /// # Errors
     ///
     /// The transport did not release the socket within [`RESTART_BUDGET`], or the
     /// root no longer holds a key.
     pub async fn restart(&mut self) -> Result<SocketAddr, String> {
+        let behind = self.network();
         if let Some(endpoint) = self.endpoint_slot().take() {
             endpoint.close(0u32.into(), b"machine restarting");
         }
@@ -379,7 +402,10 @@ impl Machine {
         }
         // A new address, as a machine that came back on another network has: the
         // remembered one is now stale, which is what the beacon is for.
-        self.socket = self.link.attach_next();
+        self.socket = match behind {
+            Some(network) => self.link.attach_on(network),
+            None => self.link.attach_next(),
+        };
         self.identity = self
             .root
             .load_identity()

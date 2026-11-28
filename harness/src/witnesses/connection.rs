@@ -1,4 +1,4 @@
-//! Connection cases: the manager's two sources, the four failures, the address
+//! Connection cases: the manager's two sources, the failures, the address
 //! rule, the tie-break, the keeper's two stops, the registration refresh, and the
 //! restart that keeps only the root.
 
@@ -256,15 +256,30 @@ pub(crate) fn reconnect_falls_back_to_the_beacon() -> Result<(), String> {
         if first_beacon < first_stale {
             return Err("the beacon was asked before the remembered address".to_owned());
         }
-        // The dialing side does not write the address it dialed: only an accept
-        // records where authenticated data came from. The record keeps the stale
-        // address, which is what a later reconnect tries first.
+        // The address the dial completed at is authenticated data: the peer answered there
+        // with the key this machine trusts, so the record holds it — and the next dial reaches
+        // the peer without the beacon.
         if left_store
             .get(&right.peer_id())
             .and_then(|record| record.last_address())
-            != Some(stale)
+            != Some(fresh)
         {
-            return Err("the dialing side rewrote the address it dialed".to_owned());
+            return Err("the address a completed dial reached was not remembered".to_owned());
+        }
+        let again = within(
+            &sim,
+            Duration::from_secs(120),
+            managed_left
+                .connections
+                .connect(&managed_left.endpoint, &right.fingerprint()),
+        )
+        .await?
+        .map_err(|error| error.to_string())?;
+        if again.remote_address() != fresh {
+            return Err(format!(
+                "the second dial reached {} instead of the remembered {fresh}",
+                again.remote_address()
+            ));
         }
         Ok(())
     })
@@ -320,7 +335,7 @@ pub(crate) fn reconnect_stops_after_both_fail() -> Result<(), String> {
     })
 }
 
-pub(crate) fn four_failures_are_distinct() -> Result<(), String> {
+pub(crate) fn failures_are_distinct() -> Result<(), String> {
     block_on(async {
         let sim = Sim::new().map_err(io_error)?;
         let beacon = TestBeacon::start(&sim).map_err(io_error)?;
@@ -388,11 +403,7 @@ pub(crate) fn four_failures_are_distinct() -> Result<(), String> {
 
         let reported = [
             ("not trusted", &not_trusted, "not trusted"),
-            (
-                "beacon unreachable",
-                &unreachable,
-                "beacon is not available",
-            ),
+            ("beacon unreachable", &unreachable, "could not reach"),
             ("peer unknown", &unknown, "the beacon does not know"),
             ("no direct path", &no_path, "no direct path"),
         ];
@@ -774,9 +785,9 @@ pub(crate) fn tie_break_closes_the_dropped_connection() -> Result<(), String> {
     })
 }
 
-/// A dial whose connection loses the tie-break teaches no address: the record keeps
-/// the last address authenticated data arrived from, never the address this machine
-/// dialled.
+/// A dial whose connection loses the tie-break writes no address: the record keeps the address
+/// the pair's kept connection is at, and the address the losing dial completed at is not copied
+/// over it.
 pub(crate) fn tie_break_drop_records_no_address() -> Result<(), String> {
     block_on(async {
         let sim = Sim::new().map_err(io_error)?;
@@ -784,11 +795,11 @@ pub(crate) fn tie_break_drop_records_no_address() -> Result<(), String> {
         let (left, right, left_store, right_store) = paired_machines(&sim)?;
         let managed_right = Managed::start(&sim, &beacon, &right, &right_store)?;
         let managed_left = Managed::start(&sim, &beacon, &left, &left_store)?;
-        let (small, large, small_managed, large_managed, small_store) =
+        let (small, large, small_managed, large_managed, large_store) =
             if left.peer_id() < right.peer_id() {
-                (&left, &right, &managed_left, &managed_right, &left_store)
+                (&left, &right, &managed_left, &managed_right, &right_store)
             } else {
-                (&right, &left, &managed_right, &managed_left, &right_store)
+                (&right, &left, &managed_right, &managed_left, &left_store)
             };
         // The smaller fingerprint's dial is the one the tie-break keeps.
         within(
@@ -800,19 +811,15 @@ pub(crate) fn tie_break_drop_records_no_address() -> Result<(), String> {
         )
         .await?
         .map_err(|error| error.to_string())?;
-        let dialled = large.addr();
-        // The larger machine moves, and the record learns where its authenticated data
-        // now arrives from, as a previous accept would have written it.
-        let moved = large.rebind_next();
-        if moved == dialled {
-            return Err("the rebind did not move the machine".to_owned());
-        }
-        small_store
-            .record_address(&large.peer_id(), moved)
+        // The larger machine's record is given an address no dial of this run could produce, so a
+        // write by its losing dial would be visible. It is tried and fails, which is the point:
+        // the address is a hint, not a promise.
+        let sentinel = SocketAddr::from(([10, 9, 9, 9], 1));
+        large_store
+            .record_address(&small.peer_id(), sentinel)
             .map_err(|error| error.to_string())?;
-        // The larger dials from its new address. Its dial loses the tie-break to the
-        // connection the smaller started, so the smaller keeps that connection — the
-        // one it dialled to `dialled` — and must not copy that address into the record.
+        // The larger dials the smaller. Its handshake completes and loses the tie-break to the
+        // connection the smaller started.
         within(
             &sim,
             Duration::from_secs(60),
@@ -824,19 +831,19 @@ pub(crate) fn tie_break_drop_records_no_address() -> Result<(), String> {
         .map_err(|error| error.to_string())?;
         sim.clock().advance(Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
-        // The drop this case is about really happened: the smaller still holds the
-        // connection it dialled, not the larger machine's incoming one.
+        // The drop this case is about really happened: the smaller still holds the connection it
+        // dialled, not the larger machine's incoming one.
         if small_managed.connections.started_by(&large.peer_id()) != Some(Started::Here) {
             return Err(
                 "the tie-break kept the larger machine's dial, so no drop was produced".to_owned(),
             );
         }
-        let record = small_store
-            .get(&large.peer_id())
-            .ok_or("the smaller machine kept no record")?;
-        if record.last_address() != Some(moved) {
+        let record = large_store
+            .get(&small.peer_id())
+            .ok_or("the larger machine kept no record")?;
+        if record.last_address() != Some(sentinel) {
             return Err(format!(
-                "the record holds {:?}, not the address authenticated data arrived from {moved}",
+                "the losing dial wrote {:?} over the address the record held",
                 record.last_address()
             ));
         }
@@ -907,7 +914,7 @@ pub(crate) fn reconnect_cause_names_the_remembered_address() -> Result<(), Strin
             manager.connect(&endpoint, &peer.fingerprint()),
         )
         .await?;
-        match failure {
+        match &failure {
             Err(ConnectFailure::BeaconUnreachable { cause, .. })
                 if cause.contains(&silent_addr.to_string()) && cause.contains("no beacon") => {}
             other => {
@@ -915,6 +922,17 @@ pub(crate) fn reconnect_cause_names_the_remembered_address() -> Result<(), Strin
                     "a failed remembered dial was reported as {other:?}"
                 ));
             }
+        }
+        // The sentence must not assert a beacon either: there is none, and the prefix claims only
+        // that the peer was not reached.
+        let Err(error) = &failure else {
+            return Err("a failed remembered dial answered a connection".to_owned());
+        };
+        let sentence = error.to_string();
+        if !sentence.starts_with("could not reach") {
+            return Err(format!(
+                "the refusal asserts a beacon when none is configured: {sentence}"
+            ));
         }
         Ok(())
     })
@@ -4358,21 +4376,24 @@ pub(crate) fn a_learned_address_reopens_a_stop() -> Result<(), String> {
                     .to_owned(),
             );
         }
-        // The hint is not the record's: with that connection gone the left has nowhere to go
-        // again, and stops again.
+        // A completed dial is authenticated data, so the address the hint reached is in the
+        // record now and the pair has somewhere to dial: it does not stop.
+        if left_store
+            .get(&right.peer_id())
+            .and_then(|record| record.last_address())
+            != Some(right.addr())
+        {
+            return Err(
+                "the address a completed hinted dial reached was not remembered".to_owned(),
+            );
+        }
         let (state, failure) = left_manager
             .ensure(&left_endpoint, &right.fingerprint())
             .await;
-        if !matches!(
-            state,
-            Recovery::Stopped {
-                cause: StopCause::Nowhere
-            }
-        ) || !matches!(failure, Some(ConnectFailure::Nowhere { .. }))
-        {
+        if failure.is_some() || matches!(state, Recovery::Stopped { .. }) {
             return Err(format!(
-                "after a hinted connection went, the pair read `{state}` / `{failure:?}`, not a \
-                 stop with nowhere to dial"
+                "the pair stopped although a completed dial left an address: `{state}` / \
+                 `{failure:?}`"
             ));
         }
         // The right learned the left's address from accepting, so its dial reaches the left —
@@ -4774,18 +4795,29 @@ pub(crate) fn pair_recovers_after_the_beacon_returns() -> Result<(), String> {
             }
         })
         .await?;
-        // Both records now remember an address that answers nothing, as a pair whose path
-        // changed does: only the beacon can say where the machines are.
+        // Both records are rebuilt to remember one address that answers nothing, as a
+        // restored backup that predates a working address leaves them: only the beacon can
+        // say where the machines are. A completed dial would otherwise have left a working
+        // address behind, and the pair would not need the beacon at all.
         let stale_for_left = sim.link().alloc_addr();
         let stale_for_right = sim.link().alloc_addr();
         sim.link().silence(stale_for_left);
         sim.link().silence(stale_for_right);
-        left_store
-            .record_address(&right.peer_id(), stale_for_left)
-            .map_err(|error| error.to_string())?;
-        right_store
-            .record_address(&left.peer_id(), stale_for_right)
-            .map_err(|error| error.to_string())?;
+        for (machine, peer, stale) in [
+            (&left, right.peer_id(), stale_for_left),
+            (&right, left.peer_id(), stale_for_right),
+        ] {
+            machine.storage().remove_record(&peer).map_err(io_error)?;
+            let store = machine
+                .reopen_records()
+                .map_err(|error| error.to_string())?;
+            store
+                .record_pairing(&peer, NOW)
+                .map_err(|error| error.to_string())?;
+            store
+                .record_address(&peer, stale)
+                .map_err(|error| error.to_string())?;
+        }
         // The beacon goes away, and both sides lose the connection they held.
         beacon.stop();
         managed_left.connections.disconnect(&right.peer_id());
@@ -4900,11 +4932,10 @@ pub(crate) fn pair_recovers_after_the_beacon_returns() -> Result<(), String> {
 /// machine's own re-check: the remembered address answers nothing, the beacon answers with
 /// the new one, and the pair connects with nobody dialling.
 ///
-/// What the record learns is the accepting side's business. The dialling side never writes
-/// the address it dialled, so the left's record still remembers the stale port after the
-/// pair is back; the case then lets the right dial — its own record has the left's address,
-/// which never moved — and shows the left's record corrected by its own accept, which is
-/// where an address comes from.
+/// What the record learns is authenticated data on both sides: the dialling side remembers
+/// the address its dial completed at, and the accepting side remembers the source address
+/// the connection arrived from. The list keeps the address the peer moved from behind the
+/// new one, so the next dial tries the fresh address first.
 pub(crate) fn pair_recovers_after_the_peer_moves() -> Result<(), String> {
     block_on(async {
         let sim = Sim::new().map_err(io_error)?;
@@ -4967,41 +4998,29 @@ pub(crate) fn pair_recovers_after_the_peer_moves() -> Result<(), String> {
             .ok_or("the far side did not adopt the connection")?;
         exchange_done(&sim, &managed_right.connections, &left.peer_id()).await?;
         within(&sim, Duration::from_secs(10), round_trip(&live, &there)).await??;
-        // The dialling side wrote nothing: the record still remembers the port the peer
-        // left.
-        let remembered = left
+        // The address the dial completed at is authenticated data, so the record holds it:
+        // the peer answered there with the key this machine trusts. The address it moved from
+        // stays behind it in the list, so the next dial tries the fresh one first.
+        let record = left
             .reopen_records()?
             .get(&right.peer_id())
-            .and_then(|record| record.last_address());
-        if remembered != Some(stale) {
+            .ok_or("the left lost the peer's record")?;
+        if record.last_address() != Some(fresh) {
             return Err(format!(
-                "the dialling side rewrote the address it dialled: the record remembers \
-                 {remembered:?}, not the stale {stale}"
+                "the dialling side did not remember the address it completed at: the record \
+                 holds {:?}, not the fresh {fresh}",
+                record.last_address()
             ));
         }
-        // The accepting side is what teaches an address. The pair holds nothing, so the
-        // right's own connection is the one the left keeps — and records.
-        managed_left.connections.disconnect(&right.peer_id());
-        let right_keeper = spawn_keeper(&managed_right, &left);
-        drive_until(&sim, Duration::from_secs(120), || {
-            let address = left
-                .reopen_records()?
-                .get(&right.peer_id())
-                .and_then(|record| record.last_address());
-            if address == Some(fresh) {
-                Ok(())
-            } else {
-                Err(format!(
-                    "the accepting side did not record where the peer came from: the record \
-                     remembers {address:?}, not the fresh {fresh}"
-                ))
-            }
-        })
-        .await?;
+        if !record.addresses().contains(&stale) {
+            return Err(format!(
+                "the record lost the address the peer moved from: it holds {:?}",
+                record.addresses()
+            ));
+        }
         drop(left_presence);
         drop(right_presence);
         keeper.abort();
-        right_keeper.abort();
         Ok(())
     })
 }

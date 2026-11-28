@@ -16,7 +16,7 @@ use ring::rand::SecureRandom;
 use tempfile::TempDir;
 
 use crate::clock::MockClock;
-use crate::link::Link;
+use crate::link::{Link, Nat, Network};
 use crate::machine::{Machine, RootId};
 use crate::root::Root;
 
@@ -62,7 +62,35 @@ impl Sim {
 
     /// Create a machine: its own root with a key file in it, and its own address.
     pub fn machine(&self) -> io::Result<Machine> {
-        self.machine_on(self.root()?)
+        self.machine_on(self.root()?, None)
+    }
+
+    /// Create a machine behind its own network, at an address inside it.
+    ///
+    /// The machine's own address is the private one it sends from, and what a peer outside
+    /// dials is [`Link::external`] once the machine has sent something. Two machines behind
+    /// one network ask for it with [`Sim::machines_behind_one`].
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's refusal, as [`Sim::machine`] answers it.
+    pub fn machine_behind(&self, nat: Nat) -> io::Result<Machine> {
+        self.machine_on(self.root()?, Some(self.link.network(nat)))
+    }
+
+    /// Create two machines behind one network, as two machines in one home are.
+    ///
+    /// This is what the local-network row needs: the two reach each other through the
+    /// network's own private side, without a hairpin and without the outside.
+    ///
+    /// # Errors
+    ///
+    /// The filesystem's refusal, as [`Sim::machine`] answers it.
+    pub fn machines_behind_one(&self, nat: Nat) -> io::Result<(Machine, Machine)> {
+        let network = self.link.network(nat);
+        let first = self.machine_on(self.root()?, Some(network))?;
+        let second = self.machine_on(self.root()?, Some(network))?;
+        Ok((first, second))
     }
 
     /// Create a machine whose key is a copy of `original`'s, as restoring a backup
@@ -70,11 +98,12 @@ impl Sim {
     ///
     /// Two roots are two peers, and this is the one way they can share a key. The
     /// transport refuses a peer that presents this machine's own key, so such a
-    /// pair never connects; that refusal is a case of its own.
+    /// pair never connects; that refusal is a case of its own. The copy is restored
+    /// where the original sits: behind the same network, when it is behind one.
     pub fn clone_of(&self, original: &Machine) -> io::Result<Machine> {
         let root = self.root()?;
         original.root.copy_key_into(&root)?;
-        self.machine_on(root)
+        self.machine_on(root, original.network())
     }
 
     fn root(&self) -> io::Result<Root> {
@@ -82,16 +111,20 @@ impl Sim {
         Root::create(RootId::new(self.nonce, index), self.dir.path())
     }
 
-    fn machine_on(&self, root: Root) -> io::Result<Machine> {
+    fn machine_on(&self, root: Root, network: Option<Network>) -> io::Result<Machine> {
         let identity = root.load_identity()?;
         let records = root
             .records()
             .map_err(|error| io::Error::other(error.to_owned()))?;
+        let socket = match network {
+            Some(network) => self.link.attach_on(network),
+            None => self.link.attach_next(),
+        };
         Ok(Machine::new(
             identity,
             root,
             records,
-            self.link.attach_next(),
+            socket,
             self.link.clone(),
             self.clock.clone(),
         ))

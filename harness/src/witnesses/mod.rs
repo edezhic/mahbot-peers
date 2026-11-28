@@ -39,6 +39,7 @@ mod server;
 mod support;
 mod transfers;
 mod transport;
+mod traverse;
 
 /// Every recorded case this host can run, and the capability it speaks for.
 #[must_use]
@@ -709,9 +710,9 @@ const WITNESSES: &[Witness] = &[
         case: connection::reconnect_stops_after_both_fail,
     },
     Witness {
-        id: "four_failures_are_distinct",
-        capabilities: &["library.peer.connect.four_failures"],
-        case: connection::four_failures_are_distinct,
+        id: "failures_are_distinct",
+        capabilities: &["library.peer.connect.failures"],
+        case: connection::failures_are_distinct,
     },
     Witness {
         id: "manager_refuses_an_unwatchable_transport",
@@ -2153,8 +2154,131 @@ const WITNESSES: &[Witness] = &[
         capabilities: &["library.peer.transfer.progress"],
         case: transfers::a_write_the_stream_accepts_is_not_progress,
     },
+    Witness {
+        id: "a_home_router_punch_is_the_handshake",
+        capabilities: &[
+            "library.peer.traverse.punch",
+            "library.peer.traverse.not_audited",
+        ],
+        case: traverse::a_home_router_punch_is_the_handshake,
+    },
+    Witness {
+        id: "the_outcome_table",
+        capabilities: &["library.peer.traverse.outcome_table"],
+        case: traverse::the_outcome_table,
+    },
+    Witness {
+        id: "the_local_network_row",
+        capabilities: &["library.peer.traverse.local_network"],
+        case: traverse::the_local_network_row,
+    },
+    Witness {
+        id: "the_hairpin_row",
+        capabilities: &["library.peer.traverse.hairpin"],
+        case: traverse::the_hairpin_row,
+    },
+    Witness {
+        id: "without_a_hairpin_the_pair_does_not_connect",
+        capabilities: &["library.peer.traverse.hairpin"],
+        case: traverse::without_a_hairpin_the_pair_does_not_connect,
+    },
+    Witness {
+        id: "double_translation_connects",
+        capabilities: &["library.peer.traverse.double_translation"],
+        case: traverse::double_translation_connects,
+    },
+    Witness {
+        id: "udp_blocked_towards_the_peer_is_no_direct_path",
+        capabilities: &["library.peer.traverse.udp_blocked_peer"],
+        case: traverse::udp_blocked_towards_the_peer_is_no_direct_path,
+    },
+    Witness {
+        id: "udp_blocked_entirely_names_the_beacon",
+        capabilities: &["library.peer.traverse.udp_blocked_beacon"],
+        case: traverse::udp_blocked_entirely_names_the_beacon,
+    },
+    Witness {
+        id: "a_beacon_that_answered_is_not_unreachable",
+        capabilities: &["library.peer.traverse.beacon_answered"],
+        case: traverse::a_beacon_that_answered_is_not_unreachable,
+    },
+    Witness {
+        id: "a_wrong_key_is_its_own_answer",
+        capabilities: &["library.peer.traverse.wrong_key"],
+        case: traverse::a_wrong_key_is_its_own_answer,
+    },
+    Witness {
+        id: "the_wrong_key_reaches_a_pair_that_came_up_while_dialling",
+        capabilities: &["library.peer.traverse.wrong_key"],
+        case: traverse::the_wrong_key_reaches_a_pair_that_came_up_while_dialling,
+    },
+    Witness {
+        id: "a_candidate_from_the_network_is_filtered",
+        capabilities: &["library.peer.traverse.candidate_filter"],
+        case: traverse::a_candidate_from_the_network_is_filtered,
+    },
+    Witness {
+        id: "the_address_list_is_newest_first_and_bounded",
+        capabilities: &["library.peer.record.address_list"],
+        case: traverse::the_address_list_is_newest_first_and_bounded,
+    },
+    Witness {
+        id: "a_coordination_payload_never_reaches_a_ceremony",
+        capabilities: &["library.peer.presence.dispatch_by_kind"],
+        case: traverse::a_coordination_payload_never_reaches_a_ceremony,
+    },
+    Witness {
+        id: "a_coordination_payload_rearms_a_wait_at_most_once",
+        capabilities: &["library.peer.traverse.rearm"],
+        case: traverse::a_coordination_payload_rearms_a_wait_at_most_once,
+    },
+    Witness {
+        id: "several_dials_end_with_one_connection",
+        capabilities: &["library.peer.traverse.one_connection"],
+        case: traverse::several_dials_end_with_one_connection,
+    },
+    Witness {
+        id: "more_than_two_completed_dials_end_with_one_connection",
+        capabilities: &["library.peer.traverse.many_completed_dials"],
+        case: traverse::more_than_two_completed_dials_end_with_one_connection,
+    },
+    Witness {
+        id: "the_candidate_ceiling_is_enforced",
+        capabilities: &["library.peer.traverse.candidate_ceiling"],
+        case: traverse::the_candidate_ceiling_is_enforced,
+    },
+    Witness {
+        id: "a_punch_of_many_candidates_is_one_dial",
+        capabilities: &["library.peer.traverse.one_dial"],
+        case: traverse::a_punch_of_many_candidates_is_one_dial,
+    },
+    Witness {
+        id: "coordination_is_not_sent_while_a_ceremony_runs",
+        capabilities: &["library.peer.presence.coordination_quiet"],
+        case: traverse::coordination_is_not_sent_while_a_ceremony_runs,
+    },
+    Witness {
+        id: "a_stale_opening_does_not_hold_the_punch_off",
+        capabilities: &["library.peer.traverse.stale_opening"],
+        case: traverse::a_stale_opening_does_not_hold_the_punch_off,
+    },
+    Witness {
+        id: "a_completed_handshake_the_pair_did_not_keep_is_not_a_network_failure",
+        capabilities: &["library.peer.traverse.completed_not_kept"],
+        case: traverse::a_completed_handshake_the_pair_did_not_keep_is_not_a_network_failure,
+    },
+    Witness {
+        id: "a_withdrawn_peer_s_payload_causes_no_dial",
+        capabilities: &["library.peer.traverse.withdrawn_payload"],
+        case: traverse::a_withdrawn_peer_s_payload_causes_no_dial,
+    },
+    Witness {
+        id: "a_refusal_is_answered_beside_a_live_connection",
+        capabilities: &["library.peer.traverse.refusal_beside_a_connection"],
+        case: traverse::a_refusal_is_answered_beside_a_live_connection,
+    },
 ];
 
 // The host-independent part of the table, which the platform tables add to. This is
 // the floor that keeps a shrinking table from looking like a pass.
-const _: () = assert!(WITNESSES.len() >= 124, "the shared witness table shrank");
+const _: () = assert!(WITNESSES.len() >= 139, "the shared witness table shrank");

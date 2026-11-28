@@ -986,7 +986,7 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.peer.connect.direct",
-        "after pairing, two machines connect at the peer's own address — the beacon is asked once for the address because the pairing stored none, and the data path that follows touches no beacon — and carry data machine to machine",
+        "after pairing, two machines connect at the address the beacon names for the peer — the beacon is asked once because the pairing stored none, and the data path that follows touches no beacon — and carry data machine to machine",
     ),
     Capability::witnessed(
         "library.peer.connect.hint_first",
@@ -998,7 +998,7 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.peer.connect.beacon_second",
-        "when the remembered address is stale the beacon is asked after it, in that order, the fresh address it answers is dialed, and the dialing side does not rewrite the address it dialed",
+        "when the remembered address is stale the beacon is asked after it, in that order, the fresh address it answers is dialed, and the address that dial completed at is written to the record — a completed authenticated handshake is authenticated data — so the next dial reaches the peer without asking the beacon",
     ),
     Capability::witnessed(
         "library.peer.connect.stops",
@@ -1083,8 +1083,8 @@ const CAPABILITIES: &[Capability] = &[
         "in a checkout of this crate, write `fn f(c: mahbot_peers::peer::ConnectFailure) { match c { mahbot_peers::peer::ConnectFailure::Nowhere { .. } => {} } }` in a separate crate that depends on it: the build fails with `non-exhaustive patterns`, which is the property; then add `_ => {}` and it builds",
     ),
     Capability::witnessed(
-        "library.peer.connect.four_failures",
-        "the four failures — beacon unreachable, peer unknown, no direct path, not trusted — are reported as themselves, each with its own words, and none as another",
+        "library.peer.connect.failures",
+        "the failures — beacon unreachable, peer unknown, no direct path, a wrong key and not trusted — are reported as themselves, each with its own words, and none as another; the other four are one case, and a wrong key is the subject of `library.peer.traverse.wrong_key`",
     ),
     Capability::witnessed(
         "library.peer.connect.unwatchable_transport",
@@ -1096,7 +1096,7 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.peer.connect.one_per_pair",
-        "when both machines dial at once each keeps the connection started by the smaller fingerprint, both sides keep the same connection, each keeper is a direct path to the other machine's own address, and data crosses it",
+        "when both machines dial at once each keeps the connection started by the smaller fingerprint, both sides keep the same connection, each keeper reaches the other machine at the address its record remembers, and data crosses it",
     ),
     Capability::witnessed(
         "library.peer.connect.asymmetric_liveness",
@@ -1116,7 +1116,7 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.peer.connect.tie_break_teaches_no_address",
-        "a dial whose connection loses the tie-break to the pair's existing connection records no address: the record keeps the last address authenticated data arrived from, never the address this machine dialled, even when the kept connection is this machine's own outbound one",
+        "a dial whose connection loses the tie-break writes no address of its own: the record keeps the address the pair's kept connection is at — written by whichever reach adopted it — and the address the losing dial completed at is never copied over it",
     ),
     Capability::witnessed(
         "library.peer.connect.closed_not_live",
@@ -1178,7 +1178,7 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::witnessed(
         "library.peer.connect.remembered_cause",
-        "when the remembered address fails and no beacon is configured, the failure is `BeaconUnreachable` whose cause names the address and its dial failure and says no beacon is configured, not a claim that no address was remembered",
+        "when the remembered address fails and no beacon is configured, the failure is `BeaconUnreachable` whose cause names the address and its dial failure and says no beacon is configured, not a claim that no address was remembered, and whose rendered sentence says the peer could not be reached rather than asserting a beacon that does not exist",
     ),
     Capability::witnessed(
         "library.peer.connect.reconnect_after_restart",
@@ -1880,9 +1880,9 @@ const CAPABILITIES: &[Capability] = &[
     ),
     Capability::unproducible(
         "library.peer.connect.real_network",
-        "a direct path over a real network: two machines reach each other at their own addresses with no relay in the path",
-        "the suite opens no socket and starts no process, so no real path exists here; the simulated link proves the address and the topology, not the network",
-        "on two hosts with a reachable beacon: start the beacon, run one installation per host with its own storage root, pair them by the six-symbol comparison, then dial the peer and read `Connection::remote_address` — it is the peer's own address, the beacon's address never appears on the path, and `ss -u` on either host shows no relay",
+        "a direct path over a real network, punched where the networks translate: two machines behind ordinary home routers reach each other by dialling the address the beacon observed for the other while each sends its own candidate list inside the signed payload the beacon relays, the completed authenticated handshake being the connectivity check — no relay, no STUN exchange and no second socket in the path",
+        "the suite opens no socket and starts no process, so no real path exists here; the simulated link proves the topology, the translation model and the order the dials go in, not what a real router does, and the classes that do not connect are refused by construction rather than observed",
+        "on two hosts behind different home routers, with a reachable beacon: start the beacon, run one installation per host with its own storage root, pair them by the six-symbol comparison, then dial the peer once and leave a keeper running — the beacon lookup and the candidate exchange overlap, both sides dial each other's observed address in the same round trip, and `Connection::remote_address` is the peer's external address as this side's network presents it, never the beacon's; `ss -u` on either host shows no relay and no TURN allocation; the peer's record then holds the address the punch completed from, so the next dial reaches the peer without asking the beacon again. Two machines in one local network connect the same way once the product declares each machine's own address, with the router's hairpin never asked for",
     ),
     Capability::unproducible(
         "library.peer.record.crash_mid_publish",
@@ -2415,6 +2415,104 @@ const CAPABILITIES: &[Capability] = &[
         "a transfer between two hosts on a real path runs at the rate the path allows and not at the rate the crate can hash, with the socket's buffers sized by the caller",
         "no host here can produce a real link: the rig has no bandwidth model. The harness delivers every datagram through an in-memory socket on a clock the test moves, so a transfer's rate is the number of scheduler turns the case gave it, and no case can say what a gigabit path or a 100 ms round trip does to it. What the rig can pin is the part that decides the rate — the windows `MAX_BUFFERED_BYTES` and `MAX_STREAM_BYTES` and the one chunk the sender holds — and that is `library.net.buffer_bound` and `library.peer.transfer.round_trips`",
         "On two hosts with a 1 Gbit/s path between them, install the product on each (or build a small binary against this crate) and give each its own storage root. Pair the two machines, and put a 1 GiB file in one product's source. Shape the path to a 100 ms round trip on both hosts with `tc qdisc add dev eth0 root netem delay 50ms`, naming the interface that carries the path in place of `eth0`, then start the transfer and read the product's own rate: it must be at least 50 MB/s. Repeat with the path shaped to 200 ms (`tc qdisc add dev eth0 root netem delay 100ms`), where it must be at least 25 MB/s. Sizing the socket's buffers is the caller's job: the product sets `SO_SNDBUF` and `SO_RCVBUF` on the socket before binding it, and the macOS defaults are far too small for a path like this, so a run with the defaults measures the kernel's buffer and not this crate. What the two runs must show is that the crate is not the bottleneck — the rate follows the path and the window, not the hashing",
+    ),
+    Capability::witnessed(
+        "library.peer.traverse.punch",
+        "a pair behind two ordinary home routers connects on the first dial by both sides dialling each other's beacon-observed address at once, the connection carries application data, the address each side reached is the other's external one, the rig shows each side's filter admitting a source it had itself sent to — a punch, not a lucky redial — and each side's record then holds the address the punch completed from, so the next dial needs no beacon",
+    ),
+    Capability::witnessed(
+        "library.peer.traverse.outcome_table",
+        "the mapping × filtering × pooling table in `connect`'s documentation is the crate's behaviour row for row: every row that states a connection ends with exactly one connection, and every row that states none refuses both dials with `NoDirectPath` and never with a beacon claim, and each failing row answers within the public `DIAL_BUDGET`",
+    ),
+    Capability::witnessed(
+        "library.peer.traverse.local_network",
+        "two machines behind one network connect at each other's declared local address, with the hairpin never used, because the product declared where its machine is",
+    ),
+    Capability::witnessed(
+        "library.peer.traverse.hairpin",
+        "two machines behind one network with no declared address connect through the network's hairpin when it has one, the rig records the hairpin, and the same pair refuses with no direct path when it has none",
+    ),
+    Capability::witnessed(
+        "library.peer.traverse.double_translation",
+        "a machine behind two networks in a row reaches, and is reached by, a machine behind one",
+    ),
+    Capability::witnessed(
+        "library.peer.traverse.udp_blocked_peer",
+        "a network that blocks UDP towards one peer only is reported as no direct path, with the candidate set it tried and without naming the beacon, which answered",
+    ),
+    Capability::witnessed(
+        "library.peer.traverse.udp_blocked_beacon",
+        "a machine whose UDP is blocked entirely is reported as a beacon that cannot be reached, and the sentence names the other cause it cannot rule out",
+    ),
+    Capability::witnessed(
+        "library.peer.traverse.beacon_answered",
+        "a beacon that answered without an address — it refused the lookup or speaks another version — is reported as itself, never as a beacon that could not be reached, and never with the clause about a network that may block UDP, because the answer has just ruled that out",
+    ),
+    Capability::witnessed(
+        "library.peer.traverse.wrong_key",
+        "an address that completed a handshake proving a key which is not the peer's is reported as `ConnectFailure::WrongPeer`, naming the peer asked for, the key that answered and the address, and outranking the beacon and network answers the dial went on to collect; the fact survives the pair coming up while the dial was still trying — `connect_with` answers it even when the pair is already up, and `ensure` answers it beside `Recovery::Connected` when its own dial met it, because the pair being up says nothing about that address — and the address is then dropped from the record, so the next dial does not meet it again",
+    ),
+    Capability::witnessed(
+        "library.peer.traverse.not_audited",
+        "a punch is not a person's decision: a completed punch writes nothing to either machine's audit log",
+    ),
+    Capability::unproducible(
+        "library.peer.traverse.ipv6_candidate",
+        "a candidate list carrying an IPv6 address is carried, filtered by the same rule and dialled, and the pair ends with one connection",
+        "the rig models IPv4 only: the link hands out IPv4 addresses and nothing in it produces or routes an IPv6 one, so no case here can put an IPv6 candidate on the wire. The crate itself carries any family — the candidate payload and the peer record use the same family-tagged address codec the ceremony does — and the filter refuses IPv6 loopback, link-local and multicast and gates a unique-local address on a declared one in the same block.",
+        "On two hosts with global IPv6 addresses, run one installation per host with its own storage root, pair them by the six-symbol comparison, and dial the peer. Read `Connection::remote_address`: it is an IPv6 address, the pair ends with one connection, and `ss -un` on either host shows the flow on it.",
+    ),
+    Capability::witnessed(
+        "library.peer.traverse.candidate_filter",
+        "a candidate that arrived from the peer is refused when it is loopback, and a private one is refused unless the product declared this machine's own address in the same block — the whole RFC 1918 block or the carrier-shared 100.64/10; the caller's hint is dialled as it stands",
+    ),
+    Capability::witnessed(
+        "library.peer.record.address_list",
+        "the record remembers up to four addresses newest first, the single-address field keeps the newest for an older reader, an older build's single-address update lands at the head of the list, and the list survives a fresh open",
+    ),
+    Capability::witnessed(
+        "library.peer.presence.dispatch_by_kind",
+        "the one reader dispatches by payload kind: a coordination payload and an unrecognised payload wake no ceremony, and a ceremony flight still reaches the ceremony waiting for that peer",
+    ),
+    Capability::witnessed(
+        "library.peer.traverse.rearm",
+        "a coordination payload moves a waiting pair's next dial to now, at most once per `PUNCH_REARM` — a duplicate inside the interval does nothing — and no payload moves a pair that is dialling, connected, stopped or watched by nobody: a pair whose episode is used up is not moved at all, and the interval bounds the re-arm, not the keeper's own trust read, which every wake costs",
+    ),
+    Capability::witnessed(
+        "library.peer.traverse.one_connection",
+        "both sides dial every candidate at once, each side's own dials and the peer's together, and the pair still ends with exactly one connection, which carries application data",
+    ),
+    Capability::witnessed(
+        "library.peer.traverse.many_completed_dials",
+        "more than two handshakes complete at once — one identity answering at three remembered addresses — and the pair still ends with exactly one connection: the left keeps one and closes the other two, and the two machines whose connections it closed hold nothing afterwards, which is what proves three went through the rule rather than two",
+    ),
+    Capability::witnessed(
+        "library.peer.traverse.one_dial",
+        "a punch that tries the maximum candidates and reaches none counts one dial of the recovery episode, not one per candidate",
+    ),
+    Capability::witnessed(
+        "library.peer.traverse.candidate_ceiling",
+        "a payload naming the maximum candidates makes the punch dial no more than `MAX_CANDIDATES` addresses, a payload naming one more is refused whole so the punch dials only the beacon's observed address",
+    ),
+    Capability::witnessed(
+        "library.peer.presence.coordination_quiet",
+        "a candidate list is never sent to a peer while a ceremony with that peer is running, because an older build ends its ceremony on a payload outside its closed set — as far as this machine can see; a payload that arrives before an older build's opening does is the one window the crate cannot close and the docs name",
+    ),
+    Capability::witnessed(
+        "library.peer.traverse.stale_opening",
+        "a pairing that was started and never finished does not hold the punch off: a held opening whose sender has given up is not a running ceremony, and it is retired when the manager asks, so the candidate exchange resumes after one attempt's worth of waiting instead of never happening again for that peer",
+    ),
+    Capability::witnessed(
+        "library.peer.traverse.completed_not_kept",
+        "a handshake that completed and whose connection the pair did not keep is refused as itself — the cause names the completion and carries no advice to change networks and no clause about a blocked network, because the network is what worked",
+    ),
+    Capability::witnessed(
+        "library.peer.traverse.withdrawn_payload",
+        "a peer this machine no longer trusts cannot turn a coordination payload into a dial: the same push that ends a trusted pair's wait and makes the keeper dial puts no datagram on the wire once trust is withdrawn, and the pair stops naming the withdrawal instead",
+    ),
+    Capability::witnessed(
+        "library.peer.traverse.refusal_beside_a_connection",
+        "a refusal is answered as itself even when the pair holds a connection — a live connection does not change a decision this machine made — and the refusal does not take that connection down",
     ),
 ];
 

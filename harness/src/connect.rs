@@ -15,6 +15,12 @@
 //! returned whichever connection came first would hand two attempts each other's
 //! halves. An endpoint the caller built serves one attempt and files anything
 //! else it is offered into the same inbox.
+//!
+//! A network between the two machines breaks the address rule: the endpoint the server
+//! sees is the one the dialer's network translated its datagram to, so nothing about the
+//! dialer's own address matches it. A case that wants that path uses the connection
+//! manager's punch (`witnesses::traverse`), which takes the connection by the handshake's
+//! own authentication — the pinned key — rather than by the address the server saw.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -63,9 +69,11 @@ impl PeerPolicy for TrustSet {
 /// What a machine's endpoint trusts: the in-memory set a case fills with
 /// `Machine::trust`, and the durable records a person wrote.
 ///
-/// The peer-layer cases use the record half; the transport cases use the set. One
-/// endpoint serves both, because a machine has one socket and the endpoint built
-/// over it is the one a beacon session and a peer dial share.
+/// The peer-layer cases use the record half; the transport cases use the set. A peer-layer case
+/// fills the set only to separate the two decisions the crate keeps apart: an endpoint that admits
+/// a certificate while the record says nothing of the peer is a handshake that completes and a
+/// connection the connection manager then refuses. One endpoint serves both, because a machine has
+/// one socket and the endpoint built over it is the one a beacon session and a peer dial share.
 #[derive(Debug)]
 pub struct Policy {
     pub trust: Arc<TrustSet>,
@@ -197,6 +205,12 @@ pub struct Pair {
 pub const DEFAULT_CONNECT_BUDGET: Duration = Duration::from_secs(10);
 
 /// Connect `from` to `to`, both of which must trust each other.
+///
+/// The dial goes to `to`'s own address and the server takes the connection its
+/// dialer filed: that is a direct path, and it is what a case uses when the two
+/// machines can reach each other's addresses. A network between them needs the
+/// manager's punch instead, because the endpoint the server sees is the network's,
+/// not the dialer's.
 ///
 /// # Errors
 ///

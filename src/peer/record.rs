@@ -4,9 +4,10 @@
 //!
 //! One file per peer, named by the 64 hex characters of the peer's key, in a
 //! `peers/` directory beside the key file. It has two levels. The machine's is the
-//! peer's key, when a person made the comparison, the last address authenticated data
-//! arrived from, the failures counted so far, any unfinished attempt with its expiry,
-//! and whether a person withdrew this machine's trust. The connection's, whose
+//! peer's key, when a person made the comparison, the addresses authenticated data
+//! arrived from or a dial completed at — newest first — the failures counted so far,
+//! any unfinished attempt with its expiry, and whether a person withdrew this
+//! machine's trust. The connection's, whose
 //! vocabulary is [`crate::peer::access`], is the account on the instance and the
 //! assistant the peer is bound to, the claim the other side's decision left here, the
 //! pairs the default has acted for, and one right per pair and capability. The key is
@@ -18,18 +19,28 @@
 //!
 //! `mahbot-peer-record`, one version byte, then fields: `[tag][len u16 big-endian]
 //! [body]`. Version 1's tags are `0x01` the key (32 bytes), `0x02` the pairing
-//! moment (8, seconds), `0x03` the address (family, address, port, and for IPv6 the
-//! flow info and scope id), `0x04` the failures (1), `0x05` the attempt (8 expiry,
+//! moment (8, seconds), `0x03` the newest address (family, address, port, and for IPv6
+//! the flow info and scope id), `0x04` the failures (1), `0x05` the attempt (8 expiry,
 //! 4 lifetime seconds), `0x06` the trust withdrawal's moment (8), `0x07` the binding
 //! (`peer::access`'s body), `0x08` the claim (the other side's fact, byte for byte),
 //! `0x09` one pair's default marker (the assistant's label and 8 seconds), `0x0a`
-//! one right (`peer::access`'s body), and `0x0b` the most recent withdrawal's moment
-//! (8), kept after a return so the action memory knows what to forget. A field this
+//! one right (`peer::access`'s body), `0x0b` the most recent withdrawal's moment
+//! (8), kept after a return so the action memory knows what to forget, and `0x0c` the
+//! addresses (a count and that many addresses, newest first). A field this
 //! build does not know is kept and
 //! written back, after the fields it knows: a rewrite may move it, which changes no
 //! meaning. A right naming a capability this build does not know is kept the same way
 //! and satisfies nothing. The file is named by the 64 lowercase hex characters of the
 //! key.
+//!
+//! `0x03` and `0x0c` say the same thing at two widths, and that is deliberate: `0x03`
+//! is what an older build reads, `0x0c` is the list this build keeps, and both are
+//! written so either build's rewrite is read back the same way. The newest address is
+//! the single field and the head of the list; a read puts `0x03` in front of `0x0c`
+//! without it, so an older build's update of the single field becomes the new head. The
+//! list is a tag of its own rather than a second `0x03` because a repeated singleton
+//! field is refused as malformed — by this build and by an older one — so a second
+//! `0x03` would make the record unreadable on both sides of the upgrade.
 //!
 //! # The format is a compatibility surface
 //!
@@ -164,8 +175,26 @@ const MAGIC: &[u8] = b"mahbot-peer-record";
 /// this version's prefix and its unknown fields are preserved; see the module docs.
 const VERSION: u8 = 1;
 
-/// The most bytes a record may have. The machine level alone is under a hundred
-/// bytes; the connection level adds a binding, a claim, one default marker per pair
+/// The most addresses the peer record keeps for one peer; newest first.
+///
+/// Beside the single-address field an older build reads, so a newer record still gives an older
+/// build an address, and bounded so a peer that moves cannot grow the file without limit. The
+/// list is written after the single address, and [`PeerRecord::addresses`] composes the two on
+/// read and is the one place the list's order and its eviction are stated.
+///
+/// This is a permanent format bound, like the shape of a right's body: a reader refuses a count
+/// above it as malformed, which stops the pair, so a later build that needs more addresses adds a
+/// new tag rather than raising it. Raising it would write records every earlier build treats as
+/// unreadable — an un-pairing by format change, which the format never does.
+pub const MAX_REMEMBERED_ADDRESSES: usize = 4;
+
+/// The list's count is one byte on the wire, and every write path cuts the list here: a bound
+/// that stopped fitting would write a record this build refuses to read back.
+const _: () = assert!(MAX_REMEMBERED_ADDRESSES <= u8::MAX as usize);
+
+/// The most bytes a record may have. The machine level alone is about 250 bytes — the key, the
+/// moments, the single address an older build reads, and up to four more at the widest an address
+/// encoding goes; the connection level adds a binding, a claim, one default marker per pair
 /// and five rights per pair, and a machine moved between assistants keeps the pairs
 /// it left. Nine pairs with every right a person can grant, every label at its own cap,
 /// still fit beside the binding and the claim — about 13.6 KiB — and a product's
@@ -192,6 +221,8 @@ mod tag {
     pub const RIGHT: u8 = 0x0a;
     /// The most recent withdrawal's moment, kept after a return. Tag 0x0b, appended.
     pub const LAST_WITHDRAWN: u8 = 0x0b;
+    /// The addresses this machine remembers for the peer, newest first. Tag 0x0c, appended.
+    pub const ADDRESSES: u8 = 0x0c;
 }
 
 /// A moment the caller supplies. The library never reads a clock.
@@ -296,7 +327,9 @@ pub struct PeerRecord {
     /// newer build wrote is still that build's after an older one touched it.
     version: u8,
     paired_at: Option<Timestamp>,
-    last_address: Option<SocketAddr>,
+    /// The addresses this machine remembers for the peer, newest first. See
+    /// [`Self::last_address`] for what may be written here.
+    addresses: Vec<SocketAddr>,
     failures: u8,
     attempt: Option<Attempt>,
     /// When this machine withdrew its trust in the peer. The rights the peer held
@@ -335,7 +368,7 @@ impl PeerRecord {
             key,
             version: VERSION,
             paired_at: None,
-            last_address: None,
+            addresses: Vec::new(),
             failures: 0,
             attempt: None,
             withdrawn_at: None,
@@ -370,14 +403,38 @@ impl PeerRecord {
         self.paired_at.is_some()
     }
 
-    /// The last address authenticated data arrived from that peer.
+    /// The newest address this machine remembers for the peer.
     ///
-    /// The source address of an accepted connection: the address the peer can be
-    /// dialed back at. It is never the address this machine dialed — that says
-    /// nothing about where the peer is — and never this machine's own appearance.
+    /// The rule for what may be written is *the source address of an accepted connection the
+    /// tie-break kept, or the address a dial completed at when that dial is the connection the
+    /// pair kept*: a completed authenticated handshake is authenticated data — the peer answered
+    /// at that address, with the key this machine trusts — and a dial that loses the tie-break
+    /// writes nothing, so it cannot overwrite the address the pair's connection is at. It is
+    /// **never** an address that arrived only as a hint from the network: not the caller's hint,
+    /// not a candidate a peer named, and not the address the beacon observed. And it is never this
+    /// machine's own appearance, which says where this machine is and nothing about the peer.
+    ///
+    /// This is the head of [`Self::addresses`], and the one address an older build reads from the
+    /// single-address field.
+    ///
+    /// An address leaves the list when a handshake at it proves a key which is not the peer's:
+    /// the claim above is then disproved, so the address is dropped and the next dial does not
+    /// meet it again.
     #[must_use]
-    pub const fn last_address(&self) -> Option<SocketAddr> {
-        self.last_address
+    pub fn last_address(&self) -> Option<SocketAddr> {
+        self.addresses.first().copied()
+    }
+
+    /// Every address this machine remembers for the peer, newest first. The first is the one an
+    /// older build reads from the single-address field.
+    ///
+    /// The same rule decides what is written as for [`Self::last_address`]. The order is the order
+    /// the addresses are reported in, the order an older build's single field is taken from, and
+    /// the order they are evicted in — the newest first and the oldest last. It is not a schedule:
+    /// a dial tries every address at once.
+    #[must_use]
+    pub fn addresses(&self) -> &[SocketAddr] {
+        &self.addresses
     }
 
     /// How many failed comparisons this machine has counted.
@@ -504,7 +561,7 @@ impl PeerRecord {
     /// file behind.
     fn is_empty(&self) -> bool {
         self.paired_at.is_none()
-            && self.last_address.is_none()
+            && self.addresses.is_empty()
             && self.failures == 0
             && self.attempt.is_none()
             && self.withdrawn_at.is_none()
@@ -732,18 +789,52 @@ impl RecordStore {
         .map(drop)
     }
 
-    /// Record `address` as the last address authenticated data arrived from.
+    /// Record `address` as the newest address this machine remembers for `peer`.
     ///
-    /// The address is a hint that saves a beacon trip, not identity; it is
-    /// published and flushed like any other write, and an address that did not
-    /// change is not rewritten.
+    /// The list is the peer's addresses newest first, and this moves `address` to its front —
+    /// removing any older place it held — then keeps at most [`MAX_REMEMBERED_ADDRESSES`] of
+    /// them. The eviction order is therefore oldest last: the address this machine has used least
+    /// recently is the one that goes. [`PeerRecord::addresses`] states what that order is and is
+    /// not — the order the addresses are reported in, never a schedule.
+    ///
+    /// What may be written is [`PeerRecord::last_address`]'s rule: the source address of an
+    /// accepted connection, or the address a dial completed at. A hint that did not complete is
+    /// never written, and the address is a hint that saves a beacon trip and not identity — the
+    /// key is checked on every handshake — so it is published and flushed like any other write,
+    /// and a list that did not change is not rewritten. [`Self::forget_address`] is the opposite
+    /// move: an address the list remembers and which answers with another machine's key is
+    /// dropped.
     pub fn record_address(&self, peer: &PeerId, address: SocketAddr) -> Result<(), RecordError> {
         self.update(peer, |record, _| {
-            if record.last_address == Some(address) {
+            let addresses = address::distinct(
+                std::iter::once(address).chain(record.addresses.iter().copied()),
+                MAX_REMEMBERED_ADDRESSES,
+            );
+            if addresses == record.addresses {
                 return Ok(Change::Nothing);
             }
-            record.last_address = Some(address);
+            record.addresses = addresses;
             Ok(Change::Write)
+        })
+        .map(drop)
+    }
+
+    /// Stop remembering `address` for `peer`, because a handshake at it proved another machine's
+    /// key.
+    ///
+    /// Nothing else about the pair changes: an address is a hint that saves a beacon trip, the
+    /// peer is still paired, and the next completed handshake writes wherever the peer answers
+    /// from. [`crate::peer::recovery::ConnectFailure::WrongPeer`] states when this is called and
+    /// what a failed write costs.
+    pub fn forget_address(&self, peer: &PeerId, address: SocketAddr) -> Result<(), RecordError> {
+        self.update(peer, |record, _| {
+            let known = record.addresses.len();
+            record.addresses.retain(|remembered| *remembered != address);
+            Ok(if record.addresses.len() == known {
+                Change::Nothing
+            } else {
+                Change::Write
+            })
         })
         .map(drop)
     }
@@ -1543,10 +1634,22 @@ fn encode(record: &PeerRecord, path: &Path) -> Result<Vec<u8>, RecordError> {
             path,
         )?;
     }
-    if let Some(address) = record.last_address {
-        let mut body = Vec::with_capacity(27);
-        address::encode(&mut body, Some(address));
-        field(&mut bytes, tag::LAST_ADDRESS, &body, path)?;
+    if let Some(head) = record.addresses.first() {
+        // The single-address field is always written beside the list: an older build reads that
+        // one and nothing else, and a rewrite by it keeps the list as a field it does not know
+        // and updates this one, so the next read puts the new address in front.
+        let mut single = Vec::with_capacity(27);
+        address::encode(&mut single, Some(*head));
+        field(&mut bytes, tag::LAST_ADDRESS, &single, path)?;
+        let mut body = Vec::with_capacity(1 + record.addresses.len() * 27);
+        body.push(
+            u8::try_from(record.addresses.len())
+                .expect("an address list is capped at MAX_REMEMBERED_ADDRESSES, which fits a byte"),
+        );
+        for address in &record.addresses {
+            address::encode(&mut body, Some(*address));
+        }
+        field(&mut bytes, tag::ADDRESSES, &body, path)?;
     }
     field(&mut bytes, tag::FAILURES, &[record.failures], path)?;
     if let Some(attempt) = record.attempt {
@@ -1621,6 +1724,10 @@ fn decode(bytes: &[u8], expected: &PeerId) -> Result<PeerRecord, Malformed> {
     let mut record = PeerRecord::empty(*expected);
     record.version = version;
     let mut seen = Vec::new();
+    // The two address fields are composed after the whole field list is read, so the order they
+    // arrive in cannot change the answer.
+    let mut single: Option<SocketAddr> = None;
+    let mut listed: Vec<SocketAddr> = Vec::new();
     for field in tlv::Fields::new(rest) {
         let (tag, body) = field.map_err(|error| malformed(error.tag, error.detail))?;
         if matches!(
@@ -1628,6 +1735,7 @@ fn decode(bytes: &[u8], expected: &PeerId) -> Result<PeerRecord, Malformed> {
             tag::KEY
                 | tag::PAIRED_AT
                 | tag::LAST_ADDRESS
+                | tag::ADDRESSES
                 | tag::FAILURES
                 | tag::ATTEMPT
                 | tag::WITHDRAWN
@@ -1651,7 +1759,10 @@ fn decode(bytes: &[u8], expected: &PeerId) -> Result<PeerRecord, Malformed> {
                 record.paired_at = Some(Timestamp::from_unix_seconds(read_u64(tag, body)?));
             }
             tag::LAST_ADDRESS => {
-                record.last_address = Some(decode_address(tag, body)?);
+                single = Some(decode_address(tag, body)?);
+            }
+            tag::ADDRESSES => {
+                listed = read_addresses(tag, body)?;
             }
             tag::FAILURES => {
                 let [failures] = body else {
@@ -1690,7 +1801,44 @@ fn decode(bytes: &[u8], expected: &PeerId) -> Result<PeerRecord, Malformed> {
             found: record.key,
         });
     }
+    // The addresses a record carries, composed from the two fields that can carry them: the
+    // single-address field goes in front of the list, so a newer build's list and an older build's
+    // single-address update compose and newest first stays defined whichever of the two wrote
+    // last. A record with only the single field has a one-entry list; one with only the list uses
+    // it as written, because no single field means the older build never wrote one and the head of
+    // the list is still the newest.
+    record.addresses =
+        address::distinct(single.into_iter().chain(listed), MAX_REMEMBERED_ADDRESSES);
     Ok(record)
+}
+
+/// Read one `ADDRESSES` field: a count and that many addresses.
+///
+/// A count of zero, a count past [`MAX_REMEMBERED_ADDRESSES`], an address that does not decode
+/// and a byte after the last one are all this field being malformed: a list that does not read
+/// exactly is not a list this build may trust.
+fn read_addresses(tag: u8, body: &[u8]) -> Result<Vec<SocketAddr>, Malformed> {
+    let (&count, mut rest) = body
+        .split_first()
+        .ok_or_else(|| malformed(tag, "has no count"))?;
+    let count = usize::from(count);
+    if count == 0 || count > MAX_REMEMBERED_ADDRESSES {
+        return Err(malformed(
+            tag,
+            format!("names {count} addresses, not one to {MAX_REMEMBERED_ADDRESSES}"),
+        ));
+    }
+    let mut addresses = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (candidate, after) = address::decode(rest)
+            .ok_or_else(|| malformed(tag, "has an address that does not read"))?;
+        addresses.push(candidate.ok_or_else(|| malformed(tag, "has a missing address"))?);
+        rest = after;
+    }
+    if !rest.is_empty() {
+        return Err(malformed(tag, "has a byte after its last address"));
+    }
+    Ok(addresses)
 }
 
 /// A malformed record field, naming the tag it was found under.

@@ -1,5 +1,123 @@
 //! The per-machine connection manager: dialling, accepting, one connection per
-//! pair, and the four failures.
+//! pair, the punch, and the five failures.
+//!
+//! # The order
+//!
+//! One dial — [`Connections::connect`] — tries, in this order:
+//!
+//! 1. **The hint**, when the caller has one: an address the peer sent in an introduction, or
+//!    one a product was handed. One dial of it, bounded by the same budget as any other.
+//! 2. **Every address the record remembers** for the peer, newest first, all of them dialled at
+//!    once. They are equally authenticated — each completed a handshake once — so waiting for
+//!    four ten-second dials in turn would spend a budget on an order that says nothing. The order
+//!    is only the order they are reported in.
+//! 3. **The beacon**, and only when nothing above worked: the beacon is not consulted while an
+//!    earlier address works, which is what keeps a working pair off it entirely.
+//!
+//! A dial that completes a handshake at any of these addresses is the pair's connection, and the
+//! address is written to the record: a completed authenticated handshake is authenticated data.
+//! An address that arrived only as a claim — the caller's hint, a peer's candidate, the beacon's
+//! observation — is never written on the strength of the claim alone.
+//!
+//! # A punch
+//!
+//! The third step is where two machines behind network address translation can meet, and it is
+//! called a punch because that is what it is: both sides dial the other's *observed* address — the
+//! one the beacon sees on the machine's own registration — at the same time, so the packet that
+//! opens one side's mapping is the one the other side's filter admits.
+//!
+//! The connectivity check is the authenticated handshake itself. There is no STUN exchange, no
+//! second socket, no second protocol and no separate check phase: a punch dials addresses with
+//! exactly the code a remembered address is dialled with, and the handshake that proves the key
+//! is the same handshake that proves the path. What a punch adds is only *which* addresses are
+//! dialled and *when*.
+//!
+//! The set a punch dials is the beacon's observed address first, then the candidate list the peer
+//! sent, filtered by `crate::peer::traverse`'s rule, deduplicated, and capped at
+//! [`crate::peer::MAX_CANDIDATES`]. The candidate list travels in the signed, opaque introduction
+//! payload the beacon already relays, so the beacon gains no duty and no new frame: it carries a
+//! candidate list as it carries a ceremony flight. It is signed and not encrypted, so the beacon
+//! *can* read it — that exposure is named here rather than discovered, and it is the price of not
+//! adding a protocol the beacon would have to learn. The whole punch fits inside [`DIAL_BUDGET`]:
+//! one beacon exchange for the lookup and the introduction together, five seconds of waiting for
+//! the peer's list, and five seconds for the candidate dials themselves. A list the presence
+//! already holds is dialled at once unless it is older than `COORDINATION_FRESH`: a stale list is
+//! worth nothing, and waiting one window for a fresh one is the same punch a moment later.
+//!
+//! Candidates that arrive from the network are filtered; the caller's hint and the beacon's own
+//! observed address are not. A global address a paired peer names is still dialled, which is an
+//! accepted cost bounded by the ceiling and the re-arm interval. The rule is stated once, with
+//! the reasons, beside the filter itself in `crate::peer::traverse`.
+//!
+//! One rule governs sending a candidate list: it is never sent to a peer while a ceremony with
+//! that peer is running — the presence's `busy_with` — because an older build ends its ceremony on
+//! any payload outside its closed set. A list is worth one dial later; a person's comparison is
+//! not worth losing. A ceremony whose opening is still in flight is the one window this cannot
+//! see: `busy_with` answers for what this machine already knows, and a payload that arrives before
+//! the opening does can still end an older build's ceremony. The window is accepted and named in
+//! `crate::peer::presence`'s note.
+//!
+//! # The outcome table
+//!
+//! Let a side be its mapping, its filtering and its pooling. A punch is both sides dialling each
+//! other's beacon-observed address at the same time. A dial from A to B's observed address
+//! completes iff B's mapping is endpoint-independent — so the address B registered is valid for
+//! any source — **and** B's filtering admits A's mapping, where "admits" means:
+//!
+//! - endpoint-independent filtering: always;
+//! - address-dependent filtering: A's mapping has the same IP address as A's observed address,
+//!   which is true when A pools one external address across destinations;
+//! - address-and-port-dependent filtering: A's mapping is exactly A's observed address, which is
+//!   true only when A's mapping is endpoint-independent.
+//!
+//! The pair connects iff either direction completes. Each side's mapping therefore decides
+//! whether the other side's dial can complete at all, its filtering decides what it admits from
+//! the other side, and its pooling decides only what address-dependent filtering admits — so a
+//! row names a filtering only on the side whose dial is being admitted, and says "any filtering"
+//! where that side's filter never decides. "Destination-dependent mapping" is address-dependent
+//! and address-and-port-dependent together: neither is the observed endpoint, and the model does
+//! not distinguish them in any row. Every combination of mapping, filtering and pooling the model
+//! can be configured with is in one of rows 1–11, the shapes that are not a mapping and filtering
+//! pair are rows 12–18, and each row is a recorded case or — for the one the rig cannot produce —
+//! a declared gap with its reason:
+//!
+//! | # | A | B | outcome |
+//! |---|---|---|---|
+//! | 1 | endpoint-independent mapping + endpoint-independent filtering | the same | connects on the first dial |
+//! | 2 | endpoint-independent mapping + endpoint-independent filtering | endpoint-independent mapping + address-dependent filtering | connects |
+//! | 3 | endpoint-independent mapping + endpoint-independent filtering | endpoint-independent mapping + address-and-port-dependent filtering | connects |
+//! | 4 | endpoint-independent mapping + address-dependent filtering | the same | connects |
+//! | 5 | endpoint-independent mapping + address-dependent filtering | endpoint-independent mapping + address-and-port-dependent filtering | connects |
+//! | 6 | endpoint-independent mapping + address-and-port-dependent filtering | the same | connects |
+//! | 7 | destination-dependent mapping, any filtering, any pooling | endpoint-independent mapping + endpoint-independent filtering | connects (B's filter admits A) |
+//! | 8 | destination-dependent mapping, any filtering, one shared external address | endpoint-independent mapping + address-dependent filtering | connects (A's mapping has the address B wrote to) |
+//! | 9 | destination-dependent mapping, any filtering, a different external address per destination | endpoint-independent mapping + address-dependent filtering | does not connect (the address differs from the one B wrote to) |
+//! | 10 | destination-dependent mapping, any filtering, any pooling | endpoint-independent mapping + address-and-port-dependent filtering | does not connect: A's mapping is not A's observed endpoint, so B's filter refuses it, and B's dial does not survive A's destination-scoped mapping |
+//! | 11 | destination-dependent mapping, any filtering, any pooling | the same | does not connect (both observed addresses are destination-scoped) |
+//! | 12 | two machines behind one network, the product declares both local addresses | | connects locally, with no hairpin |
+//! | 13 | two machines behind one network, no declared address, hairpin translation on, endpoint-independent mapping and filtering | | connects through the hairpin |
+//! | 14 | two machines behind one network, no declared address, no hairpin | | does not connect (the hairpin is what would have carried it) |
+//! | 15 | one machine behind two networks in a row, endpoint-independent mapping and filtering at each, the other behind one | | connects |
+//! | 16 | UDP blocked towards the peer only | | no direct path |
+//! | 17 | UDP blocked entirely | | the beacon is unreachable |
+//! | 18 | an address of another family (IPv6) | | not producible by this crate's tests here: the rig models IPv4 only |
+//!
+//! Rows 1–6 hold whatever the pooling: an endpoint-independent mapping is the observed endpoint,
+//! so all three filters admit it. The classes are named and not counted. Nothing in this crate
+//! branches on them: the same dial runs whatever the pair is behind, and the table is what that
+//! one dial does.
+//!
+//! # What is not attempted, and why
+//!
+//! - **Interface enumeration.** This crate is handed one socket and reads no ambient state, so it
+//!   cannot enumerate the machine's interfaces portably — and a machine's local addresses are the
+//!   product's knowledge, not the library's. The product hands them in with
+//!   [`Connections::declares`], and they travel in the candidate list.
+//! - **Port mapping.** Asking a router to forward a port is a second protocol and a third-party
+//!   device, with no portable way to do it without a dependency this crate does not take.
+//! - **NAT classification.** The check is the handshake, and the outcome table above shows the
+//!   crate's behaviour does not branch on the class: a class would be a guess it cannot act on,
+//!   and a guess that costs a probe of its own.
 //!
 //! # Recovery
 //!
@@ -146,17 +264,25 @@
 //! address — one small blocking file read, and a write only when the address changed —
 //! on the task that took the connection, not on the loop: this crate has no blocking
 //! pool to hand it to, and that task is the one place a blocking read costs nothing else.
+//! A dial writes the address it completed at the same way, on the caller's own task; the
+//! rule for what may be written is one rule for both, and it is
+//! [`crate::peer::PeerRecord::last_address`]'s.
 //!
-//! # The four failures
+//! # The five failures
 //!
 //! The beacon cannot be reached; the beacon does not know the peer; the peer's
-//! address is known and no connection can be made; the peer is not trusted. Each
-//! is reported as itself and none as another, and "not trusted" is decided here and
-//! only here: its refusal text is diagnostic and may be forged, so it drives neither
-//! trust nor a retry. One more answer, [`ConnectFailure::Nowhere`], is not a failure of
-//! the network at all, and [`ConnectFailure::Deferred`] is not a failure of the peer: it
-//! says this machine could not read the record just now. Which of them is retried and which
-//! never is [`crate::peer::recovery`]'s note, which is the one place that contract is stated.
+//! address is known and no connection can be made; an address answered with a key
+//! that is not the peer's; the peer is not trusted. Each is reported as itself and
+//! none as another, and "not trusted" is decided here and only here: its refusal text
+//! is diagnostic and may be forged, so it drives neither trust nor a retry. A wrong
+//! key is the one per-address fault that becomes an answer of its own, because it is a
+//! security fact and not a network one; every other address fault stays on this machine in the
+//! punch's refusal, which names the addresses without it, while the beacon failures — which carry
+//! no set — name their addresses and their faults in the cause. One more answer,
+//! [`ConnectFailure::Nowhere`], is not a failure of the network at all, and
+//! [`ConnectFailure::Deferred`] is not a failure of the peer: it says this machine could
+//! not read the record just now. Which of them is retried and which never is
+//! [`crate::peer::recovery`]'s note, which is the one place that contract is stated.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -169,27 +295,42 @@ use std::time::{Duration, Instant};
 use quinn::{Connection, ConnectionError, Endpoint, Incoming, Runtime};
 use rustls::pki_types::CertificateDer;
 
-use crate::beacon::{BEACON_REQUEST_TIMEOUT, Beacon, sleep, timeout};
+use crate::beacon::{BEACON_REQUEST_TIMEOUT, Beacon, BeaconError, Session, sleep, timeout};
 use crate::identity::{Fingerprint, Identity, PeerId};
 use crate::net::{SERVER_NAME, Transport};
 use crate::peer::binding;
+use crate::peer::presence::Presence;
 use crate::peer::record::{PeerRecord, RecordError, RecordStore, Untrusted};
 use crate::peer::recovery::{ConnectFailure, NotTrustedCause, Recovery, StopCause, recheck};
+use crate::peer::traverse::{self, Candidates, PUNCH_DIAL_BUDGET, PUNCH_REARM, PUNCH_WINDOW};
 
 /// How long one dial or one handshake may take before it is reported as no path.
 const DEFAULT_CONNECT_BUDGET: Duration = Duration::from_secs(10);
 
-/// The longest one dial can take before it answers: the two addresses it may try first — the
-/// caller's hint and the one the record remembers — the beacon's own two exchanges, and the
-/// address the beacon names.
+/// The longest one dial can take before it answers: the hint and then the remembered set — two
+/// dials of their own — the beacon's own two exchanges, the wait for the peer's candidates, and
+/// the candidate dials.
 ///
 /// [`crate::peer::actions::ACTION_BUDGET`] holds this much back for the dial its record read waits
 /// for, so a dial a slow read delayed can still run to its own end. Public as one of the stated
-/// numbers a caller plans against: it is the part of an action's budget the read cannot touch, so
-/// a dial an action asked for may start as late as the budget less this much.
+/// numbers a caller plans against, and as the product-facing bound on one dial: this is how long a
+/// caller waits before an honest failure, and the punch fits inside it rather than extending it.
+///
+/// The parts, in the order a dial spends them: ten seconds for the hint and ten again for the
+/// remembered set, which is dialled all at once, [`BEACON_REQUEST_TIMEOUT`] for the session and
+/// again for the lookup and the introduction together, the punch's own five-second window for the
+/// peer's candidates, and its five-second budget for the candidate dials.
 pub const DIAL_BUDGET: Duration = Duration::from_secs(
-    (3 * DEFAULT_CONNECT_BUDGET.as_secs()) + (2 * BEACON_REQUEST_TIMEOUT.as_secs()),
+    (2 * DEFAULT_CONNECT_BUDGET.as_secs())
+        + (2 * BEACON_REQUEST_TIMEOUT.as_secs())
+        + PUNCH_WINDOW.as_secs()
+        + PUNCH_DIAL_BUDGET.as_secs(),
 );
+
+// The bound is a promise a caller plans against, so it is checked rather than remembered: a stage
+// added without re-arguing the sum fails the build here instead of quietly making every dial
+// longer than the number its callers were given.
+const _: () = assert!(DIAL_BUDGET.as_secs() == 60);
 
 /// How long a connection must stay up before the keeper counts it as one the peer
 /// keeps.
@@ -230,6 +371,10 @@ pub const VANISH_BOUND: Duration = Duration::from_secs(20);
 /// tasks may exist: a public address that is flooded with half-finished handshakes costs
 /// at most this many, and the accept loop stops pulling from the endpoint until one
 /// finishes.
+///
+/// It is not what throttles a punch: a punch dials at most [`crate::peer::MAX_CANDIDATES`]
+/// connections at once, well under this cap, and the cap's argument is about strangers flooding
+/// a public address rather than about a pair reaching itself.
 pub const ACCEPT_IN_FLIGHT: usize = 64;
 
 /// How often a keeper re-reads the pair's trust while a connection is up.
@@ -559,28 +704,43 @@ impl Drop for Round<'_> {
     }
 }
 
-/// What one try in the module's order produced — the dials, and the beacon leg before
-/// them — before it is folded into the failures.
-enum Try {
-    /// The pair's connection, ready to watch.
-    Kept { connection: Connection },
-    /// A handshake completed at `address`, but the tie-break dropped the connection
-    /// and no other took its place: a dial that carried nothing, not a failed dial.
-    /// [`Connections::connect_with`] answers with the pair's live connection when one
-    /// exists, and reports this cause only when the pair has none.
-    Dropped {
-        address: SocketAddr,
-        cause: &'static str,
-    },
-    /// The try failed with one of the four failures.
-    Failed(ConnectFailure),
-}
-
 /// The pair's live connection, or `None` when the pair has none or the recorded one has
 /// closed.
 fn open<'a>(pairs: &'a BTreeMap<PeerId, Live>, peer: &PeerId) -> Option<&'a Live> {
     let live = pairs.get(peer)?;
     live.connection.close_reason().is_none().then_some(live)
+}
+
+/// Where the beacon stage speaks: the machine's one registration, or a session the manager
+/// opened for this dial because the machine keeps no presence.
+///
+/// One type for the two, so the stage above asks for a lookup and an introduction without caring
+/// which it has. The difference that matters is stated where the leg is chosen: a presence's
+/// request rides the registration and never dials a second session, so the beacon keeps one
+/// registration per machine.
+enum Leg<'a> {
+    /// The presence's registration.
+    Presence(&'a Presence),
+    /// A session of the manager's own, opened for this dial.
+    Session(Session),
+}
+
+impl Leg<'_> {
+    /// Where `id` is, if the beacon has it registered.
+    async fn lookup(&self, id: &PeerId) -> Result<Option<SocketAddr>, BeaconError> {
+        match self {
+            Self::Presence(presence) => presence.lookup(id).await,
+            Self::Session(session) => session.lookup(id).await,
+        }
+    }
+
+    /// Hand `payload` to `to`, signed by this machine's key.
+    async fn introduce(&self, to: PeerId, payload: &[u8]) -> Result<(), BeaconError> {
+        match self {
+            Self::Presence(presence) => presence.introduce(to, payload).await,
+            Self::Session(session) => session.introduce(to, payload).await,
+        }
+    }
 }
 
 /// What one read of the pair's record answers; see [`Connections::standing`].
@@ -603,6 +763,14 @@ pub(crate) enum RecordRead {
 }
 
 impl RecordRead {
+    /// The record, when this read is trust.
+    fn trusted(&self) -> Option<&PeerRecord> {
+        match self {
+            Self::Trusted(record) => Some(record),
+            _ => None,
+        }
+    }
+
     /// The failure this read answers a dial with, or `None` when it is trust.
     fn refusal(&self, peer: Fingerprint) -> Option<ConnectFailure> {
         match self {
@@ -699,6 +867,11 @@ pub struct Connections {
     me: PeerId,
     store: RecordStore,
     beacon: Option<Beacon>,
+    /// The machine's one presence, when the caller keeps one: the punch carries candidates both
+    /// ways through it, and its registration is the session the beacon stage speaks on.
+    presence: Option<Arc<Presence>>,
+    /// Addresses the product declares this machine has; never read from anywhere else.
+    declared: Arc<Mutex<Vec<SocketAddr>>>,
     runtime: Arc<dyn Runtime>,
     /// How this machine's transport bounds a silent connection; see
     /// [`Self::vanish_bound`].
@@ -722,6 +895,7 @@ impl fmt::Debug for Connections {
         f.debug_struct("Connections")
             .field("me", &self.me)
             .field("beacon", &self.beacon.is_some())
+            .field("presence", &self.presence.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -778,6 +952,8 @@ impl Connections {
             me: me.peer_id(),
             store,
             beacon,
+            presence: None,
+            declared: Arc::new(Mutex::new(Vec::new())),
             runtime,
             idle_timeout: transport.idle_timeout,
             keep_alive: transport.keep_alive,
@@ -790,6 +966,64 @@ impl Connections {
             })),
             in_flight: AtomicUsize::new(0),
         })
+    }
+
+    /// Hand this manager the machine's one presence, so the punch can carry candidates both
+    /// ways: our payload is sent on the registration, and the peer's arrives through the one
+    /// reader.
+    ///
+    /// A manager without a presence still sends its candidates and dials the beacon's address;
+    /// it cannot receive the peer's, so its punch is one-sided. The presence and the beacon must
+    /// be over the same endpoint and identity — one registration, one socket — because the
+    /// address the beacon observes on the registration is the one the peer is told to dial.
+    ///
+    /// An [`Arc`] because a machine has one presence and more than one reader of it: a product
+    /// that runs a ceremony and a manager over the same machine hands both the same
+    /// registration, and the manager's `busy_with` is what keeps a candidate list away from a
+    /// ceremony that is still comparing.
+    #[must_use]
+    pub fn with_presence(mut self, presence: Arc<Presence>) -> Self {
+        self.presence = Some(presence);
+        self
+    }
+
+    /// Declare addresses this machine has, beyond the socket's own: the product's knowledge of
+    /// its own machine.
+    ///
+    /// They travel in the coordination payload, and they are the only way a private address a
+    /// peer names may be dialled — the filter admits a private candidate only when this machine
+    /// holds an address in the same RFC 1918 block. This is the product's set and nothing else:
+    /// the punch composes the endpoint's own local address after it when the list has room, so a
+    /// declared set that fills [`crate::peer::MAX_CANDIDATES`] leaves the socket's own address
+    /// out, and an unspecified one is never sent.
+    ///
+    /// Each call states the whole set: a later call replaces what an earlier one declared,
+    /// repeats are dropped, and the list is cut at [`crate::peer::MAX_CANDIDATES`]. Nothing here
+    /// reads the machine's interfaces: which addresses it has is the product's fact.
+    pub fn declares(&self, addresses: impl IntoIterator<Item = SocketAddr>) {
+        // The ceiling and the deduplication are [`Candidates`]'s, so a declared set is bounded by
+        // the same rule as the set a punch dials.
+        let declared = Candidates::new(
+            addresses
+                .into_iter()
+                .filter(|address| !address.ip().is_unspecified()),
+        );
+        *self
+            .declared
+            .lock()
+            .expect("the declared addresses are not poisoned") = declared.addresses().to_vec();
+    }
+
+    /// The addresses the product declared this machine has, as they were handed in.
+    ///
+    /// These travel in the coordination payload beside the endpoint's own local address, and
+    /// they are what opens the filter's private-address gate: the socket's own address is not a
+    /// declaration and opens nothing.
+    fn declared(&self) -> Vec<SocketAddr> {
+        self.declared
+            .lock()
+            .expect("the declared addresses are not poisoned")
+            .clone()
     }
 
     /// How long this machine takes to notice that a peer has gone silent, and whether it can
@@ -964,9 +1198,12 @@ impl Connections {
     /// This is the reason a queued message may cause a dial without becoming a dial per
     /// second: it moves one wait, it does not reset the count, so a peer that keeps accepting
     /// a connection and dropping it is still bounded by the episode. The crate's own queue and
-    /// the crate's own transfer layer are its only callers; a caller with a genuinely new
-    /// reason to start over — a fresh address — calls [`Self::wake`], and one that only wants
-    /// to dial calls [`Self::ensure`], which is paced the same way.
+    /// the crate's own transfer layer are its only callers; a coordination payload's re-arm is
+    /// the same transition, reached through [`Self::rearm`], which bounds it to one per
+    /// [`PUNCH_REARM`] and refuses a used-up episode — that guard lives there and not here,
+    /// because this method moves a used-up episode's next check as it moves any other wait. A
+    /// caller with a genuinely new reason to start over — a fresh address — calls [`Self::wake`],
+    /// and one that only wants to dial calls [`Self::ensure`], which is paced the same way.
     pub(crate) fn hurry(&self, peer: &PeerId) {
         self.settle_stale(peer);
         let now = self.runtime.now();
@@ -1057,7 +1294,8 @@ impl Connections {
 
     /// Connect to `peer`, trying `hint` first.
     ///
-    /// The order after the hint is the module's. `hint` is an address the peer sent
+    /// The order after the hint is the module's: the hint, then every address the record
+    /// remembers, then the beacon and its punch. `hint` is an address the peer sent
     /// in an introduction — its own, as the beacon observed it — and it is
     /// self-asserted: the handshake still proves the key. It is the carrier for "a fresh
     /// address for that peer", which is one of the reasons a fresh episode starts, so a hinted
@@ -1069,21 +1307,39 @@ impl Connections {
     /// the deferral it is, which moves the next dial to the deferral's own moment. The answer is
     /// then the state's own reason, so a fault never stands in for what the last dial met; a state
     /// that names nothing — a dial already in flight, or a pair already connected — answers the
-    /// fault itself, because the dial this call asked for is what could not proceed. A dial that
-    /// fails folds nothing into the policy: a failed dial here is not a dial the policy made, and a
-    /// caller that wants the policy's pacing calls [`Self::ensure`]. A dial that is kept is folded
-    /// in as the pair's next dial, so a pair a keeper runs for does not keep a stale wait or a
-    /// used-up episode across a connection that works.
+    /// fault itself, because the dial this call asked for is what could not proceed.
+    ///
+    /// A dial that reaches the peer is folded in as the pair's next dial, so a pair a keeper runs
+    /// for does not keep a stale wait or a used-up episode across a connection that works. A dial
+    /// that fails folds nothing — it is not a dial the policy made — with one exception: a pair
+    /// that came up while this dial was trying is folded in as this dial, the wrong key included,
+    /// because the policy must not keep a wait across a connection that works. A refusal or a
+    /// deferral folds nothing even then: the connection arrived some other way, and a stop this
+    /// dial respects has to stand. A caller that wants the policy's pacing calls [`Self::ensure`].
     ///
     /// A connection the handshake proves is the peer's is adopted under the tie-break and returned
     /// — which may be a different connection than the one this call made, if the peer's own dial
     /// won, and which a concurrent accept may replace a moment later. When this call's own dial
     /// loses the tie-break, the answer is the connection the pair kept: the caller asked to reach
-    /// the peer, and the peer is reached. Only when the tie-break drops the dial and the pair holds
-    /// nothing does this report [`ConnectFailure::NoDirectPath`], with the tie-break's cause. The
-    /// handle is a connection, not a promise: the pair's live one is [`Self::live`]. The address
-    /// this call dialed is not written to the record; see
-    /// [`crate::peer::PeerRecord::last_address`].
+    /// the peer, and the peer is reached. The same holds for a network failure — a beacon that
+    /// could not be reached, a peer the beacon does not know, no direct path: a punch runs both
+    /// directions at once, so the peer's own dial may have connected the pair while this one was
+    /// still trying, and a caller that asked to reach the peer is answered with the peer reached.
+    /// That is true for every caller of [`Self::connect`], not only for a dial the tie-break
+    /// dropped, and for those three network failures only. [`ConnectFailure::WrongPeer`] is the
+    /// exception: an address that proved a key which is not the peer's is a security fact, and the
+    /// pair's own connection does not disprove it, so it is answered as itself even when the pair
+    /// came up while this dial was still trying. [`ConnectFailure::NotTrusted`] and
+    /// [`ConnectFailure::Nowhere`] are answered as themselves whatever the pair holds, because a
+    /// live connection does not change a decision this machine made or a configuration it lacks. A
+    /// [`ConnectFailure::Deferred`] is answered with the state's own reason rather than with
+    /// itself, since the fault is this machine's read and not a fact about the peer, and a
+    /// [`ConnectFailure::NoDirectPath`] names every address it tried.
+    ///
+    /// The handle is a connection, not a promise: the pair's live one is [`Self::live`]. The
+    /// address this call dialled is written to the record only when the handshake at it completed,
+    /// because that is what makes it authenticated data; a hint that did not complete is never
+    /// written. See [`crate::peer::PeerRecord::last_address`].
     pub async fn connect_with(
         &self,
         endpoint: &Endpoint,
@@ -1098,8 +1354,8 @@ impl Connections {
             // that only still reads "dialling" or against a cause this call should ask about.
             self.wake(&peer_id);
         }
-        match self.try_peer(endpoint, peer, hint, None).await {
-            Try::Kept { connection, .. } => {
+        match Box::pin(self.try_peer(endpoint, peer, hint, None)).await {
+            Ok(connection) => {
                 // A dial the policy knows about: a pair a keeper runs for has this counted as
                 // its next dial, so a stale wait or a used-up episode does not outlive the
                 // connection. A pair no keeper runs for stays `Unwatched`: nothing will
@@ -1107,36 +1363,62 @@ impl Connections {
                 self.adopted_here(peer_id);
                 Ok(connection)
             }
-            Try::Dropped { address, cause } => {
-                // A dial the tie-break dropped is not a failed dial when the pair is
-                // connected: that connection is the answer.
-                if let Some(connection) = self.live(&peer.peer_id()) {
+            Err(failure) => {
+                // A punch runs both directions at once, and the peer's own dial may have reached
+                // this machine while this one was still trying, or this dial's other addresses
+                // may have. A connection that works is folded in as the dial the policy knows
+                // about, whatever this dial met, so a keeper does not keep a stale wait or a
+                // used-up episode across it.
+                //
+                // Only where the record said this machine trusts the peer: the failures a dial can
+                // reach only after that read passed. A refusal or a deferral may be answered while
+                // the pair holds a connection that arrived some other way, and folding it would
+                // clear a stop this dial exists to respect. No case pins the difference, because a
+                // stop closes what is live and refuses what arrives, so a stop and a live
+                // connection cannot both be true today — this is what keeps that from being an
+                // accident.
+                let reached = match failure {
+                    ConnectFailure::WrongPeer { .. }
+                    | ConnectFailure::BeaconUnreachable { .. }
+                    | ConnectFailure::PeerUnknown { .. }
+                    | ConnectFailure::NoDirectPath { .. }
+                    | ConnectFailure::Nowhere { .. } => self.live(&peer_id),
+                    ConnectFailure::NotTrusted { .. } | ConnectFailure::Deferred { .. } => None,
+                };
+                if reached.is_some() {
                     self.adopted_here(peer_id);
-                    return Ok(connection);
                 }
-                Err(ConnectFailure::NoDirectPath {
-                    peer: *peer,
-                    address,
-                    cause: cause.to_owned(),
-                })
+                match failure {
+                    // A wrong key is a security fact about an address, and the pair's own
+                    // connection does not disprove it: it is answered as itself.
+                    ConnectFailure::WrongPeer { .. } => Err(failure),
+                    // A network answer names no path, and that is the answer to *this* dial, not
+                    // to the pair: a caller that asked to reach the peer is answered with the
+                    // peer reached.
+                    ConnectFailure::BeaconUnreachable { .. }
+                    | ConnectFailure::PeerUnknown { .. }
+                    | ConnectFailure::NoDirectPath { .. } => reached.ok_or(failure),
+                    // A deferral is not this dial's answer: the answer is the state a product
+                    // reads, which keeps whatever reason it had — the fault itself when the state
+                    // names none.
+                    ConnectFailure::Deferred { .. } => {
+                        let (_, named) = self.state_and_reason(&peer_id);
+                        Err(named.unwrap_or(failure))
+                    }
+                    other => Err(other),
+                }
             }
-            Try::Failed(failure) => Err(match failure {
-                // A deferral is not this dial's answer: the answer is the state a product reads,
-                // which keeps whatever reason it had — the fault itself when the state names none.
-                ConnectFailure::Deferred { .. } => {
-                    let (_, named) = self.state_and_reason(&peer_id);
-                    named.unwrap_or(failure)
-                }
-                other => other,
-            }),
         }
     }
 
-    /// Fold this machine's own successful dial into the policy: the pair is connected, and a
-    /// stop is open again.
+    /// Fold a pair that holds a connection into the policy as this dial: the pair is connected,
+    /// and a stop is open again.
     ///
-    /// The dial began with a record that said this machine trusts the peer and ended with the
-    /// peer answering, so both of a stop's causes are disproved by it.
+    /// The callers check both halves of the premise. This machine's read of the record said it
+    /// trusts the peer — a refusal or a deferral is never folded, because a connection that
+    /// arrived some other way must not clear a stop this dial exists to respect — and the pair
+    /// holds a connection: either the one this dial kept, or one the peer's own dial brought up
+    /// while this one was still trying. Both of a stop's causes are disproved by that.
     fn adopted_here(&self, peer: PeerId) {
         let now = self.runtime.now();
         self.transition(peer, |state| {
@@ -1150,97 +1432,352 @@ impl Connections {
     /// failures.
     ///
     /// `standing` is this machine's trust in the peer, read by a caller that had to read the
-    /// record anyway; `None` asks here. Either way the answer is one read of the file.
+    /// record anyway; `None` asks here. Either way the answer is one read of the file, and the
+    /// addresses that read found are the ones the second step dials.
+    ///
+    /// The three steps and the punch's failure mapping are the module's *The order* and *A punch*
+    /// notes. Two things are this function's own. Every address it actually dialled is kept, in
+    /// the order it tried them and without repeats, so a
+    /// [`ConnectFailure::NoDirectPath`] names the whole set rather than one address of it. And the
+    /// punch counts as **one** dial of the recovery episode: nothing here calls
+    /// [`Recovery::failed`] per candidate, and the accounting is [`Self::ensure`]'s and
+    /// [`Self::judge`]'s, unchanged.
     async fn try_peer(
         &self,
         endpoint: &Endpoint,
         peer: &Fingerprint,
         hint: Option<SocketAddr>,
         standing: Option<RecordRead>,
-    ) -> Try {
+    ) -> Result<Connection, ConnectFailure> {
         let peer_id = peer.peer_id();
         let standing = match standing {
             Some(standing) => standing,
             None => self.standing(&peer_id),
         };
         if let Some(failure) = standing.refusal(*peer) {
-            return Try::Failed(failure);
+            return Err(failure);
         }
-        let remembered = self.remembered(&peer_id);
-        let mut addresses = Vec::with_capacity(2);
-        if let Some(hint) = hint {
-            addresses.push(hint);
-        }
-        if let Some(remembered) = remembered
-            && Some(remembered) != hint
+        let mut tried: Vec<(SocketAddr, AddressError)> = Vec::new();
+        let mut completed = false;
+        let answer = if let Some(connection) = self
+            .dial_known(
+                endpoint,
+                peer,
+                hint,
+                standing.trusted(),
+                &mut tried,
+                &mut completed,
+            )
+            .await
         {
-            addresses.push(remembered);
+            Ok(connection)
+        } else if let Some(connection) = self.live(&peer_id) {
+            // An accept may have connected the pair while this dial was trying its known
+            // addresses: the peer is reached, and the beacon has nothing to add.
+            Ok(connection)
+        } else {
+            self.punch(endpoint, peer, &mut tried, &mut completed).await
+        };
+        // A wrong key met on the way outranks whatever the dial answered: the pair being up, a
+        // beacon that could not be reached and a set that reached nothing all say nothing about
+        // an address that answered with another machine's key. This is the one place the
+        // precedence is applied, so a new failure arm anywhere below cannot drop the fact.
+        if let Some(failure) = wrong_key(peer, &tried) {
+            self.forget_wrong_keys(&peer_id, &tried);
+            return Err(failure);
         }
-        let mut tried = Vec::new();
-        for address in addresses {
-            match self.try_address(endpoint, address, peer).await {
-                Ok(connection) => return self.here(peer, address, connection),
-                Err(cause) => tried.push((address, cause)),
-            }
+        answer
+    }
+
+    /// The first two steps of the module's order: the hint, then every address `record`
+    /// remembers for the peer, all of them dialled at once.
+    ///
+    /// `record` is the read that found the pair trusted, so the addresses dialled here are the
+    /// ones that read found. `Some` is the pair's connection. `None` means nothing was reached —
+    /// including a dial whose handshake completed and whose connection the tie-break dropped with
+    /// the pair holding nothing, which `completed` records — and the beacon stage is next, with
+    /// `tried` naming every address this dial has failed at.
+    async fn dial_known(
+        &self,
+        endpoint: &Endpoint,
+        peer: &Fingerprint,
+        hint: Option<SocketAddr>,
+        record: Option<&PeerRecord>,
+        tried: &mut Vec<(SocketAddr, AddressError)>,
+        completed: &mut bool,
+    ) -> Option<Connection> {
+        // The hint, once: a claim about where the peer is, which the handshake either confirms or
+        // disproves. A connection the tie-break dropped is no answer about the path — the caller
+        // finds the pair's own connection, if there is one — so the next step still runs.
+        if let Some(hint) = hint
+            && let Some(connection) = self
+                .dial_and_adopt(
+                    endpoint,
+                    peer,
+                    [hint],
+                    DEFAULT_CONNECT_BUDGET,
+                    tried,
+                    completed,
+                )
+                .await
+        {
+            return Some(connection);
         }
-        let Some(beacon) = &self.beacon else {
-            // Nothing to ask and nothing to try: configuration, not a network state.
-            if tried.is_empty() {
-                return Try::Failed(ConnectFailure::Nowhere { peer: *peer });
+        // The remembered set, all at once. They are equally authenticated, so their order says
+        // nothing about which is likelier; four sequential ten-second dials would spend the whole
+        // budget on that order. The hint was just tried, so it is not tried twice.
+        let remembered: Vec<SocketAddr> = record
+            .map(PeerRecord::addresses)
+            .unwrap_or_default()
+            .iter()
+            .copied()
+            .filter(|address| Some(*address) != hint)
+            .collect();
+        if remembered.is_empty() {
+            return None;
+        }
+        self.dial_and_adopt(
+            endpoint,
+            peer,
+            remembered,
+            DEFAULT_CONNECT_BUDGET,
+            tried,
+            completed,
+        )
+        .await
+    }
+
+    /// Dial a whole set at once, record every fault it met, and adopt whatever completed.
+    ///
+    /// `completed` is updated in place: a handshake that completed and then lost the tie-break is
+    /// not a failed path, so a later refusal says so rather than naming a blocked network. The
+    /// answer is the pair's connection, or `None` when the set left the pair with nothing — which
+    /// is no answer about the path, so the caller's next stage still runs.
+    async fn dial_and_adopt(
+        &self,
+        endpoint: &Endpoint,
+        peer: &Fingerprint,
+        addresses: impl IntoIterator<Item = SocketAddr>,
+        budget: Duration,
+        tried: &mut Vec<(SocketAddr, AddressError)>,
+        completed: &mut bool,
+    ) -> Option<Connection> {
+        let dials = addresses
+            .into_iter()
+            .map(|address| (address, self.dial_to(endpoint, address, peer, budget)))
+            .collect();
+        let (reached, failures) = traverse::dial_all(dials).await;
+        *completed |= !reached.is_empty();
+        for (address, error) in failures {
+            note(tried, address, error);
+        }
+        self.adopt_all(peer, reached)
+    }
+
+    /// The third step: the beacon, the punch it asks for, and the failures it can answer with.
+    ///
+    /// One exchange for the lookup and our candidate list together, so neither can abort the
+    /// other; a wait for the peer's list, unless one is already here or a ceremony with the peer
+    /// is running; and then the whole dial set at once.
+    async fn punch(
+        &self,
+        endpoint: &Endpoint,
+        peer: &Fingerprint,
+        tried: &mut Vec<(SocketAddr, AddressError)>,
+        completed: &mut bool,
+    ) -> Result<Connection, ConnectFailure> {
+        let peer_id = peer.peer_id();
+        let leg = match self.beacon_leg(peer, tried).await {
+            Ok(leg) => leg,
+            Err(failure) => return Err(failure),
+        };
+        // A ceremony with this peer is running here: an older build would end it on a payload
+        // outside its closed set, so nothing is sent, nothing is waited for, and the peer's own
+        // candidates — a stored list included — are not dialled. The rule is read first, so a
+        // dial that is stepping aside does not take the coordination lock for a list it will
+        // not use.
+        let may_send = self
+            .presence
+            .as_ref()
+            .is_none_or(|presence| !presence.busy_with(&peer_id));
+        let declared = self.declared();
+        let local = endpoint
+            .local_addr()
+            .ok()
+            .filter(|address| !address.ip().is_unspecified());
+        let ours = Candidates::new(declared.iter().copied().chain(local));
+        // Our candidates, and the generation to wait past. The generation is read *before* the
+        // payload is sent, so one that arrives while this dial is sending is not missed; a list
+        // already stored at entry is used as it is and nothing waits, unless it is older than
+        // `COORDINATION_FRESH` — a stale list is worth nothing, and waiting one window for a
+        // fresh one is the same punch later.
+        let stored = if may_send {
+            self.presence
+                .as_ref()
+                .and_then(|presence| presence.candidates(&peer_id))
+        } else {
+            None
+        };
+        let generation = stored.as_ref().map_or(0, |(_, generation)| *generation);
+        // An empty list encodes to nothing — the format refuses a count of zero — so a machine
+        // that knows of no address of its own sends no payload at all rather than one the peer
+        // would drop as unrecognised.
+        let payload = ours.encode();
+        let introduce = async {
+            match (&payload, may_send) {
+                (Some(payload), true) => leg.introduce(peer_id, payload).await,
+                _ => Ok(()),
             }
-            return Try::Failed(ConnectFailure::BeaconUnreachable {
+        };
+        // Neither request may abort the other: an introduction the beacon refused does not turn
+        // an address it did answer with into a failure, and a lookup that failed does not throw
+        // away an introduction that was delivered. Each request carries its own
+        // [`BEACON_REQUEST_TIMEOUT`], so no outer deadline can discard a lookup the beacon
+        // answered; both answers are kept for the refusal.
+        let (lookup, introduced) = traverse::join2(leg.lookup(&peer_id), introduce).await;
+        let observed = match lookup {
+            Ok(address) => address,
+            Err(error) => {
+                return Err(ConnectFailure::BeaconUnreachable {
+                    peer: *peer,
+                    cause: cause(tried, &unreachable(error.to_string(), &error)),
+                });
+            }
+        };
+        let theirs = if may_send {
+            match stored {
+                Some((candidates, _)) => Some(candidates),
+                None => match &self.presence {
+                    Some(presence) => {
+                        presence
+                            .wait_for_candidates(&peer_id, generation, PUNCH_WINDOW)
+                            .await
+                    }
+                    None => None,
+                },
+            }
+        } else {
+            // A ceremony with this peer is running here, so the punch steps aside: the dial set
+            // is the beacon's answer alone, and neither a stored list nor a wait is used.
+            None
+        };
+        let set = punch_set(observed, theirs.as_ref(), &declared, local);
+        if set.is_empty() {
+            // The beacon has no registration for the peer and the peer named nothing to dial.
+            return Err(ConnectFailure::PeerUnknown {
                 peer: *peer,
-                cause: cause(&tried, "no beacon is configured"),
+                cause: cause(tried, "the peer is not registered"),
+            });
+        }
+        match self
+            .dial_and_adopt(
+                endpoint,
+                peer,
+                set.iter().copied(),
+                PUNCH_DIAL_BUDGET,
+                tried,
+                completed,
+            )
+            .await
+        {
+            Some(connection) => Ok(connection),
+            // Every dial failed, or the one that completed was dropped with the pair holding
+            // nothing: the refusal names the whole set rather than the one address that was last.
+            None => Err(no_path(peer, tried, *completed, &introduced)),
+        }
+    }
+
+    /// Adopt every connection a set of dials completed, and answer the pair's one connection.
+    ///
+    /// Every completion is adopted, not only the first: the peer accepts a handshake the moment
+    /// it completes, so a completed dial this side dropped would leave the two machines keeping
+    /// different connections. The tie-break decides which of them the pair keeps, and it decides
+    /// the same on both sides because it reads only who started what and the exporter both ends
+    /// compute. The answer is the pair's connection, or `None` when the set left the pair with
+    /// nothing.
+    fn adopt_all(
+        &self,
+        peer: &Fingerprint,
+        reached: Vec<(SocketAddr, Connection)>,
+    ) -> Option<Connection> {
+        for (_, connection) in reached {
+            self.here(peer, connection);
+        }
+        // A dial the tie-break dropped is not the answer when the pair holds one: the caller
+        // asked to reach the peer, and the peer is reached. The pair's connection wrote its own
+        // address when it was adopted, so nothing is written again here.
+        self.live(&peer.peer_id())
+    }
+
+    /// The session the beacon stage speaks on: the machine's one registration when there is a
+    /// presence, and one session of the manager's own otherwise.
+    ///
+    /// The two failures of this step are the ones the module's note names: nothing configured at
+    /// all, which is configuration rather than a network state, and a beacon that would not open a
+    /// session.
+    async fn beacon_leg<'a>(
+        &'a self,
+        peer: &Fingerprint,
+        tried: &[(SocketAddr, AddressError)],
+    ) -> Result<Leg<'a>, ConnectFailure> {
+        if let Some(presence) = &self.presence {
+            return Ok(Leg::Presence(presence));
+        }
+        let Some(beacon) = self.beacon() else {
+            return Err(if tried.is_empty() {
+                ConnectFailure::Nowhere { peer: *peer }
+            } else {
+                ConnectFailure::BeaconUnreachable {
+                    peer: *peer,
+                    cause: cause(tried, "no beacon is configured"),
+                }
             });
         };
-        let session = match beacon.connect().await {
-            Ok(session) => session,
-            Err(error) => {
-                return Try::Failed(ConnectFailure::BeaconUnreachable {
-                    peer: *peer,
-                    cause: cause(&tried, &format!("the beacon: {error}")),
-                });
-            }
-        };
-        let address = match session.lookup(&peer_id).await {
-            Ok(Some(address)) => address,
-            Ok(None) => {
-                return Try::Failed(ConnectFailure::PeerUnknown {
-                    peer: *peer,
-                    cause: cause(&tried, "the peer is not registered"),
-                });
-            }
-            Err(error) => {
-                return Try::Failed(ConnectFailure::BeaconUnreachable {
-                    peer: *peer,
-                    cause: cause(&tried, &format!("the beacon: {error}")),
-                });
-            }
-        };
-        match self.try_address(endpoint, address, peer).await {
-            Ok(connection) => self.here(peer, address, connection),
-            Err(error) => Try::Failed(ConnectFailure::NoDirectPath {
+        match beacon.connect().await {
+            Ok(session) => Ok(Leg::Session(session)),
+            Err(error) => Err(ConnectFailure::BeaconUnreachable {
                 peer: *peer,
-                address,
-                cause: error.to_string(),
+                cause: cause(tried, &unreachable(error.to_string(), &error)),
             }),
         }
     }
 
-    /// Adopt this machine's own dial.
+    /// One address's dial, boxed for a set that is polled together.
     ///
-    /// A handshake that completed but whose connection the tie-break dropped is
-    /// [`Try::Dropped`], not a dial failure: the address answered, and the
-    /// keeper treats it as a dial that carried nothing rather than giving up.
-    fn here(&self, peer: &Fingerprint, address: SocketAddr, connection: Connection) -> Try {
+    /// `budget` is the whole dial's bound, applied once: [`Self::try_address`] spends it on the
+    /// handshake, and a punch's five seconds are shorter than a lone dial's ten.
+    fn dial_to<'a>(
+        &'a self,
+        endpoint: &'a Endpoint,
+        address: SocketAddr,
+        peer: &'a Fingerprint,
+        budget: Duration,
+    ) -> traverse::Dial<'a, Connection, AddressError> {
+        Box::pin(async move { self.try_address(endpoint, address, peer, budget).await })
+    }
+
+    /// Adopt this machine's own dial and answer the pair's connection.
+    ///
+    /// `None` when the tie-break dropped it. That is not a dial failure — the address answered —
+    /// and a dropped dial is marked judged, so the keeper never counts it as a strike: losing the
+    /// tie-break is the design doing its job, and a punch dials several addresses at once, so
+    /// counting each one would spend a whole episode in one round.
+    ///
+    /// The kept connection's remote address is written to the record here, because a completed
+    /// authenticated handshake is authenticated data: the peer answered at that address with the
+    /// key this machine trusts. Only the dial that kept the connection writes, so a dial the
+    /// tie-break dropped adds nothing — the pair's connection was written when it was adopted —
+    /// and a hint that did not complete is never written at all.
+    fn here(&self, peer: &Fingerprint, connection: Connection) -> Option<Connection> {
         match self.adopt(peer.peer_id(), connection, Started::Here) {
-            Ok((connection, kept_this, watch)) => {
+            Some((connection, kept_this, watch)) => {
                 if kept_this {
+                    self.note_address(&peer.peer_id(), connection.remote_address());
                     self.start_exchange(peer.peer_id(), &connection, &watch, Started::Here);
                 }
-                Try::Kept { connection }
+                Some(connection)
             }
-            Err(cause) => Try::Dropped { address, cause },
+            None => None,
         }
     }
 
@@ -1286,11 +1823,11 @@ impl Connections {
         // The tie-break runs before the address write: the write is a hint that
         // saves a beacon trip, and delaying the adoption by it would let the keeper
         // see the pair empty while the peer's own connection was still being taken.
-        // Only a connection the tie-break keeps teaches an address. When it keeps the
-        // one the pair already held, that connection may be this machine's own
-        // outbound one, whose remote address is the address this machine dialled —
-        // never a fact the record may hold.
-        if let Ok((kept, kept_this, watch)) = self.adopt(peer, connection, Started::There)
+        // Only a connection the tie-break keeps teaches an address here. When it keeps the one
+        // the pair already held, that connection's remote address was written by the reach that
+        // adopted it — a dial writes the address it completed at, and an accept the address it
+        // arrived from — so nothing is lost by not writing it twice.
+        if let Some((kept, kept_this, watch)) = self.adopt(peer, connection, Started::There)
             && kept_this
         {
             self.note_address(&peer, kept.remote_address());
@@ -1416,6 +1953,11 @@ impl Connections {
         // and must not hand a peer that keeps dropping a connection a second episode.
         let _kept = Kept::new(self, peer_id, self.runtime.now());
         loop {
+            // Read before the trust check, so a coordination payload that arrives while this
+            // round runs is not missed: the wait below returns for a generation past this one,
+            // and the round then asks the record again rather than dialling on the payload's
+            // word. A withdrawn peer therefore causes no dial.
+            let generation = self.coordination_generation(&peer_id);
             // A pair whose trust is gone is not one to keep: close what is live and stop,
             // naming the trust rather than a lost path. The record is read from disk, so a
             // withdrawal written through another handle — or by the other process on this
@@ -1457,12 +1999,18 @@ impl Connections {
                 // that notices an inbound connection, a withdrawal or a wake is what comes
                 // next. Every arm of this loop waits, so no state can make it a hot loop.
                 Recovery::Dialling { .. } | Recovery::Connected | Recovery::Unwatched => {
-                    pause(self, TRUST_POLL).await;
+                    self.pause_or_punch(&peer_id, generation, TRUST_POLL).await;
                 }
                 Recovery::Waiting { until, .. } | Recovery::Exhausted { until, .. } => {
-                    // One timer, and it is the sooner of the policy's moment and the round
-                    // that notices an inbound connection, a withdrawal or a wake.
-                    pause(self, until.saturating_duration_since(self.runtime.now())).await;
+                    // One timer, and it is the sooner of the policy's moment, the round that
+                    // notices an inbound connection, a withdrawal or a wake, and a coordination
+                    // payload that asks for a punch.
+                    self.pause_or_punch(
+                        &peer_id,
+                        generation,
+                        until.saturating_duration_since(self.runtime.now()),
+                    )
+                    .await;
                 }
                 // A stop is answered here rather than dialled through. The keeper's own two
                 // stops return from the branch that wrote them, so a stop that reaches here was
@@ -1503,6 +2051,12 @@ impl Connections {
     /// [`Self::recovery`] is the same answer with a live connection and with "no keeper" in front
     /// of it; this one is what a caller about to dial needs, because the policy's moment is what
     /// paces the next call.
+    ///
+    /// A pair that is up is answered [`Recovery::Connected`], and the one failure reported beside
+    /// it is [`ConnectFailure::WrongPeer`]: a network failure is the answer to a dial and the pair
+    /// being up is the answer to the pair, but an address that proved a key which is not the
+    /// peer's is a security fact the pair's own connection says nothing about. This reports it as
+    /// [`Self::connect_with`] does, so the two entry points cannot disagree about the same event.
     ///
     /// A record that refuses trust is a decision, so it stops the pair with the cause this read
     /// found: nothing would dial it again by itself while the file says that, and a keeper would
@@ -1608,20 +2162,12 @@ impl Connections {
             peer: peer_id,
             token,
         };
-        let outcome = self.try_peer(endpoint, peer, None, Some(standing)).await;
-        let failure = match outcome {
-            // A dial that lost the tie-break to a connection the pair already holds carried
-            // nothing and is not a failure: the pair is connected.
-            Try::Kept { .. } => {
-                self.fold(&dialing, Recovery::adopted);
-                return self.answer(&peer_id, None);
-            }
-            Try::Dropped { address, cause } => ConnectFailure::NoDirectPath {
-                peer: *peer,
-                address,
-                cause: cause.to_owned(),
-            },
-            Try::Failed(failure) => failure,
+        let outcome = Box::pin(self.try_peer(endpoint, peer, None, Some(standing))).await;
+        // A dial that lost the tie-break to a connection the pair already holds carried nothing
+        // and is not a failure: the pair is connected.
+        let Err(failure) = outcome else {
+            self.fold(&dialing, Recovery::adopted);
+            return self.answer(&peer_id, None);
         };
         // Read before the recovery map is taken: the connection map is not held while the
         // recovery map is, so a reader of the state cannot wait behind a dial. `adopt` is the
@@ -1648,7 +2194,7 @@ impl Connections {
                 state.failed(now, failure.clone(), self.recheck);
             }
         });
-        self.answer(&peer_id, (!connected).then_some(failure))
+        self.answer(&peer_id, Some(failure))
     }
 
     /// Give a dial's claim back and fold its outcome into the policy, under one lock.
@@ -1668,7 +2214,8 @@ impl Connections {
 
     /// The answer one call to the manager gives: the policy's state, and the failure this call
     /// has to report — `None` when it has none, or when a connection arrived while the record was
-    /// being read or the dial was running.
+    /// being read or the dial was running, except a wrong key, which outlives the connection that
+    /// arrived beside it.
     ///
     /// A stop always names its cause, whether this call wrote it or found it: a caller that
     /// asked for one delivery is owed the reason, and the conversion from a cause to a failure
@@ -1689,7 +2236,13 @@ impl Connections {
         met: Option<ConnectFailure>,
     ) -> (Recovery, Option<ConnectFailure>) {
         if self.live(peer).is_some() {
-            return (Recovery::Connected, None);
+            // The pair is up, so a network failure is not reported: it is the answer to a dial,
+            // and the pair being up is the answer to the pair. A wrong key is not a network
+            // failure — it is a security fact about an address, which the pair being up says
+            // nothing about — so it is reported beside the connected state.
+            let security =
+                met.filter(|failure| matches!(failure, ConnectFailure::WrongPeer { .. }));
+            return (Recovery::Connected, security);
         }
         let state = self.policy(peer);
         // A stop is the standing answer whatever this call met on the way: a transient record
@@ -1827,7 +2380,7 @@ impl Connections {
                 now,
                 ConnectFailure::NoDirectPath {
                     peer: fingerprint,
-                    address: connection.remote_address(),
+                    candidates: vec![connection.remote_address()],
                     cause: close_cause(error),
                 },
                 self.recheck,
@@ -1926,11 +2479,17 @@ impl Connections {
         change(&mut retry.entry(peer).or_insert_with(Watched::unwatched).state);
     }
 
-    /// The address the record remembers for `peer`, if it remembers one.
-    fn remembered(&self, peer: &PeerId) -> Option<SocketAddr> {
+    /// The addresses the record remembers for `peer`, newest first, and empty when it remembers
+    /// none.
+    ///
+    /// A dial tries all of them at once, so the order is the order they are reported in rather
+    /// than a schedule; see [`crate::peer::RecordStore::record_address`] for what may be written
+    /// and how the list is kept.
+    fn remembered(&self, peer: &PeerId) -> Vec<SocketAddr> {
         self.store
             .get(peer)
-            .and_then(|record| record.last_address())
+            .map(|record| record.addresses().to_vec())
+            .unwrap_or_default()
     }
 
     /// Whether this machine has anywhere to dial `peer`: a beacon that could look it up, or an
@@ -1938,7 +2497,96 @@ impl Connections {
     /// and [`Self::ensure`]'s answer for a stopped pair must not disagree about the one stop a
     /// service path writes.
     fn somewhere_to_dial(&self, peer: &PeerId) -> bool {
-        self.beacon.is_some() || self.remembered(peer).is_some()
+        self.beacon().is_some() || !self.remembered(peer).is_empty()
+    }
+
+    /// The beacon this machine can reach, if it has one: the manager's own handle, or the one
+    /// its presence speaks to.
+    ///
+    /// A manager given a presence was given a beacon with it — the presence is one machine's
+    /// registration on one — so a manager built without a beacon of its own still has one to ask,
+    /// and [`Self::somewhere_to_dial`] must not call that machine's pair unreachable.
+    fn beacon(&self) -> Option<&Beacon> {
+        self.beacon
+            .as_ref()
+            .or_else(|| self.presence.as_ref().map(|presence| presence.beacon()))
+    }
+
+    /// The generation of the last coordination payload from `peer`, and zero when none arrived.
+    ///
+    /// The keeper reads this before its trust check and hands it to the wait: a payload that
+    /// arrives during the round carries a later generation, so the wait returns at once instead
+    /// of sleeping through it.
+    fn coordination_generation(&self, peer: &PeerId) -> u64 {
+        self.presence
+            .as_ref()
+            .and_then(|presence| presence.candidates(peer))
+            .map_or(0, |(_, generation)| generation)
+    }
+
+    /// A coordination payload from `peer` asks for a punch: make the pair's next dial due,
+    /// keeping the episode. At most once per [`PUNCH_REARM`]; a pair whose episode is used up is
+    /// not re-armed (the slow re-check is not a punch cadence). Never starts a dial of its own.
+    ///
+    /// Only a wait is moved. A pair that is dialling, connected, stopped or watched by nobody is
+    /// left alone: the first is already doing what the payload asks, the second needs nothing,
+    /// the third is a decision a payload does not overrule, and the fourth has no episode for a
+    /// dial to belong to.
+    ///
+    /// Every honoured payload stamps, whether or not it moves a wait: the interval is what bounds
+    /// how often a payload can move a wait. It bounds nothing else. A payload reaches this method
+    /// only when the presence handed this machine a candidate list from that peer, so it comes
+    /// from a paired machine; one whose trust has been withdrawn since is refused after the trust
+    /// read below, and still costs that one read. The keeper's own read at the top of its round is
+    /// the second line, so a peer this machine does not trust cannot turn a payload into a dial
+    /// even if this check were missed. A payload also ends the keeper's wait, whose next round
+    /// reads the record before it dials — its ordinary business, and the price of never dialling on
+    /// a payload's word. The dial pacing is what the interval is for.
+    fn rearm(&self, peer: &PeerId) {
+        let now = self.runtime.now();
+        if self
+            .retry()
+            .get(peer)
+            .and_then(|watched| watched.rearmed)
+            .is_some_and(|rearmed| now.saturating_duration_since(rearmed) < PUNCH_REARM)
+        {
+            return;
+        }
+        // A payload from a machine this one does not trust is not honoured at all: it can cause
+        // no dial and no re-arm, so the record is read before the state is touched. The keeper
+        // reads it again on its next round; this is the read that makes the rule true for the
+        // instant the payload arrives.
+        if !matches!(self.standing(peer), RecordRead::Trusted(_)) {
+            return;
+        }
+        // A dial nobody finished is settled first: the state a payload re-arms must not be one
+        // that only still reads "dialling" because its caller went away.
+        self.settle_stale(peer);
+        let mut retry = self.retry();
+        let watched = retry.entry(*peer).or_insert_with(Watched::unwatched);
+        watched.rearmed = Some(now);
+        if matches!(watched.state, Recovery::Waiting { .. }) {
+            watched.state.hurry(now);
+        }
+    }
+
+    /// Wait one round, or until a coordination payload from `peer` arrives, whichever is first.
+    ///
+    /// A payload is a request to punch, so the round ends early and [`Self::rearm`] makes the
+    /// pair's next dial due; the loop then asks the record and the policy again, which is what
+    /// makes a withdrawn peer cause no dial. The wait is the same timer either way: a payload
+    /// that never comes costs the round, and a dropped keeper ends both halves.
+    async fn pause_or_punch(&self, peer: &PeerId, generation: u64, for_at_most: Duration) {
+        let Some(presence) = &self.presence else {
+            pause(self, for_at_most).await;
+            return;
+        };
+        let fresh = presence.wait_for_candidates(peer, generation, for_at_most);
+        if let traverse::Either::Second(Some(_)) =
+            traverse::race2(pause(self, for_at_most), fresh).await
+        {
+            self.rearm(peer);
+        }
     }
 
     /// What one read of `peer`'s record means for this machine's trust, from the record on disk.
@@ -1986,14 +2634,36 @@ impl Connections {
         }
     }
 
-    /// Remember the peer's authenticated source address.
+    /// Remember the address a completed handshake proved.
     ///
-    /// Best effort on purpose: the address is a hint that saves a beacon trip, not
-    /// identity — the key is checked on every handshake — so a record that cannot be
-    /// written is a hint lost, not a connection refused. Only an accept calls this;
-    /// the write, and the task it runs on, are the module's "Accepting" note.
+    /// The rule for what may be written is [`crate::peer::PeerRecord::last_address`]'s: the
+    /// source address of an accepted connection, or the address a dial completed at. Both are
+    /// authenticated data — the peer answered there with the key this machine trusts — and
+    /// neither a hint nor a candidate nor the beacon's observation is, which is why nothing else
+    /// calls this.
+    ///
+    /// Best effort on purpose: the address is a hint that saves a beacon trip, not identity — the
+    /// key is checked on every handshake — so a record that cannot be written is a hint lost, not
+    /// a connection refused. The write, and the task it runs on, are the module's "Accepting"
+    /// note; a dial's write runs on the caller's task, which is already off the accept loop.
+    /// [`Self::forget_wrong_keys`] is the other direction: an address the record remembers and
+    /// which answers with another machine's key is dropped.
     fn note_address(&self, peer: &PeerId, address: SocketAddr) {
         let _ = self.store.record_address(peer, address);
+    }
+
+    /// Stop remembering every address this dial tried that answered with a key which is not the
+    /// peer's.
+    ///
+    /// [`ConnectFailure::WrongPeer`] states the rule and why a failed write costs only the same
+    /// answer once more, and [`RecordStore::forget_address`] what dropping one does to the pair;
+    /// this is where the addresses that earned it are dropped.
+    fn forget_wrong_keys(&self, peer: &PeerId, tried: &[(SocketAddr, AddressError)]) {
+        for (address, error) in tried {
+            if matches!(error, AddressError::WrongPeer { .. }) {
+                let _ = self.store.forget_address(peer, *address);
+            }
+        }
     }
 
     /// Start the manager's liveness reader, once per manager, and only when this machine has a
@@ -2133,11 +2803,12 @@ impl Connections {
         endpoint: &Endpoint,
         address: SocketAddr,
         peer: &Fingerprint,
+        budget: Duration,
     ) -> Result<Connection, AddressError> {
         let connecting = endpoint
             .connect(address, SERVER_NAME)
             .map_err(|error| AddressError::Open(error.to_string()))?;
-        let connection = match timeout(&*self.runtime, DEFAULT_CONNECT_BUDGET, connecting).await {
+        let connection = match timeout(&*self.runtime, budget, connecting).await {
             Some(Ok(connection)) => connection,
             Some(Err(error)) => return Err(AddressError::Handshake(error.to_string())),
             None => return Err(AddressError::TimedOut),
@@ -2156,7 +2827,9 @@ impl Connections {
     /// Keep one connection for the pair, by the rule the module states.
     ///
     /// The answer is the connection the pair kept and whether it is the one this call
-    /// passed in.
+    /// passed in; `None` when neither can be kept — the tie-break cannot be computed, or the
+    /// connection it kept has already closed. The reason is not carried: both are the same
+    /// answer to the caller, and the connection it did not keep is closed with it.
     ///
     /// One thing outranks the rule: a connection that has shown no sign of life for this
     /// machine's liveness bound — [`VANISH_BOUND`], or twice the keep-alive when that is
@@ -2173,7 +2846,7 @@ impl Connections {
         peer: PeerId,
         connection: Connection,
         started_by: Started,
-    ) -> Result<(Connection, bool, Arc<Watch>), &'static str> {
+    ) -> Option<(Connection, bool, Arc<Watch>)> {
         self.start_liveness();
         let now = self.runtime.now();
         let preferred = if self.me < peer {
@@ -2186,7 +2859,7 @@ impl Connections {
             let live = Live::new(connection, started_by, now);
             let answer = (live.connection.clone(), true, live.watch.clone());
             pairs.insert(peer, live);
-            return Ok(answer);
+            return Some(answer);
         };
         // A connection that died before the keeper looked is judged here, before its entry
         // is replaced: a dial whose connection died must not escape the settle window just
@@ -2207,7 +2880,7 @@ impl Connections {
                 .connection
                 .close(0u32.into(), TIE_BREAK_CAUSE.as_bytes());
             connection.close(0u32.into(), TIE_BREAK_CAUSE.as_bytes());
-            return Err(TIE_BREAK_CAUSE);
+            return None;
         };
         let (kept, dropped) = if keep_new {
             (Live::new(connection, started_by, now), existing)
@@ -2218,16 +2891,21 @@ impl Connections {
         // through the handle would rewrite that reason as a local close, and the keeper may not
         // have judged it yet.
         if dropped.connection.close_reason().is_none() {
+            // Losing the tie-break is not a failed dial, and a keeper watching the connection this
+            // call drops must not count it as one: a punch dials several addresses at once and
+            // every one but the pair's is superseded here, so marking it judged is what keeps
+            // eight candidates from spending eight dials of the episode.
+            dropped.watch.judged.store(true, Ordering::SeqCst);
             dropped
                 .connection
                 .close(0u32.into(), SUPERSEDED_CAUSE.as_bytes());
         }
         if kept.connection.close_reason().is_some() {
-            return Err(ADOPTION_LOST_CAUSE);
+            return None;
         }
         let answer = (kept.connection.clone(), keep_new, kept.watch.clone());
         pairs.insert(peer, kept);
-        Ok(answer)
+        Some(answer)
     }
 
     fn pairs(&self) -> MutexGuard<'_, BTreeMap<PeerId, Live>> {
@@ -2263,6 +2941,8 @@ struct Watched {
     keepers: usize,
     /// When a stop's cause was last asked about; see [`Connections::stop_due`].
     checked: Option<Instant>,
+    /// When a coordination payload last made the next dial due; see [`Connections::rearm`].
+    rearmed: Option<Instant>,
 }
 
 impl Watched {
@@ -2275,6 +2955,7 @@ impl Watched {
             token: 0,
             keepers: 0,
             checked: None,
+            rearmed: None,
         }
     }
 
@@ -2497,10 +3178,6 @@ const TIE_BREAK_CAUSE: &str = "the pair's tie-break could not be computed";
 /// What the tie-break closes a connection it does not keep with.
 const SUPERSEDED_CAUSE: &str = "superseded by the pair's tie-break";
 
-/// Why a dial that completed a handshake did not become the pair's connection: the
-/// connection it kept had already closed.
-const ADOPTION_LOST_CAUSE: &str = "the connection closed before the pair adopted it";
-
 /// What [`Connections::disconnect`] closes the pair's connection with: the connection
 /// level changed, and the next connection carries it.
 const RECONNECT_CAUSE: &str = "the pair is reconnecting";
@@ -2523,7 +3200,7 @@ const VANISHED_CAUSE: &str = "the peer stopped answering";
 
 /// The cause of a failed beacon leg, naming the addresses tried before it.
 ///
-/// The four failures are classes; this is the detail a reader acts on, so a
+/// The failures are classes; this is the detail a reader acts on, so a
 /// remembered address that did not answer is named rather than folded away.
 fn cause(tried: &[(SocketAddr, AddressError)], detail: &str) -> String {
     if tried.is_empty() {
@@ -2535,6 +3212,147 @@ fn cause(tried: &[(SocketAddr, AddressError)], detail: &str) -> String {
     }
     text.push_str(detail);
     text
+}
+
+/// `detail` for a beacon leg that failed, with the blocked-UDP clause added only where the network
+/// can explain the failure.
+///
+/// Only [`BeaconError::Unavailable`] leaves the network as an explanation: the bound passed with
+/// no handshake, or the session or the stream ended without an answer. Every other answer — a
+/// version mismatch, a malformed frame, a refusal — came from the beacon, and a transport error
+/// may be an alert it sent, so neither leaves the network as the cause. A refusal must not name a
+/// cause the crate just disproved.
+fn unreachable(detail: String, error: &BeaconError) -> String {
+    match error {
+        BeaconError::Unavailable => format!("{detail}; this network may block UDP"),
+        _ => detail,
+    }
+}
+
+/// The set a punch dials: the beacon's observed address first and unfiltered, then the peer's
+/// candidates, filtered by [`traverse::acceptable`] and deduplicated, cut at
+/// [`crate::peer::MAX_CANDIDATES`].
+///
+/// The beacon's answer is not filtered because it is the beacon's own observation of where this
+/// peer appears, and not a claim the peer made about itself: filtering it would change what a
+/// machine behind one router can do today. A candidate is a claim, so it is filtered, against
+/// the addresses the product declared — not against the socket's own, which is not a
+/// declaration and opens no private gate.
+fn punch_set(
+    observed: Option<SocketAddr>,
+    theirs: Option<&Candidates>,
+    declared: &[SocketAddr],
+    local: Option<SocketAddr>,
+) -> Vec<SocketAddr> {
+    let accepted = theirs
+        .into_iter()
+        .flat_map(Candidates::addresses)
+        .copied()
+        .filter(|candidate| traverse::acceptable(*candidate, declared, local));
+    // The ceiling and the deduplication are [`Candidates`]'s, so the most a punch may dial is
+    // stated once.
+    Candidates::new(observed.into_iter().chain(accepted))
+        .addresses()
+        .to_vec()
+}
+
+/// The refusal a punch answers when every address of its set failed.
+///
+/// The set is every address this dial tried, this stage's included, in the order it tried them: a
+/// reader acts on where the peer was not.
+fn no_path(
+    peer: &Fingerprint,
+    tried: &[(SocketAddr, AddressError)],
+    completed: bool,
+    introduced: &Result<(), BeaconError>,
+) -> ConnectFailure {
+    ConnectFailure::NoDirectPath {
+        peer: *peer,
+        // The addresses are the refusal's own field, so the cause does not repeat them:
+        // one sentence, one list.
+        candidates: tried.iter().map(|(address, _)| *address).collect(),
+        cause: punch_cause(tried, completed, introduced),
+    }
+}
+
+/// The wrong key one of this dial's addresses proved, if one did.
+///
+/// It outranks every other answer, the pair's own live connection included: the pair being up
+/// says nothing about an address this machine was told is the peer's and which answered with
+/// another machine's key. [`Connections::try_peer`] applies it once, where every arm of the dial
+/// meets it.
+fn wrong_key(peer: &Fingerprint, tried: &[(SocketAddr, AddressError)]) -> Option<ConnectFailure> {
+    tried.iter().find_map(|(address, error)| match error {
+        AddressError::WrongPeer { presented, .. } => Some(ConnectFailure::WrongPeer {
+            peer: *peer,
+            presented: *presented,
+            address: *address,
+        }),
+        _ => None,
+    })
+}
+
+/// The sentence a punch that dialled its whole set and reached nothing ends its cause with.
+///
+/// The beacon answered — a lookup that failed returns before any candidate is dialled — so the
+/// reason is never "the beacon is unreachable", and the fact that it has no registration for the
+/// peer is a fact about the lookup and not the reason a candidate did not answer. An
+/// introduction that was not delivered is named after the sentence rather than as its cause: a
+/// candidate list that never arrived is one dial without the peer's addresses, not a path that
+/// was tried and refused.
+///
+/// The blocked-UDP clause belongs only where nothing answered at all: an address whose handshake
+/// completed and whose connection the pair kept none of — `completed`, whether the tie-break
+/// dropped it or the far side's accept closed it — or one that answered with a failed handshake or
+/// no key has not been silent, and naming a blocked network there would name a cause the dial has
+/// just ruled out. The advice to try another network belongs with it, for the same reason: it is
+/// advice about a network that failed, and a completed handshake is the network working.
+fn punch_cause(
+    tried: &[(SocketAddr, AddressError)],
+    completed: bool,
+    introduced: &Result<(), BeaconError>,
+) -> String {
+    let mut text = if completed {
+        // A handshake completed and the pair kept nothing: the tie-break dropped it, or the far
+        // side's accept closed it. Either way the network worked, and there is no network to
+        // advise a person away from.
+        "an address completed a handshake and the pair kept no connection".to_owned()
+    } else if !tried.is_empty()
+        && tried
+            .iter()
+            .all(|(_, error)| matches!(error, AddressError::TimedOut))
+    {
+        "this network may block UDP towards the peer; another network may work".to_owned()
+    } else {
+        // An address answered, with a handshake that failed or no key: the network is not what is
+        // shown to have failed, so no advice aimed at one is given.
+        "the addresses did not complete a handshake with the peer".to_owned()
+    };
+    if let Err(error) = introduced {
+        let _ = write!(text, "; the candidate list was not delivered ({error})");
+    }
+    text
+}
+
+/// Keep one address this dial tried, with the first fault it answered with.
+///
+/// One address can be dialled twice inside one dial — the beacon's observed address may be one
+/// the record already remembers — and a refusal names it once: a second fault from the same
+/// address says nothing the first does not, and a list of repeats is a list a reader has to
+/// deduplicate to act on. The one exception is a wrong key, which replaces an earlier fault
+/// rather than being folded away: it is the fault that outranks the rest.
+fn note(tried: &mut Vec<(SocketAddr, AddressError)>, address: SocketAddr, error: AddressError) {
+    let Some((_, known)) = tried.iter_mut().find(|(known, _)| *known == address) else {
+        tried.push((address, error));
+        return;
+    };
+    // A wrong key outranks an earlier fault from the same address: it is the one fault that
+    // becomes an answer of its own, and a timeout recorded first must not hide it.
+    if matches!(error, AddressError::WrongPeer { .. })
+        && !matches!(known, AddressError::WrongPeer { .. })
+    {
+        *known = error;
+    }
 }
 
 /// Why a connection manager could not be built.
@@ -2595,13 +3413,15 @@ impl fmt::Display for ManagerError {
 impl std::error::Error for ManagerError {}
 
 /// Why one address did not become the pair's connection. Never reported outward as-is:
-/// [`Connections::connect`] folds it into one of the three failures a dial can decide — a
-/// dial is never `NotTrusted`, which is decided before an address is chosen. The word *dial*
+/// [`Connections::connect`] folds it into one of the failures a dial can decide — a
+/// dial is never `NotTrusted`, which is decided before an address is chosen — and
+/// [`AddressError::WrongPeer`] is the one that becomes an answer of its own. The word *dial*
 /// is the pair's, one whole try; this is one of the addresses inside it.
 #[derive(Clone, Debug)]
-enum AddressError {
+pub(crate) enum AddressError {
     Open(String),
     Handshake(String),
+    /// No handshake within the dial's budget.
     TimedOut,
     NoIdentity,
     WrongPeer {
@@ -2615,7 +3435,7 @@ impl fmt::Display for AddressError {
         match self {
             Self::Open(error) => write!(f, "the connection could not be opened: {error}"),
             Self::Handshake(error) => write!(f, "handshake: {error}"),
-            Self::TimedOut => f.write_str("no handshake within the connect budget"),
+            Self::TimedOut => f.write_str("no handshake within the dial's budget"),
             Self::NoIdentity => f.write_str("the handshake proved no key"),
             Self::WrongPeer {
                 expected,

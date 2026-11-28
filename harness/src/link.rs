@@ -9,6 +9,15 @@
 //! Faults are scripted or seeded, never probabilistic: a seed picks one
 //! datagram's fate by arithmetic, so the same seed over the same traffic
 //! produces the same trace, and a recorded trace replays to itself.
+//!
+//! # Networks
+//!
+//! The link is also the wire between networks, so a machine can be created behind a
+//! NAT and a case can watch what that NAT does: [`Link::attach_on`] hands out an
+//! address inside the network, [`nat`] decides where every datagram the machines send
+//! goes, and [`Link::traversal`] reports the mappings, the holes and the hairpins the
+//! translation left behind. A link with no network on it translates nothing, and every
+//! address, trace and fault is exactly what it was before networks existed.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -23,6 +32,21 @@ use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, UdpPoller};
 
 use crate::clock::MockClock;
+
+pub mod nat;
+
+pub use nat::{Filtering, Hairpin, Hole, Mapping, Nat, Pooling, Translation, Traversal};
+
+use nat::Nats;
+
+/// One network on the link: the thing two machines are behind when they share a
+/// router.
+///
+/// A handle, not a description: two machines are behind one network when a case asks
+/// for it once with [`Link::network`] and attaches both with [`Link::attach_on`]. Two
+/// machines behind the same [`Nat`] description are two networks that behave alike.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Network(usize);
 
 /// What the link does to one datagram.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,7 +150,11 @@ pub struct Delivery {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TraceEvent {
     pub seq: u64,
+    /// The source the datagram carried: the sender's own address, or the endpoint a
+    /// network had translated it to when it left.
     pub from: SocketAddr,
+    /// The destination the sender named, before any fault moved it and before any
+    /// network translated it.
     pub to: SocketAddr,
     /// The link clock's reading when the datagram was sent.
     ///
@@ -184,6 +212,11 @@ struct LinkState {
     /// Addresses that accept nothing, as a process that is gone does: the socket
     /// still exists, but no datagram reaches it until the address is resumed.
     silenced: BTreeSet<SocketAddr>,
+    /// One-directional firewall rules: a datagram from the first address to the
+    /// second is sent and reaches nothing.
+    blocked: BTreeSet<(SocketAddr, SocketAddr)>,
+    /// The networks between the machines, and what they have done.
+    nats: Nats,
     held: Option<Datagram>,
     /// Whether `send` records what happened; see [`Link::record_trace`].
     tracing: bool,
@@ -228,6 +261,8 @@ impl Link {
                     seq: 0,
                     sockets: BTreeMap::new(),
                     silenced: BTreeSet::new(),
+                    blocked: BTreeSet::new(),
+                    nats: Nats::default(),
                     held: None,
                     tracing: true,
                     delivered: 0,
@@ -244,12 +279,19 @@ impl Link {
     /// Replace the fault plan and start a new run: the trace, the sequence
     /// numbers, the held datagram and every socket's queue are cleared, and a
     /// delivery queued by the previous run is dropped when it fires.
+    ///
+    /// The networks start cold with the run: [`Link::traversal`] is emptied and so
+    /// are the mapping tables behind it, so the first datagram of a run makes its
+    /// mappings as if the network had just come up. The addresses are not touched —
+    /// a machine keeps the address it was created at — and neither are the firewall
+    /// rules: a block is a configuration, like a silenced address.
     pub fn set_plan(&self, plan: FaultPlan) {
         let mut state = self.state();
         state.plan = plan;
         state.generation += 1;
         state.seq = 0;
         state.held = None;
+        state.nats.clear();
         state.trace.clear();
         let sockets: Vec<Arc<LinkedSocket>> =
             state.sockets.values().filter_map(Weak::upgrade).collect();
@@ -337,8 +379,37 @@ impl Link {
     /// When every address the link can hand out is taken.
     pub fn attach_next(&self) -> Arc<LinkedSocket> {
         let mut state = self.state();
-        let addr = free_addr(&state).expect("the link has no free address");
+        let addr = free_addr(&state, None).expect("the link has no free address");
         self.insert(&mut state, addr)
+    }
+
+    /// Make one network of `nat`; two machines are behind it when both are attached
+    /// with [`Link::attach_on`].
+    ///
+    /// # Panics
+    ///
+    /// When the link has no room for another network.
+    #[must_use]
+    pub fn network(&self, nat: Nat) -> Network {
+        Network(self.state().nats.fresh(nat))
+    }
+
+    /// Register a socket inside an existing network, at the lowest free address there.
+    ///
+    /// # Panics
+    ///
+    /// When the network has no free address.
+    #[must_use]
+    pub fn attach_on(&self, network: Network) -> Arc<LinkedSocket> {
+        let mut state = self.state();
+        let addr = free_addr(&state, Some(network.0)).expect("the network has no free address");
+        self.insert(&mut state, addr)
+    }
+
+    /// The network a machine at `addr` is behind, by the block it lives in.
+    #[must_use]
+    pub fn network_of(&self, addr: SocketAddr) -> Option<Network> {
+        self.state().nats.network_of(addr).map(Network)
     }
 
     fn insert(&self, state: &mut LinkState, addr: SocketAddr) -> Arc<LinkedSocket> {
@@ -363,6 +434,40 @@ impl Link {
     /// Deliver to `addr` again.
     pub fn resume(&self, addr: SocketAddr) {
         self.state().silenced.remove(&addr);
+    }
+
+    /// Stop delivering anything `from` sends to `to`: one firewall rule, one
+    /// direction, judged against the address the sender named before any network
+    /// translates it.
+    ///
+    /// The datagram is still sent — the trace records it with the faults the plan
+    /// gave it and no deliveries — which is what a machine whose UDP is blocked
+    /// towards one peer looks like. Blocking a machine entirely is one rule per
+    /// destination it dials.
+    pub fn blocks(&self, from: SocketAddr, to: SocketAddr) {
+        self.state().blocked.insert((from, to));
+    }
+
+    /// The address traffic from `addr` comes from once it has left every network the
+    /// machine is behind.
+    ///
+    /// A machine behind nothing answers with its own address, which is what a peer
+    /// dials. A machine behind a network answers with the mapping that network has
+    /// made for it — the oldest one, the address the first peer to hear from it was
+    /// told — and `None` before it has sent anything, because until then its network
+    /// has made no mapping and nothing outside can name it.
+    #[must_use]
+    pub fn external(&self, addr: SocketAddr) -> Option<SocketAddr> {
+        self.state().nats.external(addr)
+    }
+
+    /// What the networks have done since the current run began: every mapping made,
+    /// every hole a filter opened, every hairpin carried.
+    ///
+    /// [`Link::set_plan`] empties it, because it starts the run it describes.
+    #[must_use]
+    pub fn traversal(&self) -> Traversal {
+        self.state().nats.traversal()
     }
 
     /// Move a socket to a new apparent address, as a path change does.
@@ -394,12 +499,17 @@ impl Link {
     /// Move a socket to the lowest free address, allocating and moving under one
     /// lock: a concurrent caller cannot be handed the address in between.
     ///
+    /// The socket stays on the side of the wire it was on: one behind a network moves
+    /// to a free address inside that network, and one behind nothing stays on the
+    /// loopback space.
+    ///
     /// # Panics
     ///
     /// When every address the link can hand out is taken.
     pub fn rebind_next(&self, socket: &Arc<LinkedSocket>) -> SocketAddr {
         let mut state = self.state();
-        let addr = free_addr(&state).expect("the link has no free address");
+        let network = state.nats.network_of(socket.addr());
+        let addr = free_addr(&state, network).expect("the link has no free address");
         move_socket(&mut state, socket, addr);
         addr
     }
@@ -416,10 +526,14 @@ impl Link {
     /// created more machines than the link has room for.
     #[must_use]
     pub fn alloc_addr(&self) -> SocketAddr {
-        free_addr(&self.state()).expect("the link has no free address")
+        free_addr(&self.state(), None).expect("the link has no free address")
     }
 
     /// Send one datagram from one machine to another.
+    ///
+    /// The datagram is what the sender emitted: the faults the plan gives it are
+    /// applied to the address it named, and only then are the networks between the
+    /// two ends asked where it goes and what source it carries.
     pub fn send(&self, from: SocketAddr, to: SocketAddr, bytes: Vec<u8>) {
         let sent_at = self.inner.clock.elapsed();
         let deliveries = {
@@ -443,12 +557,23 @@ impl Link {
                     Fault::Reroute(addr) => destination = *addr,
                 }
             }
+            // A blocked datagram is sent and reaches nothing, as a dropped one is,
+            // so no network translates it: a firewall sits in front of the wire.
+            let (source, target) = if dropped || state.blocked.contains(&(from, destination)) {
+                (from, None)
+            } else {
+                // Every network between the two ends translates here, once, and the
+                // answer is frozen into the datagram: the source a socket reports is
+                // the one the sender's networks had already chosen.
+                let route = state.nats.route(from, destination);
+                (route.source, route.destination)
+            };
             if state.tracing {
                 state.trace.insert(
                     seq,
                     TraceEvent {
                         seq,
-                        from,
+                        from: source,
                         to,
                         sent_at,
                         faults,
@@ -456,36 +581,37 @@ impl Link {
                     },
                 );
             }
-            if dropped {
-                Vec::new()
-            } else {
-                let generation = state.generation;
-                let datagram = Datagram {
-                    generation,
-                    seq,
-                    from,
-                    to: destination,
-                    bytes,
-                    delay,
-                    copies,
-                };
-                if reorder {
-                    match state.held.replace(datagram) {
-                        // Two holds in a row: the older one is released now.
-                        Some(previous) => vec![previous],
-                        None => Vec::new(),
-                    }
-                } else {
-                    match state.held.take() {
-                        Some(mut previous) => {
-                            // The held datagram can never land before the one
-                            // that released it, so it waits for the later of the
-                            // two delays; with equal delays both land in the same
-                            // instant and the held one arrives second.
-                            previous.delay = previous.delay.max(delay);
-                            vec![datagram, previous]
+            match target {
+                None => Vec::new(),
+                Some(target) => {
+                    let generation = state.generation;
+                    let datagram = Datagram {
+                        generation,
+                        seq,
+                        from: source,
+                        to: target,
+                        bytes,
+                        delay,
+                        copies,
+                    };
+                    if reorder {
+                        match state.held.replace(datagram) {
+                            // Two holds in a row: the older one is released now.
+                            Some(previous) => vec![previous],
+                            None => Vec::new(),
                         }
-                        None => vec![datagram],
+                    } else {
+                        match state.held.take() {
+                            Some(mut previous) => {
+                                // The held datagram can never land before the one
+                                // that released it, so it waits for the later of the
+                                // two delays; with equal delays both land in the same
+                                // instant and the held one arrives second.
+                                previous.delay = previous.delay.max(delay);
+                                vec![datagram, previous]
+                            }
+                            None => vec![datagram],
+                        }
                     }
                 }
             }
@@ -675,10 +801,26 @@ impl AsyncUdpSocket for LinkedSocket {
 }
 
 /// The lowest address the link hands out that no live socket holds.
-fn free_addr(state: &LinkState) -> Option<SocketAddr> {
-    (0..ADDRESS_SPAN).map(addr_at).find(|addr| {
-        state.sockets.get(addr).and_then(Weak::upgrade).is_none() && !state.silenced.contains(addr)
-    })
+///
+/// `None` asks the loopback space every machine behind nothing sits on; `Some` asks
+/// the private block of that network.
+fn free_addr(state: &LinkState, network: Option<usize>) -> Option<SocketAddr> {
+    match network {
+        None => (0..ADDRESS_SPAN)
+            .map(addr_at)
+            .find(|addr| is_free(state, addr)),
+        Some(network) => {
+            let block = state.nats.private_of(network);
+            nat::HOSTS
+                .map(|host| nat::host_at(block, host))
+                .find(|addr| is_free(state, addr))
+        }
+    }
+}
+
+/// Whether no live socket holds `addr` and nothing has silenced it.
+fn is_free(state: &LinkState, addr: &SocketAddr) -> bool {
+    state.sockets.get(addr).and_then(Weak::upgrade).is_none() && !state.silenced.contains(addr)
 }
 
 /// Point a socket's registry entry at `addr`.
