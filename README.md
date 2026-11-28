@@ -266,8 +266,8 @@ cargo package --offline -p mahbot-peers   # needs a committed tree
 cargo build -p mahbot-beacon-server
 ```
 
-`windows-check` type-checks the Windows reader for both Windows targets on a host that is not
-Windows.
+`windows-check` type-checks and lints the Windows reader for both Windows targets on a host that
+is not Windows.
 
 The default suite needs no external host, no service and no wall-clock waiting, and keeps no
 process-global state, so it runs in parallel.

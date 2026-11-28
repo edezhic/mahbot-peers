@@ -5,14 +5,30 @@
 //! for its target, and a host without the Windows headers stops in that compiler
 //! before it reaches this crate's own code. This crate compiles the same
 //! `src/identity/access/` sources with only the dependencies the access-list code
-//! uses, so both Windows targets type-check without a Windows host:
+//! uses, so both Windows targets type-check without a Windows host.
+//!
+//! `rust-toolchain.toml` pins the channel and the components, not the targets, so a
+//! fresh `rustup` installation needs this once; without it the check stops in "can't
+//! find crate for `std`":
+//!
+//! ```sh
+//! rustup target add x86_64-pc-windows-msvc x86_64-pc-windows-gnu
+//! ```
+//!
+//! Then, for each target, the compile check and the lint check:
 //!
 //! ```sh
 //! cargo check -p mahbot-peers-windows-check --target x86_64-pc-windows-msvc
+//! cargo clippy -p mahbot-peers-windows-check --target x86_64-pc-windows-msvc -- -D warnings
 //! cargo check -p mahbot-peers-windows-check --target x86_64-pc-windows-gnu
+//! cargo clippy -p mahbot-peers-windows-check --target x86_64-pc-windows-gnu -- -D warnings
 //! ```
 //!
-//! It proves the code compiles; it runs nothing. The reader and writer are exercised
+//! The lint runs per target too: on a host that is not Windows,
+//! `cargo clippy --workspace --all-targets` never compiles the Windows module at all,
+//! so a Windows-only lint failure would otherwise pass here.
+//!
+//! This proves the code compiles; it runs nothing. The reader and writer are exercised
 //! on a Windows host, and the capability inventory records that procedure.
 //!
 //! # The peer layer's storage is covered through the same gate
