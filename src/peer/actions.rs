@@ -107,16 +107,11 @@
 //! [`ActionAnswer::Unknown`] and the identifier stays remembered, because the action may well
 //! have run. A slow execution never holds up a different pair, and one that panics tells the
 //! sender the outcome is unknown and then ends the service with a visible fault, as a panicking
-//! delivery sink already does. A result larger than [`MAX_RESULT_BYTES`] is not carried and is
-//! not truncated: the answer says the action ran and the result was too large to carry, so the
-//! identifier stays remembered and the person knows the command happened and can run it
-//! differently.
+//! delivery sink already does.
 //!
 //! # One connection carries both
 //!
-//! Messages and actions share the pair's connection. [`crate::peer::inbox::Inbox`] is the one
-//! place that takes a stream and decides what it is, so a message is never taken for an action
-//! nor an action for a message, in either direction. An action in flight does not count as the
+//! Messages and actions share the pair's connection. An action in flight does not count as the
 //! pair having carried traffic for the connection manager, while an answer that means the
 //! receiving side accepted the operation does — it ran, ran with a result too large to carry, or
 //! the identifier was already spent there. A message counts only the take; an action also counts
@@ -361,8 +356,7 @@ impl fmt::Debug for ActionKind {
 
 /// One action as it travels: its identifier, its kind and its body.
 ///
-/// Crate-private: no public entry point takes one — [`Actions::request`] takes the pieces —
-/// and the harness builds raw frames to exercise the wire format.
+/// Crate-private: no public entry point takes one — [`Actions::request`] takes the pieces.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Action {
     id: ActionId,
@@ -511,10 +505,6 @@ pub enum ActionAnswer {
 impl ActionAnswer {
     /// Whether this answer means the receiving side accepted the operation: it ran, it ran
     /// with a result too large to carry, or the identifier was already spent there.
-    ///
-    /// This is what the connection manager counts as the pair having carried traffic. Every
-    /// other answer means nothing was taken, so a slow-down followed by a dropped connection is
-    /// not a link failure to be re-dialled.
     #[must_use]
     pub(crate) const fn accepted(&self) -> bool {
         matches!(
@@ -530,9 +520,8 @@ impl ActionAnswer {
 
     /// One answer, from the bytes a reply carried.
     ///
-    /// Public like the message layer's own answer: a caller — and this workspace's cases —
-    /// reads an answer off the wire, and there is no builder to hide it behind, because only a
-    /// receiver composes one.
+    /// Public like the message layer's own answer: a caller reads an answer off the wire, and
+    /// there is no builder to hide it behind, because only a receiver composes one.
     ///
     /// # Errors
     ///
@@ -646,9 +635,7 @@ pub struct ActionMark {
 ///
 /// Built once per storage root, like the records and the log: the store it holds names the
 /// root's `actions/` directory, and a second layer over one root shares it rather than copying
-/// it. A product calls [`Actions::request`] when a person asks for an action, and runs
-/// [`crate::peer::inbox::Inbox::serve`] once per paired peer, which answers both messages and
-/// actions; the receiving side reaches this layer through the [`Executor`] it was built with.
+/// it.
 pub struct Actions {
     rights: Rights,
     floor: Arc<dyn Floor + Send + Sync>,
@@ -711,21 +698,6 @@ impl Actions {
     /// withdrew, or a pair closed by three failed comparisons is refused before anything is
     /// sent. A body over [`MAX_ACTION_BODY_BYTES`] is refused, and an identifier already marked
     /// unknown for this peer is answered [`ActionAnswer::Unknown`] without being offered again.
-    ///
-    /// The pair's live connection is used when it has one; otherwise this call dials — the ask
-    /// is an ordinary reason to dial, paced by the pair's retry policy — and a pair the manager
-    /// has stopped dialling is returned as [`ActionError::Connect`] with nothing held anywhere.
-    /// A request this machine could not get onto the wire — no stream could be opened, or the
-    /// write did not finish — is [`ActionError::NotSent`], unless the receiver had already
-    /// answered: that answer is read under a short courtesy bound and handed back. The record
-    /// read and the network work — reaching the pair, opening the stream, writing the frame and
-    /// reading the answer — share one [`ACTION_BUDGET`], so it is one bound a caller can plan
-    /// against; that bound's own documentation says what a record fault costs and how it is
-    /// answered. Once the frame may be whole on the wire and no answer comes back — or the
-    /// answer is one this build cannot read, or the receiver answers that it could not tell — the
-    /// action is marked unknown durably and answered [`ActionAnswer::Unknown`]. The crate never
-    /// offers it again while the mark is kept. When the memory cannot be read or written, the caller
-    /// is answered [`ActionError::Untraced`], which names both the outcome and the storage fault.
     ///
     /// # Errors
     ///
@@ -842,12 +814,8 @@ impl Actions {
 
     /// Drop the memory a peer's most recent trust withdrawal made moot.
     ///
-    /// The clearing is the record's, not this sweep's: every read already treats everything
-    /// recorded before [`crate::peer::record::PeerRecord::last_withdrawn_at`] as gone, so a
-    /// product that stops this peer's service for the whole withdrawal and starts it again
-    /// after the return still forgets. This only compacts the file, and a memory with nothing
-    /// to drop is not rewritten. A product may call it on its own schedule; the inbox calls it
-    /// once every `SWEEP_EVERY` for the pairs it serves.
+    /// A product may call it on its own schedule; the inbox calls it once every `SWEEP_EVERY`
+    /// for the pairs it serves.
     ///
     /// # Errors
     ///
@@ -882,8 +850,7 @@ impl Actions {
     /// The path of `peer`'s memory under `root`.
     ///
     /// Public for the same reason [`Self::dir_in`] is: a caller that must name one memory
-    /// without opening the store — a repair, a backup, a case that corrupts one on purpose —
-    /// asks here instead of spelling the name.
+    /// without opening the store — a repair, a backup — asks here instead of spelling the name.
     #[must_use]
     pub fn path_for(root: &Path, peer: &PeerId) -> PathBuf {
         store::path_in(&Self::dir_in(root), peer)
@@ -892,20 +859,14 @@ impl Actions {
     /// The lock file a writer of `peer`'s memory holds, beside the memory itself.
     ///
     /// Public for the reason [`Self::path_for`] is: a backup or a repair must be able to tell
-    /// the file a writer locks from the memory it writes, and a case that plays the self-update
-    /// window's second process asks here instead of spelling the name.
+    /// the file a writer locks from the memory it writes, and a second process asks here
+    /// instead of spelling the name.
     #[must_use]
     pub fn lock_path_for(root: &Path, peer: &PeerId) -> PathBuf {
         store::lock_in(&Self::dir_in(root), peer)
     }
 
     /// Answer one action request on `send`/`recv`, whose first bytes are `prefix`.
-    ///
-    /// The connection's presented key was checked by the inbox that called this, so `peer` is
-    /// the transport's attested author. The order is the module's: the right, the host's floor,
-    /// the kind, the journal, the record of the execution, then the run. The kind comes after
-    /// the right so a peer without "work on me" is refused at that step rather than told which
-    /// kinds this build knows.
     pub(crate) async fn receive(
         &self,
         peer: PeerId,
@@ -962,11 +923,6 @@ impl Actions {
     }
 
     /// Decide one decoded action and run it if it may be run, answering the sender.
-    ///
-    /// Two steps return before an answer, because there is nothing yet to say: the decision —
-    /// whose record or log may fail — and the journal's own read and write. Every later
-    /// fault is answered first: the log's as [`ActionAnswer::NotRecorded`], a decline's release
-    /// as [`ActionAnswer::NotRun`].
     async fn decide_and_run(
         &self,
         peer: PeerId,
@@ -1055,12 +1011,7 @@ impl Actions {
     /// Run one recorded action and answer what became of it on `send`.
     ///
     /// The identifier is already remembered and the execution already recorded. Every arm
-    /// answers exactly once before returning. A decline forgets the identifier, because nothing
-    /// ran; a memory that cannot release it — another writer holds it, or it cannot be read or
-    /// written — still leaves the decline answered, and a hard fault ends the service after the
-    /// answer rather than turning it into an unknown. A panic keeps the identifier, answers
-    /// unknown and ends the service; a run that outlives [`EXECUTION_BUDGET`] keeps it and
-    /// answers unknown, because the action may well have run.
+    /// answers exactly once before returning.
     async fn run(
         &self,
         peer: PeerId,
@@ -1160,14 +1111,6 @@ impl Actions {
 
     /// Release `id`, then answer, and hand back a hard fault in the release so it ends the
     /// service after the answer.
-    ///
-    /// This is the one shape for an answer that comes after the identifier is remembered and says
-    /// nothing ran — `not run` for a decline, `not recorded` for a log that could not be written:
-    /// the identifier is released *before* the answer, so a repeat that arrives after it finds
-    /// the identifier free. A memory another writer holds this instant cannot release it — the
-    /// same cost as a crash between the remember and the run, and the identifier stays spent —
-    /// and a hard fault is returned after the answer rather than turning it into an unknown for
-    /// an action that did not run.
     async fn release_then_answer(
         &self,
         peer: PeerId,
@@ -1191,16 +1134,6 @@ impl Actions {
     /// will speak on. The search shares the call's [`ACTION_BUDGET`] through `deadline`; a
     /// connection that never becomes ready within it is reported as [`ActionError::Unprepared`]
     /// rather than offered, and nothing is held.
-    ///
-    /// The ask is a reason to dial, so it starts a fresh episode once — and the dial itself is
-    /// [`Connections::ensure`]'s, which is paced by the pair's retry policy: a pair that has
-    /// just failed is waited out until the policy's own moment rather than polled. A dial this
-    /// call made and that failed answers with its failure at once, as does a record that refuses
-    /// trust. A fault this machine met this instant is deferred and waited out like a gap when the
-    /// state names nothing else; when the pair's last dial met a reason, that reason is the answer
-    /// at once, because the state a product reads is the truth. Only a wait that never became a
-    /// dial runs out the budget — then the policy's own account of why the pair is down is the
-    /// answer rather than a bare "nothing was ready".
     async fn reachable(
         &self,
         connections: &Connections,
@@ -1306,16 +1239,6 @@ enum Offered {
 }
 
 /// Offer one action over `connection` and read the answer.
-///
-/// Every wait shares the call's one [`ACTION_BUDGET`] through `deadline`. A failure before the
-/// frame is whole answers [`Offered::NotSent`]: a stream that could not be opened certainly
-/// wrote nothing, and a write that did not finish may still have been whole on the wire, so the
-/// receiver's journal is what stops a repeat from running twice. The one exception is a write
-/// that did not finish after the receiver had already answered — a throttled receiver may have
-/// written its slow-down before resetting the stream, and a write may time out after the answer
-/// went out — so the answer is read even then, under a short courtesy bound rather than a second
-/// full budget. A failure after the whole frame went out — `finish`, the read, or a reply this
-/// build cannot decode — leaves the action possibly run, which the caller marks unknown.
 async fn offer(
     runtime: &dyn Runtime,
     connection: &quinn::Connection,
@@ -1372,10 +1295,7 @@ async fn reply(runtime: &dyn Runtime, send: SendStream, answer: &ActionAnswer) {
 /// abort.
 ///
 /// The receiving task is detached, so a panic that unwound through it would leave the pair
-/// answering nothing while the service went on looking healthy. This catches a panic raised
-/// while the executor's future is polled; the call that produced the future is caught beside
-/// it, because a product may panic before returning one. The marker is `Err(())`, which
-/// [`Actions::run`] turns into [`ActionError::Execution`].
+/// answering nothing while the service went on looking healthy.
 struct CatchUnwind<F>(F);
 
 impl<F: Future + Unpin> Future for CatchUnwind<F> {

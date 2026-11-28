@@ -32,13 +32,6 @@
 //! binding's fact is: the framing has one spelling and a repeat is the writer's, not a
 //! second meaning. A field frame that runs past the end is a refusal, and so is any
 //! byte after the last whole field.
-//!
-//! # Why the body is opaque
-//!
-//! Nothing here reads a body. The body is bytes a product composed and bytes a product
-//! will be handed: this module checks its length and never its content, so no path
-//! leads from a body to a decision. What the frame says about a message — its
-//! identifier, its count, its moment — is separate from what it carries.
 
 use std::time::Duration;
 

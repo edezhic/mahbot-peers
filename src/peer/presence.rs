@@ -11,16 +11,14 @@
 //! # The registration keeps itself alive
 //!
 //! [`Presence::new`] starts the two tasks below on the runtime the caller handed the endpoint,
-//! and they run for as long as the `Presence` exists. Dropping it ends both: it closes the
-//! session, which ends the reader's wait on it, and opens the gate, which ends the keeper's wait
-//! on the beacon and the reader's pause. A dial already in flight is the one thing a drop does
-//! not cancel — it finishes first, within [`BEACON_REQUEST_TIMEOUT`], and the endpoint handle
-//! that task carries goes with it. A product that must have the socket back before that drops
-//! the presence and then closes and drops its own endpoint handle: the connection and the dial
-//! end with it, both tasks finish, and the socket goes. The beacon forgets the registration when
-//! the connection goes. Nothing else starts, stops or refreshes it, so a product that pairs and
-//! runs no presence loop is still registered, and a person comparing six symbols cannot lose the
-//! registration they are comparing under.
+//! and they run for as long as the `Presence` exists. Dropping it ends both. A dial already in
+//! flight is the one thing a drop does not cancel — it finishes first, within
+//! [`BEACON_REQUEST_TIMEOUT`], and the endpoint handle that task carries goes with it. A product
+//! that must have the socket back before that drops the presence and then closes and drops its own
+//! endpoint handle: the connection and the dial end with it, both tasks finish, and the socket
+//! goes. The beacon forgets the registration when the connection goes. Nothing else starts, stops
+//! or refreshes it, so a product that pairs and runs no presence loop is still registered, and a
+//! person comparing six symbols cannot lose the registration they are comparing under.
 //!
 //! The beacon forgets a registration when its lifetime passes, so the machine re-registers at a
 //! third of the lifetime it was answered with — comfortably before the registration expires and
@@ -40,8 +38,8 @@
 //! # One reader, and where a payload goes
 //!
 //! The second task reads every introduction the beacon pushes, and what it does with one is
-//! decided by the payload's own bytes before anything acts on it — `crate::peer::traverse`
-//! classifies it. There are three kinds and no fourth.
+//! decided by the payload's own bytes before anything acts on it. There are three kinds and no
+//! fourth.
 //!
 //! A *ceremony flight* — one of the closed set of pair messages — goes to the ceremony for the
 //! peer it came from: [`Presence::flights`], never to another ceremony and never first-come. A
@@ -209,12 +207,6 @@ impl fmt::Debug for Presence {
 
 impl Presence {
     /// Keep this machine registered from now on, on the runtime the endpoint runs on.
-    ///
-    /// The two tasks this starts are the machine's registration and its reader. Nothing else has to
-    /// be run, and no other session may be registered for the same machine without displacing this
-    /// one. Dropping the presence ends both, with the one bound the module documentation states: a
-    /// dial already in flight is not cancelled, so the keeper can outlive the drop by up to
-    /// [`BEACON_REQUEST_TIMEOUT`].
     ///
     /// # Panics
     ///
@@ -738,10 +730,6 @@ impl Inner {
     }
 
     /// Where an introduction the beacon pushed goes, by the kind of its payload.
-    ///
-    /// The kind is decided once, here, before anything acts on the payload: a candidate list is
-    /// stored and never delivered to a ceremony, a ceremony flight is delivered or held, and
-    /// anything else is dropped. See the module note for the rule and why it is one.
     fn route(&self, introduction: Introduction) {
         let from = introduction.from();
         match traverse::classify(introduction.payload()) {

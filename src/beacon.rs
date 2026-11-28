@@ -228,7 +228,7 @@ impl Introduction {
         &self.signature
     }
 
-    /// The opaque bytes. The beacon never reads them.
+    /// The opaque bytes. The beacon relays them without acting on them.
     #[must_use]
     pub fn payload(&self) -> &[u8] {
         &self.payload

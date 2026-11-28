@@ -102,10 +102,7 @@ const SETTLE_ATTEMPTS: usize = 1000;
 /// Create `dir` if it is missing, and hold it to the key file's rule.
 ///
 /// A directory another account can write lets it delete a record or a queue, which is
-/// a silent un-pairing, so an existing directory is checked as well as a new one. The
-/// check is the same on both platforms: unix reads the mode, the owner and (on macOS)
-/// the extended list from a descriptor opened without following a link; Windows reads
-/// the directory's access list and owner from a handle opened for the directory.
+/// a silent un-pairing, so an existing directory is checked as well as a new one.
 ///
 /// A directory this crate creates is hardened before it is checked: a fresh directory
 /// inherits its parent's access list on Windows and the umask's mode on unix, and the

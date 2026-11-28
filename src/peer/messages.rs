@@ -18,9 +18,7 @@
 //! A message carries no author. The author is the peer the handshake proved, taken from
 //! the connection and never from the bytes: [`Delivery::sender`] is the transport's
 //! attested peer, and a frame cannot claim to be from someone else because nothing in it
-//! names anyone. The inbox checks once, when a connection's reader starts, that the
-//! connection's presented key is the peer it was started for, and a connection that does not
-//! present it ends the service rather than receiving nothing under the pair's name.
+//! names anyone.
 //!
 //! # The queue is durable, and the offer is best effort
 //!
@@ -76,22 +74,6 @@
 //! forgets it, which costs at most one window's worth of offers. A refusal a peer does
 //! cause is written in the log's part for peer-driven acts, which stops at its reserve, so
 //! a flood cannot take the room a person's own acts need.
-//!
-//! # What it guarantees
-//!
-//! - **A body is never interpreted.** Its length is checked against [`MAX_BODY_BYTES`] and
-//!   nothing else is read from it.
-//! - **A decision is about the peer.** Whether a message may be taken is
-//!   `Rights::may_take_message` — the pair's "write to me" and the host's floor — and
-//!   nothing in the message reaches it.
-//! - **A sender never speaks to a pair that is not its own.** [`Messages::send`] re-reads
-//!   the record, and [`Messages::state`] answers from the same gate: no binding or
-//!   claim, no offer.
-//! - **Nothing is lost to a crash before the offer.** The queue is published before
-//!   [`Messages::send`] returns, and a message leaves it only when the receiver answered or
-//!   the retention passed.
-//! - **A withdrawal drops the queue.** [`Messages::sweep`] drops every queued message for a
-//!   peer whose trust this machine withdrew, and records why.
 //!
 //! # What it is not
 //!
@@ -332,10 +314,9 @@ impl fmt::Debug for Message {
 pub enum Answer {
     /// The message was taken: the caller was handed it and its identifier recorded.
     Taken,
-    /// The identifier is one this machine took before. By the peer's own account the message
-    /// reached a caller, so the sender drops its copy without recording a drop. The peer is
-    /// the only one who can say so: a receiver that answered this and then discarded the
-    /// message would leave the sender's log silent about it.
+    /// The identifier is one this machine took before. The peer is the only one who can say so:
+    /// a receiver that answered this and then discarded the message would leave the sender's log
+    /// silent about it.
     AlreadyTaken,
     /// The receiver's rights refused it. The class is all the sender is told: why is the
     /// receiver's business, and its words stay there.
@@ -357,9 +338,8 @@ impl Answer {
 
     /// One answer, from the bytes a reply carried.
     ///
-    /// Public like the beacon's own wire: a caller — and this workspace's cases — reads an
-    /// answer off the wire, and there is no builder to hide it behind, because only a
-    /// receiver composes one.
+    /// Public like the beacon's own wire: a caller reads an answer off the wire, and there is
+    /// no builder to hide it behind, because only a receiver composes one.
     ///
     /// # Errors
     ///
@@ -460,11 +440,7 @@ pub struct Sweep {
 /// The message layer of one machine.
 ///
 /// Built once per storage root, like the records and the log: the store it holds names the
-/// root's queues, and a second layer over one root shares them rather than copying them. A
-/// product runs [`crate::peer::inbox::Inbox::serve`] once per paired peer — which offers this
-/// layer's queue and answers the connection's streams — calls [`Messages::send`] when it has
-/// something to say, and calls [`Messages::sweep`] at start-up and periodically; the
-/// receiver's deliveries arrive through the [`Deliveries`] it was built with.
+/// root's queues, and a second layer over one root shares them rather than copying them.
 pub struct Messages {
     rights: Rights,
     floor: Arc<dyn Floor + Send + Sync>,
@@ -631,14 +607,11 @@ impl Messages {
 
     /// Offer `peer`'s queue over the pair's live connection, one message at a time.
     ///
-    /// An infinite loop, one per paired peer, run by [`crate::peer::inbox::Inbox::serve`] in
-    /// the same task as the receiving half. Each round offers the head of the queue if the
-    /// record allows it and the receiver has not asked this machine to wait. A round that did
-    /// not take the head off the queue — nothing to offer, an offer nobody answered, another
-    /// writer holding the queue — waits `MESSAGE_POLL` before the next: a peer that accepts
-    /// each stream and resets it costs one round a second, not a spin. The queue is swept every
-    /// `SWEEP_EVERY`, not every round, because the offer's own gate is re-read each time and
-    /// only the drop of an expired message waits for the sweep.
+    /// A round that did not take the head off the queue — nothing to offer, an offer nobody
+    /// answered, another writer holding the queue — waits `MESSAGE_POLL` before the next: a peer
+    /// that accepts each stream and resets it costs one round a second, not a spin. The queue is
+    /// swept every `SWEEP_EVERY`, not every round, because the offer's own gate is re-read each
+    /// time and only the drop of an expired message waits for the sweep.
     ///
     /// The first stream a kept connection carries belongs to the binding exchange, so no
     /// offer is made until that exchange has finished: the receiving side would otherwise
@@ -769,8 +742,7 @@ impl Messages {
     /// The path of `peer`'s queue under `root`.
     ///
     /// Public for the same reason [`Self::dir_in`] is: a caller that must name one queue
-    /// without opening the store — a repair, a backup, a case that corrupts one on purpose —
-    /// asks here instead of spelling the name.
+    /// without opening the store — a repair, a backup — asks here instead of spelling the name.
     #[must_use]
     pub fn path_for(root: &Path, peer: &PeerId) -> PathBuf {
         store::path_in(&Self::dir_in(root), peer)
@@ -780,8 +752,8 @@ impl Messages {
     ///
     /// Public for the reason [`Self::path_for`] is: a backup or a repair must be able to tell
     /// the file a writer locks from the queue it writes — the two are told apart by their
-    /// names, and neither is a queue. A case that plays the self-update window's second
-    /// process asks here instead of spelling the name.
+    /// names, and neither is a queue. A second process names it here instead of spelling the
+    /// name.
     #[must_use]
     pub fn lock_path_for(root: &Path, peer: &PeerId) -> PathBuf {
         store::lock_in(&Self::dir_in(root), peer)
@@ -874,9 +846,6 @@ impl Messages {
     }
 
     /// Take one answered message off the queue, answering whether it left.
-    ///
-    /// Another writer holding the queue this instant is not a fault: the round is told the
-    /// message is still there, waits, and offers it again.
     fn forget(&self, peer: &PeerId, id: &EnvelopeId) -> Result<bool, MessageError> {
         match self.store.remove(peer, id) {
             Ok(()) => Ok(true),
@@ -887,12 +856,9 @@ impl Messages {
 
     /// Answer one offer.
     ///
-    /// The offer was counted against the peer's window before the rest of its frame was read
-    /// ([`Self::receive`]), so a peer cannot make this machine decode by flooding it. The body
-    /// is decoded only to hand it over; the decision is about the peer. `Ok(None)` is no
-    /// answer at all: the sender keeps its copy and offers again. `Err` is a record, a queue
-    /// or a log this machine cannot read or write, which ends the service that started the
-    /// receiver rather than looking like a pair that takes nothing.
+    /// `Ok(None)` is no answer at all: the sender keeps its copy and offers again. `Err` is a
+    /// record, a queue or a log this machine cannot read or write, which ends the service that
+    /// started the receiver rather than looking like a pair that takes nothing.
     fn handle(&self, peer: &PeerId, bytes: &[u8]) -> Result<Option<Answer>, MessageError> {
         let now = self.moment.now();
         let Ok(message) = Message::decode(bytes) else {
@@ -956,13 +922,12 @@ impl Messages {
 impl Messages {
     /// Answer one offer on `send`/`recv`, whose first bytes are `prefix`.
     ///
-    /// The connection's presented key was checked by the inbox that called this, so `peer` is
-    /// the transport's attested author. The offer is counted against the peer's window once the
-    /// frame's first bytes are read — the earliest a stream is visible — and before the rest of
-    /// the frame, so a peer that writes an offer's first bytes and stalls still spends one
-    /// offer; a stream that never completes its prefix is classified as a message by the bytes
-    /// it did carry and counted here too. A frame this build cannot read is answered unreadable,
-    /// so the sender drops it instead of keeping it for the retention.
+    /// The offer is counted against the peer's window once the frame's first bytes are read —
+    /// the earliest a stream is visible — and before the rest of the frame, so a peer that
+    /// writes an offer's first bytes and stalls still spends one offer; a stream that never
+    /// completes its prefix is classified as a message by the bytes it did carry and counted
+    /// here too. A frame this build cannot read is answered unreadable, so the sender drops it
+    /// instead of keeping it for the retention.
     ///
     /// This half does not begin a message round: the keeper's "an offer in flight is not the
     /// pair's traffic" rule is about this machine's own offers, and a peer that opens a stream

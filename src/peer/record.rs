@@ -2,18 +2,9 @@
 //!
 //! # What a record is
 //!
-//! One file per peer, named by the 64 hex characters of the peer's key, in a
-//! `peers/` directory beside the key file. It has two levels. The machine's is the
-//! peer's key, when a person made the comparison, the addresses authenticated data
-//! arrived from or a dial completed at — newest first — the failures counted so far,
-//! any unfinished attempt with its expiry, and whether a person withdrew this
-//! machine's trust. The connection's, whose
-//! vocabulary is [`crate::peer::access`], is the account on the instance and the
-//! assistant the peer is bound to, the claim the other side's decision left here, the
-//! pairs the default has acted for, and one right per pair and capability. The key is
-//! the whole identity: the fingerprint is derived from it, never stored beside it
-//! as a second fact, so a record cannot claim a key and a fingerprint that
-//! disagree.
+//! One file per peer in a `peers/` directory beside the key file. The key is the
+//! whole identity: the fingerprint is derived from it, never stored beside it as a
+//! second fact, so a record cannot claim a key and a fingerprint that disagree.
 //!
 //! # The bytes
 //!
@@ -26,9 +17,8 @@
 //! `0x09` one pair's default marker (the assistant's label and 8 seconds), `0x0a`
 //! one right (`peer::access`'s body), `0x0b` the most recent withdrawal's moment
 //! (8), kept after a return so the action memory knows what to forget, and `0x0c` the
-//! addresses (a count and that many addresses, newest first). A field this
-//! build does not know is kept and
-//! written back, after the fields it knows: a rewrite may move it, which changes no
+//! addresses (a count and that many addresses, newest first). A field this build does not know is
+//! kept and written back, after the fields it knows: a rewrite may move it, which changes no
 //! meaning. A right naming a capability this build does not know is kept the same way
 //! and satisfies nothing. The file is named by the 64 lowercase hex characters of the
 //! key.
@@ -67,9 +57,7 @@
 //!   never decreases, and a writer never overwrites a peer it did not touch — one
 //!   file per peer is what makes that structural. The merge has no cross-process
 //!   lock, so it holds when a writer's publish lands before the other's re-read;
-//!   that is the order the self-update window's contract asks for, and the decision
-//!   and the connection manager re-read the one record they are about to act on, so
-//!   neither answers from a view another process has moved past. A record that
+//!   that is the order the self-update window's contract asks for. A record that
 //!   cannot be read is a typed refusal; the store does not open over it.
 //! - **A write never produces a file this build cannot read.** A record that would
 //!   grow past `MAX_RECORD_BYTES` is refused before anything is written, so an additive
@@ -133,9 +121,7 @@
 //!   so the read is what keeps the answer fresh.
 //!
 //! The store's writes are small blocking file operations, like the key file's one
-//! create: a caller runs them where blocking is allowed. The manager's one write per
-//! changed accepted address is the case to look at; `peer::connect` says where it
-//! runs.
+//! create: a caller runs them where blocking is allowed.
 //!
 //! Who the person was is the product's fact, not the network's: the record says that
 //! a comparison happened and when, and the product says which person made it.
@@ -171,16 +157,13 @@ const RECORD_EXTENSION: &str = "record";
 /// The bytes every record opens with.
 const MAGIC: &[u8] = b"mahbot-peer-record";
 
-/// The record format this build writes. A record of a higher version is read as
-/// this version's prefix and its unknown fields are preserved; see the module docs.
+/// The record format this build writes.
 const VERSION: u8 = 1;
 
 /// The most addresses the peer record keeps for one peer; newest first.
 ///
 /// Beside the single-address field an older build reads, so a newer record still gives an older
-/// build an address, and bounded so a peer that moves cannot grow the file without limit. The
-/// list is written after the single address, and [`PeerRecord::addresses`] composes the two on
-/// read and is the one place the list's order and its eviction are stated.
+/// build an address, and bounded so a peer that moves cannot grow the file without limit.
 ///
 /// This is a permanent format bound, like the shape of a right's body: a reader refuses a count
 /// above it as malformed, which stops the pair, so a later build that needs more addresses adds a
@@ -204,7 +187,7 @@ const _: () = assert!(MAX_REMEMBERED_ADDRESSES <= u8::MAX as usize);
 /// next open cannot read.
 pub const MAX_RECORD_BYTES: u64 = 16 * 1024;
 
-/// The field tags of version 1. Unknown tags are preserved, not refused.
+/// The field tags of version 1.
 mod tag {
     pub const KEY: u8 = 0x01;
     pub const PAIRED_AT: u8 = 0x02;
@@ -414,9 +397,6 @@ impl PeerRecord {
     /// not a candidate a peer named, and not the address the beacon observed. And it is never this
     /// machine's own appearance, which says where this machine is and nothing about the peer.
     ///
-    /// This is the head of [`Self::addresses`], and the one address an older build reads from the
-    /// single-address field.
-    ///
     /// An address leaves the list when a handshake at it proves a key which is not the peer's:
     /// the claim above is then disproved, so the address is dropped and the next dial does not
     /// meet it again.
@@ -465,9 +445,6 @@ impl PeerRecord {
     }
 
     /// The moment of the most recent withdrawal, kept after the trust returns.
-    ///
-    /// The action memory forgets everything recorded before it, so a person's
-    /// withdrawal clears that peer's journal even across a stop of the service.
     #[must_use]
     pub const fn last_withdrawn_at(&self) -> Option<Timestamp> {
         self.last_withdrawn_at
@@ -538,9 +515,6 @@ impl PeerRecord {
     }
 
     /// Which of the three reasons [`Self::trusted`] rejected the pair, when it did.
-    ///
-    /// [`Self::trusted`] is this predicate with the reason dropped, so the message, action and
-    /// transfer layers cannot disagree about what an untrusted pair is.
     #[must_use]
     pub(crate) const fn untrusted(&self, limits: &Limits) -> Option<Untrusted> {
         if self.is_withdrawn() {
@@ -555,10 +529,6 @@ impl PeerRecord {
     }
 
     /// Whether the record says nothing worth keeping.
-    ///
-    /// A record that only ever held an unfinished attempt becomes this when the
-    /// attempt ends, and the store removes it: a ceremony with a stranger leaves no
-    /// file behind.
     fn is_empty(&self) -> bool {
         self.paired_at.is_none()
             && self.addresses.is_empty()
@@ -582,9 +552,7 @@ impl PeerRecord {
 /// The map is a cache of the files. [`Self::get`], [`Self::is_paired`] and
 /// [`Self::is_closed`] answer from it; a caller that must
 /// see what another handle over the same root, or another process, wrote re-reads the
-/// record it is about with [`Self::reread`] — which is what the decision and the
-/// connection manager do before acting, and what [`PeerPolicy`] does for the
-/// handshake.
+/// record it is about with [`Self::reread`].
 #[derive(Clone)]
 pub struct RecordStore {
     inner: Arc<Inner>,
@@ -705,11 +673,6 @@ impl RecordStore {
     }
 
     /// Every peer this store has loaded.
-    ///
-    /// A sweep over the rights — a term that passed with no question asked — walks
-    /// this, then re-reads each record so the sweep sees what another process wrote.
-    /// A record another process created after this store opened is that process's to
-    /// sweep.
     #[must_use]
     pub fn peers(&self) -> Vec<PeerId> {
         self.records().keys().copied().collect()
@@ -717,8 +680,7 @@ impl RecordStore {
 
     /// Whether a person on this machine made the comparison for `peer`.
     ///
-    /// This is this machine's half of the pair; whether the other machine holds it is
-    /// the ceremony's question. Trust is [`PeerRecord::trusted`], which also asks
+    /// Trust is [`PeerRecord::trusted`], which also asks
     /// whether the pair is closed.
     #[must_use]
     pub fn is_paired(&self, peer: &PeerId) -> bool {
@@ -740,7 +702,7 @@ impl RecordStore {
     /// handshake, the next dial and the next keeper round. A record that cannot be read
     /// is not trusted: the caller fails closed. [`crate::peer::PeerRecord::trusted`] is
     /// the rule, and [`crate::tls::PeerPolicy::trusts`] is the public question, so the
-    /// handshake and the manager ask one thing; the manager adds the cause on top.
+    /// handshake and the manager ask one thing.
     pub(crate) fn trusted(&self, peer: &PeerId) -> bool {
         self.reread(peer)
             .ok()
@@ -751,11 +713,9 @@ impl RecordStore {
     /// Re-read every record from disk, replacing the loaded map.
     ///
     /// A caller that wants the whole set as the files have it — a screen listing the
-    /// peers, a start-up sweep — calls this. The decision and the connection manager do
-    /// not need it: each re-reads the one record it is about to act on, so a write by
-    /// another process on the same root is seen at that reach. The caller owns the
-    /// moment: nothing in this crate calls it behind a caller's back. A record that has
-    /// become unreadable is a typed refusal like [`RecordStore::open`]'s.
+    /// peers, a start-up sweep — calls this. The caller owns the moment: nothing in this
+    /// crate calls it behind a caller's back. A record that has become unreadable is a
+    /// typed refusal like [`RecordStore::open`]'s.
     pub fn reload(&self) -> Result<(), RecordError> {
         let records = load(&self.inner.dir)?;
         *self.write_map() = records;
@@ -791,19 +751,11 @@ impl RecordStore {
 
     /// Record `address` as the newest address this machine remembers for `peer`.
     ///
-    /// The list is the peer's addresses newest first, and this moves `address` to its front —
-    /// removing any older place it held — then keeps at most [`MAX_REMEMBERED_ADDRESSES`] of
-    /// them. The eviction order is therefore oldest last: the address this machine has used least
-    /// recently is the one that goes. [`PeerRecord::addresses`] states what that order is and is
-    /// not — the order the addresses are reported in, never a schedule.
-    ///
     /// What may be written is [`PeerRecord::last_address`]'s rule: the source address of an
     /// accepted connection, or the address a dial completed at. A hint that did not complete is
     /// never written, and the address is a hint that saves a beacon trip and not identity — the
     /// key is checked on every handshake — so it is published and flushed like any other write,
-    /// and a list that did not change is not rewritten. [`Self::forget_address`] is the opposite
-    /// move: an address the list remembers and which answers with another machine's key is
-    /// dropped.
+    /// and a list that did not change is not rewritten.
     pub fn record_address(&self, peer: &PeerId, address: SocketAddr) -> Result<(), RecordError> {
         self.update(peer, |record, _| {
             let addresses = address::distinct(
@@ -917,10 +869,9 @@ impl RecordStore {
 
     /// Keep the other side's fact, as it arrived.
     ///
-    /// This is the storage step of a received claim, and the connection manager is its
-    /// one caller in this crate: the bytes are kept verbatim, so a fact a newer build
-    /// wrote survives this build's rewrite and this build's decoder reads its known
-    /// fields. It is public because a claim is data a caller may receive by any
+    /// This is the storage step of a received claim: the bytes are kept verbatim, so a
+    /// fact a newer build wrote survives this build's rewrite and this build's decoder
+    /// reads its known fields. It is public because a claim is data a caller may receive by any
     /// transport and keep here; it decides nothing, and nothing reads a claim to allow
     /// anything. A fact older than the one already kept is ignored: the claim is the
     /// deciding machine's latest decision, and a re-delivered stale one does not undo
@@ -1141,8 +1092,8 @@ impl RecordStore {
     /// The directory under `root` that holds the records.
     ///
     /// Public for the same reason [`Self::path_for`] is: a caller that must name the
-    /// records without opening the store — a backup, a repair, a case that makes the
-    /// directory unreadable — asks here instead of spelling `peers`.
+    /// records without opening the store — a backup, a repair, a directory that cannot
+    /// be opened — asks here instead of spelling `peers`.
     #[must_use]
     pub fn dir_in(root: &Path) -> PathBuf {
         root.join(PEERS_DIR)
@@ -1150,11 +1101,10 @@ impl RecordStore {
 
     /// The path of `peer`'s record under `root`.
     ///
-    /// A record's name is this module's, so a caller that must name one without
-    /// opening the store — a repair, a backup, a case that corrupts a record on
-    /// purpose — asks here instead of spelling the directory and the extension. Opening
-    /// a store would fail on exactly the record such a caller is about, and would
-    /// create `peers/` under a root that has none.
+    /// A record's name is this module's, so a caller that must name one without opening the
+    /// store — a repair, a backup, a record that is already unreadable — asks here instead of
+    /// spelling the directory and the extension. Opening a store would fail on exactly the
+    /// record such a caller is about, and would create `peers/` under a root that has none.
     #[must_use]
     pub fn path_for(root: &Path, peer: &PeerId) -> PathBuf {
         path_in(&Self::dir_in(root), peer)
@@ -1280,11 +1230,10 @@ fn drop_attempt(record: &mut PeerRecord) -> Change {
 impl PeerPolicy for RecordStore {
     /// The handshake asks the record on disk, not this process's copy of it.
     ///
-    /// A store is a handle, and a product may hold more than one over one root — the
-    /// connection manager one, the rights layer another. Asking the file is what makes
-    /// a withdrawal written through any of them refuse the next handshake, and what
-    /// makes the refusal the far side sees the same one the decision gives. A record
-    /// that cannot be read is not trusted: the handshake fails closed.
+    /// A store is a handle, and a product may hold more than one over one root. Asking
+    /// the file is what makes a withdrawal written through any of them refuse the next
+    /// handshake, and what makes the refusal the far side sees the same one the decision
+    /// gives. A record that cannot be read is not trusted: the handshake fails closed.
     fn trusts(&self, peer: &Fingerprint) -> bool {
         self.trusted(&peer.peer_id())
     }
@@ -1578,11 +1527,6 @@ fn read_file(path: &Path, expected: &PeerId) -> Result<Option<PeerRecord>, Recor
 
 /// Publish `record` atomically: a private temporary file beside the destination,
 /// flushed, and published by one rename.
-///
-/// Every write is flushed, the address hint included: a rename of an unflushed
-/// file can leave an empty or torn record, which the next open refuses. A record
-/// that would pass `MAX_RECORD_BYTES` is refused before the temporary file is written,
-/// so this build never publishes a file it cannot read back.
 fn publish(dir: &Path, record: &PeerRecord) -> Result<(), RecordError> {
     let path = path_in(dir, &record.key);
     let bytes = encode(record, &path)?;
@@ -1886,8 +1830,7 @@ fn read_default(record: &mut PeerRecord, tag: u8, body: &[u8]) -> Result<(), Mal
     Ok(())
 }
 
-/// Read one `RIGHT` field. A capability this build does not know is kept as it
-/// arrived, and no question this build can ask matches it.
+/// Read one `RIGHT` field.
 fn read_right(record: &mut PeerRecord, tag: u8, body: &[u8]) -> Result<(), Malformed> {
     let Some(right) = Right::decode_body(body).map_err(|detail| malformed(tag, detail))? else {
         record.unknown.push((tag, body.to_vec()));

@@ -4,19 +4,17 @@
 //! # What a punch is
 //!
 //! A punch is one [`crate::peer::Connections::connect`] call that tries the addresses the peer
-//! says it can be reached at, while the peer tries this machine's, in the same round trip. There
-//! is no separate connectivity check: the authenticated handshake *is* the check — the module
-//! note in [`crate::peer::connect`] states that rule and what it implies. What is here is the
-//! set, bounded by [`MAX_CANDIDATES`] and filtered before anything is dialled, and the machinery
-//! that polls several dials at once: a punch needs both machines' packets in flight at the same
-//! time, and eight sequential dials of ten seconds each do not fit one dial's budget — so the set
-//! goes out at once, and a candidate dial is bounded by [`PUNCH_DIAL_BUDGET`] rather than by a
-//! lone dial's ten seconds.
+//! says it can be reached at, while the peer tries this machine's, in the same round trip. What
+//! is here is the set, bounded by [`MAX_CANDIDATES`] and filtered before anything is dialled,
+//! and the machinery that polls several dials at once: a punch needs both machines' packets in
+//! flight at the same time, and eight sequential dials of ten seconds each do not fit one dial's
+//! budget — so the set goes out at once, and a candidate dial is bounded by [`PUNCH_DIAL_BUDGET`]
+//! rather than by a lone dial's ten seconds.
 //!
 //! # The coordination payload
 //!
 //! A candidate list travels as a signed, opaque introduction payload — the beacon relays it
-//! without reading it, and it carries the same signature every introduction does, over both ids
+//! without acting on it, and it carries the same signature every introduction does, over both ids
 //! and the payload, so the list is authenticated as coming from the peer. It is signed and not
 //! encrypted: the beacon can read it, and that exposure is named where the payload is sent.
 //!
@@ -24,17 +22,7 @@
 //! be taken for one: [`classify`] answers [`Payload::Coordination`] only when the magic, the
 //! version, the count and every address in it decode. Any family is carried and tried — the
 //! payload uses the same family-tagged codec the ceremony does — and nothing here prefers one:
-//! the crate cannot know which family a path will work over. A ceremony flight can never start with
-//! that magic, because a flight starts with the ceremony's own version byte, and the magic
-//! starts with `m`.
-//!
-//! # The filter
-//!
-//! [`acceptable`] is the one place a candidate that arrived from the network is judged. Only
-//! addresses that came from the peer pass through it: the caller's hint and the beacon's
-//! observed address are dialled unfiltered, because a product may legitimately redial a private
-//! or local address, and because filtering the beacon's own answer would change every existing
-//! case.
+//! the crate cannot know which family a path will work over.
 //!
 //! # Why nothing here is a protocol
 //!
@@ -190,40 +178,35 @@ pub(crate) fn classify(payload: &[u8]) -> Payload {
 
 /// Whether a candidate that arrived from the peer may be dialled.
 ///
-/// Only addresses from the network pass through this. The caller's hint and the beacon's
-/// observed address are not filtered: a product may legitimately redial a private or local
-/// address, and filtering the beacon's answer would change every existing case.
+/// Which sources are filtered at all is [`crate::peer::Connections::declares`]'s rule; this is
+/// where the network half of it is applied.
 ///
 /// Refused unconditionally: loopback, link-local, multicast, the limited broadcast
 /// (`255.255.255.255`), unspecified, and this machine's own endpoints — the address of the socket
 /// this crate was handed and every address the product declared, each compared as an address
 /// *and a port*. A candidate naming one of this machine's own addresses on another port is
 /// therefore not refused here: it is dialled, and it ends as
-/// [`crate::peer::ConnectFailure::WrongPeer`] when that port is this machine's own endpoint and as
-/// an ordinary dial failure otherwise. This machine's external address — the one the beacon
+/// [`crate::peer::ConnectFailure::WrongPeer`] when that port is this machine's own endpoint and
+/// as an ordinary dial failure otherwise. This machine's external address — the one the beacon
 /// observes — is not in the filter's knowledge, because the crate never learns it: a peer that
 /// names it makes this machine dial itself, the transport refuses its own key, and the dial
 /// reports the failure.
 ///
-/// A private address is refused unless `declared` holds an address in the same block: the same /8
-/// for 10/8, the same /12 for 172.16/12, the same /16 for 192.168/16, the same /10 for the
-/// carrier-shared 100.64/10, and the same /7 for fc00::/7. The block is the whole RFC 1918 block
-/// (or shared block) and not a subnet of it, and that is the accepted cost of needing one
+/// A private candidate is admitted only through a declaration, as
+/// [`crate::peer::Connections::declares`] states; what counts as the same block is this function's:
+/// the same /8 for 10/8, the same /12 for 172.16/12, the same /16 for 192.168/16, the same /10 for
+/// the carrier-shared 100.64/10, and the same /7 for fc00::/7. The block is the whole of the /8,
+/// /12, /16, /10 or /7 above, not a subnet of it, and that is the accepted cost of needing one
 /// declaration: a peer behind this machine's own router is dialled, and so is one behind a
 /// neighbour's on the same block. The ceiling, the re-arm interval and the handshake bound what a
 /// paired peer makes of that. A subnet-directed broadcast inside a declared block — say
-/// `192.168.1.255` with `192.168.0.0/16` declared — cannot be told from a host address without
-/// the block's prefix, so it is dialled and bounded the same way. An IPv4-mapped IPv6 address is
-/// judged by the IPv4 rules.
+/// `192.168.1.255` with `192.168.0.0/16` declared — cannot be told from a host address without the
+/// block's prefix, so it is dialled and bounded the same way. An IPv4-mapped IPv6 address is judged
+/// by the IPv4 rules.
 ///
 /// The socket's own address is not a declaration: a product that binds the wildcard gets an
 /// unspecified address and declares nothing, and a private candidate is then refused, so a
-/// peer can never use this machine to sweep its network. Only what the product declared opens
-/// that gate.
-///
-/// A global unicast address is accepted. A paired peer can still name a global address that is
-/// not the peer's, and that is an accepted cost: the set is bounded by [`MAX_CANDIDATES`], a
-/// re-arm by [`PUNCH_REARM`], and the handshake still proves the key at whatever answers.
+/// peer can never use this machine to sweep its network.
 pub(crate) fn acceptable(
     candidate: SocketAddr,
     declared: &[SocketAddr],
@@ -278,10 +261,11 @@ pub(crate) fn acceptable(
     }
 }
 
-/// The RFC 1918 block an address belongs to, named by the two octets that decide it.
+/// The private block an address belongs to, named by the two octets that decide it.
 ///
 /// Two addresses are in the same block exactly when this answer is the same for both: 10/8 is
-/// named by `(10, 0)`, 172.16/12 by `(172, 16..=31)`, and 192.168/16 by `(192, 168)`.
+/// named by `(10, 0)`, 172.16/12 by `(172, 16..=31)`, 192.168/16 by `(192, 168)`, and the
+/// carrier-shared 100.64/10 by `(100, 64)`.
 fn private_block(ip: Ipv4Addr) -> Option<(u8, u8)> {
     let [first, second, ..] = ip.octets();
     match (first, second) {

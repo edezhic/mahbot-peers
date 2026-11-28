@@ -6,9 +6,8 @@
 //! is not listed here, a body that is not exactly the length its kind implies,
 //! or a stream that carries a second frame after the first is refused.
 //!
-//! This module is sans-I/O apart from [`Frame::read`] and [`write()`], which
-//! take a `quinn` stream and nothing else: the server's state machine and the
-//! client's request loop both speak these types, so the wire has one definition.
+//! The server's state machine and the client's request loop both speak these types,
+//! so the wire has one definition.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::time::Duration;
@@ -60,8 +59,8 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// Build a frame. Nothing is validated: this is the constructor the test rig
-    /// uses to speak bytes the typed messages would not produce.
+    /// Build a frame. Nothing is validated: a caller that must speak bytes the typed
+    /// messages would not produce builds one here.
     #[must_use]
     pub fn new(version: u8, kind: u8, body: Vec<u8>) -> Self {
         Self {

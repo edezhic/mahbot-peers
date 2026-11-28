@@ -15,14 +15,6 @@
 //! not a secret: the beacon can compute it from what it relays, and what it must
 //! never do is carry or store it.
 //!
-//! The flights, in order:
-//!
-//! 1. the initiator's commitment;
-//! 2. the responder's fresh value, bound to that commitment;
-//! 3. the initiator's fresh value, checked against its commitment;
-//! 4. the initiator's confirmation;
-//! 5. the responder's confirmation.
-//!
 //! Every flight is an introduction the sender signed, and the receiver refuses one
 //! whose signature does not verify; the beacon can neither alter nor re-attribute a
 //! flight. What it can do is replay an old one: the answer is bound to the
@@ -271,7 +263,7 @@ impl Body {
 /// The one question an introduction payload that arrived from the network is asked before it is
 /// allowed near a ceremony. A payload that is not one of these must never reach a ceremony: an
 /// older build ends its ceremony on any payload outside the set, so a payload this build does not
-/// understand is dropped rather than delivered. One parse answers both.
+/// understand is dropped rather than delivered.
 pub(crate) fn ceremony_flight(payload: &[u8]) -> Option<bool> {
     match Message::parse(payload) {
         Ok(message) => Some(message.kind() == Kind::Commit),
@@ -394,10 +386,7 @@ pub enum Outcome {
 
 /// One side of one ceremony, as a state machine.
 ///
-/// It holds no I/O: a caller feeds it the peer's payloads and sends what it asks
-/// for. [`run`] is the driver that does both over this machine's registration at
-/// the beacon; the test rig drives the machine directly when it has to stand
-/// between two of them.
+/// It holds no I/O: a caller feeds it the peer's payloads and sends what it asks for.
 pub struct Ceremony {
     me: PeerId,
     peer: PeerId,
@@ -784,8 +773,7 @@ pub enum Opening {
 ///
 /// The ceremony awaits the answer, so a person who takes minutes does not block the
 /// reactor: a caller with a blocking UI implements this over an async channel. The
-/// blanket implementation below is the immediate answer a test or a scripted policy
-/// gives.
+/// blanket implementation below is the immediate answer a closure gives.
 pub trait Person: Send {
     /// Show the six symbols and answer whether they matched the other machine's.
     fn ask(&mut self, comparison: Comparison) -> impl Future<Output = bool> + Send;
@@ -814,10 +802,6 @@ where
 /// six symbols and answers whether they matched the other machine's. It is awaited, so a person
 /// who takes minutes does not block the reactor; a caller with a blocking UI implements
 /// [`Person`] over an async channel.
-///
-/// A machine that starts and receives the other machine's opening flight applies the fingerprint
-/// rule: the smaller fingerprint's attempt wins, and the loser's is dropped without counting
-/// against anybody.
 ///
 /// A responder waits for the other machine for as long as its person might still start on their
 /// side, so this call does not end because nothing has arrived yet, and it never names a cause

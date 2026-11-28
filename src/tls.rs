@@ -76,8 +76,7 @@ pub(crate) fn refusal(
     }
 }
 
-/// Who a connection may talk to. A machine's peer store implements this; the
-/// test harness backs it with an in-memory set of fingerprints.
+/// Who a connection may talk to.
 pub trait PeerPolicy: fmt::Debug + Send + Sync {
     fn trusts(&self, peer: &Fingerprint) -> bool;
 }
@@ -104,10 +103,9 @@ pub fn client_config(
 
 /// A client configuration with a caller-supplied certificate resolver.
 ///
-/// The resolver is where the client's identity comes from, so a caller can
-/// present a key it holds elsewhere — or, in a test, present none at all. `me` is
-/// still needed: it names the machine whose own key must never be accepted back
-/// from the network.
+/// The resolver is where the client's identity comes from, so a caller can present a key it
+/// holds elsewhere. `me` is still needed: it names the machine whose own key must never be
+/// accepted back from the network.
 ///
 /// # Why resumption is off
 ///

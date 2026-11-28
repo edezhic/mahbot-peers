@@ -15,14 +15,8 @@
 //! that can be re-sent on the next connection: the exchange never fails a connection
 //! and never closes one. The whole exchange is bounded by [`EXCHANGE_BUDGET`] of the
 //! injected runtime's time, so a peer that opens a stream and stalls cannot park a
-//! task.
-//!
-//! The machine that started the connection opens the stream, writes its fact,
-//! finishes, and reads the reply; the machine that accepted reads first, then writes
-//! its own. What comes back is the peer's fact as it arrived, byte for byte, so a
-//! caller stores exactly what the other side sent; a peer with no fact writes nothing,
-//! and an empty body is stored as no fact. The exchange is the first stream on a
-//! kept connection: it runs at adoption, before anything the pair says follows it.
+//! task. What comes back is the peer's fact as it arrived, byte for byte, and a peer
+//! with no fact writes nothing.
 //!
 //! # What the exchange is not
 //!
@@ -49,12 +43,9 @@ pub const EXCHANGE_BUDGET: Duration = Duration::from_secs(10);
 
 /// Exchange the connection level's fact over a live connection, best effort.
 ///
-/// The machine that started the connection opens the stream, writes its fact,
-/// finishes, and reads the reply; the machine that accepted reads first, then writes
-/// its own. The answer is the bytes the other side sent, or `None` when the exchange
+/// The answer is the bytes the other side sent, or `None` when the exchange
 /// failed — a peer that does not answer, a stream that stalls, bytes that are not a
-/// fact. A peer with no binding writes nothing, and an empty body is kept as no fact by
-/// the store; the connection stands either way, and the next one tries again.
+/// fact. The connection stands either way, and the next one tries again.
 pub(crate) async fn exchange(
     connection: &Connection,
     local: Option<Fact>,

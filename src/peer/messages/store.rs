@@ -28,24 +28,10 @@
 //!   previous queue in place. A queue that would pass [`MAX_MESSAGES_BYTES`] is refused
 //!   before the temporary file is written, so this build never publishes a file it cannot
 //!   read back.
-//! - **One writer at a time, on this machine and on the root.** This process writes one
-//!   queue at a time: a mutex is held across the whole read-modify-publish, so two tasks
-//!   cannot lose each other's work, and two peers written at the same instant wait for one
-//!   write and the flush at the end of it. One lock file per peer's queue is held for the
-//!   same span, so the self-update window's second process cannot lose a message either;
-//!   that lock is per peer, so a second process writing another peer's queue never waits for
-//!   this one. The record merges and the log appends; a queue is the one file that must be
-//!   locked, because it is rewritten whole.
 //! - **A queue is private.** The directory and every file are held to the key file's rule,
 //!   and a file reachable by another account is refused rather than read.
 //!
 //! # Blocking
-//!
-//! Every operation is a small blocking file operation, like the record's. The delivery sink
-//! runs with no lock held — the decision is taken, the lock is let go, the caller is handed
-//! the message, and the record is made under the lock again — so a caller's own code never
-//! decides how long another peer waits: a slow sink delays that peer's later messages and
-//! nothing else.
 //!
 //! The waits this layer makes are its own and are bounded: another writer's lock file is
 //! never waited on at all (it answers [`MessageError::Busy`] and the write is retried), and
@@ -425,12 +411,10 @@ impl MessageStore {
 
     /// Drop every queued message whose retention passed at `now`.
     ///
-    /// `record` is the audit entry, and it runs with no queue lock held: the queue is read
-    /// and let go, the entry is appended, and the queue is read again to remove what is
-    /// still there. The log has a cross-process lock of its own, and taking it while a
-    /// peer's queue is held would let another process's log write hold every queue this
-    /// machine is dropping. It is not called when nothing expired, and it cannot refuse: a
-    /// log that will not take the entry must not keep bodies on disk.
+    /// The log has a cross-process lock of its own, and taking it while a peer's queue is
+    /// held would let another process's log write hold every queue this machine is
+    /// dropping. It is not called when nothing expired, and it cannot refuse: a log that
+    /// will not take the entry must not keep bodies on disk.
     pub(crate) fn drop_expired(
         &self,
         peer: &PeerId,

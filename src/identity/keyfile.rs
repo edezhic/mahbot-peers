@@ -29,25 +29,23 @@
 //!   the file. That is the whole cost of losing the key: a new identity, unknown
 //!   to every other machine, and a fresh acquaintance with each of them.
 //! - No account but the owner can reach it, and on Windows the two system accounts a
-//!   backup needs: on unix the mode and the owning account, on macOS also the
-//!   extended access list, on Windows a protected list naming the owner, `SYSTEM` and
+//!   backup needs: on unix the mode and the owning account, on macOS also the extended
+//!   access list, on Windows a protected list naming the owner, `SYSTEM` and
 //!   `Administrators` — chosen so an operator is never pushed into loosening the
 //!   check — and the file owned by the account the process runs as, because an owner
 //!   may rewrite the list of what it owns. Any other reach is a
-//!   [`KeyFileError::Insecure`](crate::identity::keyfile::KeyFileError::Insecure),
-//!   which is distinct from "missing" and from "not a key", so a caller cannot
-//!   confuse it with either and cannot continue silently. Its message names the
-//!   accounts involved — or says that no account can be named — and, where one
-//!   command built from the path (and, on Windows, `%USERNAME%`) restores exactly the
-//!   state the rule requires, that command; `identity::access` lists every refusal with
-//!   its platform and its words, and gives the dependency of each repair it does not
-//!   append.
-//!   When the storage root itself hands a new file an access its mode cannot
-//!   override, the refusal is
-//!   [`KeyFileError::RootNotPrivate`](crate::identity::keyfile::KeyFileError::RootNotPrivate):
-//!   it happens before a key is minted, names the root and what has to change, and
-//!   appends a command only for two access-list causes — a macOS entry or an inherited
-//!   Windows list.
+//!   [`KeyFileError::Insecure`](crate::identity::keyfile::KeyFileError), which is
+//!   distinct from "missing" and from "not a key", so a caller cannot confuse it with
+//!   either and cannot continue silently. Its message names the accounts involved —
+//!   or says that no account can be named — and, where one command built from the
+//!   path (and, on Windows, `%USERNAME%`) restores exactly the state the rule requires,
+//!   that command; `identity::access` lists every refusal with its platform and its
+//!   words, and gives the dependency of each repair it does not append.
+//!   [`KeyFileError::RootNotPrivate`](crate::identity::keyfile::KeyFileError) is the
+//!   refusal when the storage root itself hands a new file an access its mode cannot
+//!   override: it happens before a key is minted, names the root and what has to
+//!   change, and appends a command only for two access-list causes — a macOS entry or
+//!   an inherited Windows list.
 //! - A copy of a storage root is the same identity. That is how a restored backup
 //!   keeps its machine, and it is also a clone: the transport refuses a peer that
 //!   presents this machine's own key ([`crate::tls::Refusal::OwnIdentity`]).
@@ -275,8 +273,6 @@ fn read(path: &Path) -> Result<Option<Identity>, KeyFileError> {
 }
 
 /// Mint a key and publish it under `root` unless another creator already did.
-///
-/// The root is checked by [`load_or_create`], the only caller.
 fn create(root: &Path) -> Result<Identity, KeyFileError> {
     let path = file_in(root);
     let io_error = |source| KeyFileError::Io {

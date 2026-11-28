@@ -1,12 +1,8 @@
 //! The stream half every peer service shares: read a frame's kind, read the rest under a cap,
 //! and write an answer back under a bound.
 //!
-//! A pair's connection carries one bidirectional stream per message offer, one per action
-//! request and one per transfer attempt, and the binding exchange owns the first stream a kept
-//! connection carries. Exactly one place accepts a stream after that exchange —
-//! [`crate::peer::inbox`] — and it classifies the frame by its magic before handing it to the
-//! layer that owns it. This module holds the three operations that classification and every
-//! layer need, so a prefix, a cap and a reply bound are written once.
+//! Exactly one place accepts a stream after the binding exchange — [`crate::peer::inbox`] — and it
+//! classifies the frame by its magic before handing it to the layer that owns it.
 
 use std::future::Future;
 use std::pin::pin;
@@ -104,9 +100,8 @@ pub(crate) async fn read_rest(
 
 /// Write `bytes` whole, bounded; `false` when the stream took less than all of them.
 ///
-/// The bounded write the answer paths share. A budget that passes cancels `write_all` where it
-/// stands, so a caller that gets `false` has a fragment on the stream and must treat it as
-/// broken rather than writing after it.
+/// A budget that passes cancels `write_all` where it stands, so a caller that gets `false` has
+/// a fragment on the stream and must treat it as broken rather than writing after it.
 pub(crate) async fn write_whole(
     runtime: &dyn Runtime,
     send: &mut SendStream,

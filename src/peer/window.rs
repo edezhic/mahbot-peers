@@ -1,9 +1,9 @@
 //! The per-peer token window the three peer services throttle with.
 //!
 //! A service that answers a peer's requests — a message, an action or a transfer — keeps one
-//! window per peer: when the window started and how many requests it admitted. A request
-//! beyond the limit is answered with the delay until the window turns, and each service holds
-//! its own windows, so a flood of one service's requests cannot throttle the other two.
+//! window per peer. A request beyond the limit is answered with the delay until the window
+//! turns, and each service holds its own windows, so a flood of one service's requests cannot
+//! throttle the other two.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;

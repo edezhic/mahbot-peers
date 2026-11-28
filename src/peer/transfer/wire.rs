@@ -54,10 +54,6 @@
 //! as "not understood", which is what the sender does with any answer it cannot read. The
 //! set is closed, so a class added after this build shipped is not a wire value this build
 //! can write.
-//!
-//! Nothing here says why a frame could not be read: a decoder answers `None`, and the two
-//! call sites turn that into the one word the layer has for it — `malformed` on the
-//! receiving side, "not understood" on the sending one.
 
 use crate::peer::transfer::{Digest, TransferAnswer, TransferLimit, TransferName};
 use crate::peer::{Step, tlv};

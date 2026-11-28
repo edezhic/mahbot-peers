@@ -4,58 +4,11 @@
 //! # Its own thing
 //!
 //! A file does not travel as a stream of messages. It is a transfer in its own right: one
-//! bidirectional stream per attempt, an offer, the receiving machine's answer, then the
-//! file's bytes, then the receiver's verdict. It does not inherit the message layer's body
-//! cap, does not consume its window, its queue, its taken identifiers or its retention, and
-//! a transfer frame is never counted as a message. The inbox tells the two apart by the
-//! frame's magic; a frame it does not recognise is still handed to the message layer, which
-//! is exactly what makes an older peer answer "unreadable" to an offer.
-//!
-//! # The direction, and whose decision it is
-//!
-//! One way: a machine offers a file and it lands on the peer. Only the receiving machine's
-//! decision is asked, because it bears the effect: the permission is
-//! [`Capability::PUT_FILES`](crate::peer::Capability::PUT_FILES) ("put files on me"), never
-//! the default, and the host's floor is asked after it with the same capability. The sending
-//! machine's own person is the one acting, so no second grant is required — exactly as sending
-//! a message requires only the receiver's "write to me". A peer asking this machine for a file
-//! of its own is not served, which is why "take files from me" is inert.
-//!
-//! # What the product supplies
-//!
-//! The crate moves bytes and decides whether it may; the product says where they go and what
-//! they are. It supplies a [`Source`] that answers bytes at an offset, including after a
-//! reconnect, and may answer [`Read::NotNow`] rather than block; a [`Sink`] that accepts
-//! bytes at an offset, is told which peer is sending, and answers what it holds for a name
-//! — how many bytes, and which digest they were being assembled toward — and what it
-//! assembled once it holds them all; and the file's length and the SHA-256 digest it must
-//! have, when the transfer is offered. The sink's three questions are lookups that answer
-//! without waiting — the crate asks them while the sending machine waits on its bound, so a
-//! product that hashed on demand would answer after the sender had given up (see [`Sink`]).
-//! The crate never writes the file, never hashes it and never turns its name into a path: a
-//! transfer's name is the sending product's, scoped to one peer, carried as given and bounded
-//! in length, and the crate only compares two names for equality. On the receiving side it is
-//! the sending peer's word rather than this machine's product's — see [`Sink`].
-//!
-//! A product with no sink has nowhere to put a file: a peer with no right is refused at the
-//! right step, and a peer that holds the right and finds nothing behind it is refused at the
-//! floor — this layer's own, recorded like any other floor refusal. The two are never the same
-//! answer, and the crate never reads the product's configuration as a rights fact: it asks the
-//! floor, and the floor is where a machine's own policy lives.
-//!
-//! # The memory bound
-//!
-//! A transfer's bytes are the transport's, not this layer's: the receiving machine's
-//! connection credit is [`crate::net::MAX_BUFFERED_BYTES`] and one stream's is
-//! [`crate::net::MAX_STREAM_BYTES`], so at most [`MAX_RUNNING_TRANSFERS`] transfers account
-//! for half the connection's credit and the rest stays available to messages and actions. That
-//! limit is one decision under one lock on the receiving side, so offers that arrive together
-//! cannot take more than it — a guarantee this workspace's single-threaded rig cannot race, so
-//! no case produces it. A sink that answers [`Stored::NotNow`] stops this machine reading, which
-//! stops the sender through QUIC's flow control instead of growing memory, dropping the file or
-//! stalling the pair's messages. What this machine sends is bounded by the same number: quinn
-//! retains at most [`crate::net::MAX_BUFFERED_BYTES`] of its own writes, whatever window the
-//! peer advertises, so a product's file cannot make this machine queue without limit either.
+//! bidirectional stream per attempt. It does not inherit the message layer's body cap, does not
+//! consume its window, its queue, its taken identifiers or its retention, and a transfer frame is
+//! never counted as a message. The inbox tells the two apart by the frame's magic; a frame it does
+//! not recognise is still handed to the message layer, which is exactly what makes an older peer
+//! answer "unreadable" to an offer.
 //!
 //! # Resume, and the difference between a lost connection and a stopped transfer
 //!
@@ -64,36 +17,11 @@
 //! states how much it already holds, and the sender continues from there. A transfer with a live
 //! connection that stops moving bytes is abandoned after [`TRANSFER_STALL`], on either side — the
 //! receiver records the same cause rather than showing it as a wait — and [`TRANSFER_STALL`] states
-//! what each kind of answered round spends.
-//! The sending side's own bound is [`TRANSFER_STALL`] plus [`TRANSFER_GRACE`], whose own doc states
-//! what that margin carries and what lies outside it; a receiver reaching its own bound is heard as
-//! the answer it gave instead of being timed out first. One that waits longer than
-//! [`TRANSFER_WAIT`] for the pair ends as [`TransferFailure::NoPair`] — "the pair never answered",
-//! not a claim that it was absent — and the receiving side reports the same for a transfer whose
-//! sender never came back, so a dead transfer is never shown as a quiet one. Both bounds are
-//! budgets a transfer spends and neither is an episode that restarts: they are added up over every
-//! attempt and every wait, and the receiving machine's stated offset growing is the only thing that
-//! clears either (see `Bounds`) — so a transfer that has been moving bytes for an hour is still
-//! waited for in full when its connection drops, while a pair that keeps coming back and moving
-//! nothing exhausts the budget instead of parking the transfer. An ended transfer on the receiving
-//! side stays visible to the product for the wait bound after it ended, and is forgotten once that
-//! has passed. A transfer that is already complete on the receiver is answered complete instead of
-//! being sent again. A name the receiving machine's person stopped stays stopped: every later offer
-//! under it is answered `stopped` until the wait bound passes, so a stop is not undone by the
-//! sender asking again. One the *sending* machine's product stopped is a different act: it is
-//! [`TransferState::Stopped`] at once, the stream is reset with the transfer's stop code, and the
-//! receiving machine learns that the sending side stopped it — but that is not the receiving
-//! person's decision, so the name is free, and a sending product that offers the file again gets a
-//! fresh transfer rather than being told the receiving person stopped something they never saw. A
-//! stop reaches every phase of a transfer, the tail included: once the bytes are written the
-//! transfer waits for the receiving side's verdict, which for a slow sink is most of its life, and
-//! a stop there ends it as stopped and gives one of this machine's places for the peer back rather
-//! than finishing a file its person cancelled. The two waits it does not poll are not on the
-//! transfer's own clock — a dial already under way, and a stream the peer has not made room for
-//! (see [`Transfer::stop`]). Nothing of a transfer's own state is kept across a process restart on
-//! either side: the product offers the file again and the receiver states what it holds. The
-//! authorisation is not transfer state — it is an audit
-//! entry, kept like every other allowed act (see below).
+//! what each kind of answered round spends. One that waits longer than [`TRANSFER_WAIT`] for the
+//! pair ends as [`TransferFailure::NoPair`], and the receiving side reports the same for a
+//! transfer whose sender never came back, so a dead transfer is never shown as a quiet one. A
+//! transfer that is already complete on the receiver is answered complete instead of being sent
+//! again.
 //!
 //! The decision is made once, when the transfer is authorised, and holds for its whole life,
 //! including across a reconnect: a right withdrawn afterwards ends future transfers, not
@@ -112,48 +40,20 @@
 //! # The closed answer set
 //!
 //! Every cause is its own answer, never merged into a neighbour, and a product sees them as
-//! [`TransferFailure`]. What the sender learns from the receiving machine: it arrived; it was
-//! already complete there; a transfer under that name is already running there; it was refused
-//! and at which step; it was not run because the machine could not write its own record of the
-//! act; a limit was reached and which one; the name is already held with
-//! different content; what arrived does not match the digest; the receiving side could not
-//! store it; the receiving side's person stopped it; and the offer itself could not be
-//! understood. What the sender learns about its own side: no progress — a live connection that
-//! stopped moving bytes, or a record this machine could not read for the whole wait bound — a
-//! pair that never answered, its own product stopped it, its own source could not be
-//! read, this machine no longer trusts the peer, and nothing arrived that it could understand —
-//! a peer answering in another vocabulary, or a status byte this build cannot read. A
-//! zero-length file and an empty name are refused locally, before anything is sent. An offer that
-//! arrives before this machine has a pair to decide under is answered nothing at all, and the
-//! sender asks again, as the message and action layers leave it — with a wait that doubles after
-//! each offer the pair left unanswered, so a pair that never binds is not offered a file once a
-//! second for the whole wait bound. Every offer that is not a resume does spend one start of the
-//! receiving machine's window, which is what the doubling is for; a resume is the same transfer and
-//! spends none. A throttle met after a whole window of offers the pair answered with nothing ends
-//! as [`TransferFailure::NoPair`] rather than as a limit, because the window it met is one this
-//! machine filled itself: a pair with no binding to decide under answers offers with nothing, so
-//! those offers were this machine's own, and that is what the transfer met. Any answer that is not
-//! a bare limit — a `running` answer to an offer, or a throttle after the receiving machine took
-//! the transfer — starts the count again, so a pair that is there and whose window is full is the
+//! [`TransferFailure`]. An offer that arrives before this machine has a pair to decide under is
+//! answered nothing at all, and the sender asks again, as the message and action layers leave
+//! it — with a wait that doubles after each offer the pair left unanswered, so a pair that never
+//! binds is not offered a file once a second for the whole wait bound. Any answer that is not a
+//! bare limit — a `running` answer to an offer, or a throttle after the receiving machine took the
+//! transfer — starts the count again, so a pair that is there and whose window is full is the
 //! limit it met, and says so.
 //!
 //! The one answer that is not an end is the start limit's throttle: the receiving machine names
 //! how long to wait before starting another transfer, the sender shows that as
 //! [`TransferState::Throttled`] and asks again when it passes. A limit on running transfers is
-//! still terminal, because this machine's own count would have refused a third one locally.
-//! Both numbers in a throttle are this machine's in the end: the delay is clamped to
-//! [`TRANSFER_THROTTLE_CAP`], and a peer that keeps throttling for the whole wait bound ends the
-//! transfer with the limit it kept meeting rather than parking it for ever — unless the offset it
-//! states keeps growing, which ends the streak: a throttle that arrives with a grown offset is
-//! pacing a transfer that is moving, so only a peer that throttles while moving nothing is ended
-//! by the bound. The start limit means that one thing wherever it is read — in an answer to an
-//! offer, in a word while the bytes are moving, or in the verdict that follows them.
-//!
-//! The one answer that travels the other way is not an answer frame: a sending product that
-//! stops a running transfer resets the stream, which the receiver reads as "the sending side
-//! stopped it". File bytes are unframed, so a reset is the one signal a reader cannot mistake
-//! for them — and a receiver whose sink is answering "not now" reads the stream once more
-//! before it gives up, because a reset is only visible by reading.
+//! still terminal, because this machine's own count would have refused a third one locally. The
+//! start limit means that one thing wherever it is read — in an answer to an offer, in a word
+//! while the bytes are moving, or in the verdict that follows them.
 //!
 //! An answer that is still arriving is never a refusal: a frame the budget caught half-written
 //! is kept and continued by the next look, so a word split across two looks is read once, and a
@@ -199,9 +99,7 @@
 //! No queue, no retention, no journal of its own, no file on disk: the crate holds a transfer's
 //! name, its length, its digest and how far it has got in memory while it runs, and nothing of that
 //! after a restart. What it does keep is the authorisation, an audit entry like every other allowed
-//! act, naming the same name, length and digest. Where a file lands, how it is named on disk and
-//! what happens to a partial file are the product's decisions, and the crate never makes them
-//! silently.
+//! act, naming the same name, length and digest.
 
 mod wire;
 
@@ -243,18 +141,18 @@ pub const TRANSFER_CHUNK: usize = 64 * 1024;
 
 /// How long a transfer with a live connection may stop moving bytes before it is abandoned.
 ///
-/// It is a bound on *no progress*, not on a transfer's length: a transfer that keeps the
-/// receiving machine's stated offset growing is never abandoned, so a slow link and a slow sink
-/// are allowed to take as long as they take — a slow source too, as long as it produces
-/// something inside the bound: one that produces nothing for the whole of it is no progress.
-/// It is a budget the transfer spends, not an instant it re-anchors: the receiving machine's stated
-/// offset growing is the only thing that clears it (see `Bounds`). A round the receiving machine
-/// paced spends neither bound and clears neither; any other answered round buys time only by
-/// stating a further offset, which clears both; an answered round that states no further offset is
-/// charged the stall bound — the whole of its own duration as well as the pause after it, so a peer
-/// that keeps this machine waiting before saying "the same offset" spends the bound at the rate it
-/// really passes. Bytes the stream accepted are not growth: a connection that comes back and moves
-/// nothing buys the transfer nothing.
+/// It is a bound on *no progress*, not on a transfer's length: a transfer that keeps the receiving
+/// machine's stated offset growing is never abandoned, so a slow link and a slow sink are allowed
+/// to take as long as they take — a slow source too, as long as it produces something inside the
+/// bound: one that produces nothing for the whole of it is no progress. It is a budget the transfer
+/// spends, not an instant it re-anchors: the receiving machine's stated offset growing is the only
+/// thing that clears it. A round the receiving machine paced spends neither bound and clears
+/// neither; any other answered round buys time only by stating a further offset, which clears both;
+/// an answered round that states no further offset is charged the stall bound — the whole of its
+/// own duration as well as the pause after it, so a peer that keeps this machine waiting before
+/// saying "the same offset" spends the bound at the rate it really passes. Bytes the stream
+/// accepted are not growth: a connection that comes back and moves nothing buys the transfer
+/// nothing.
 pub const TRANSFER_STALL: Duration = Duration::from_secs(60);
 
 /// The margin the sending machine's bound keeps past the receiving machine's worst honest
@@ -341,9 +239,7 @@ pub(crate) const TRANSFER_ANSWER_BUDGET: Duration = Duration::from_secs(30);
 ///
 /// The receiver's count and its record of the new transfer are one decision under one lock, so
 /// two offers that arrive together cannot both take the last place — which is what keeps
-/// [`crate::net::MAX_STREAM_BYTES`] twice over a real bound on the connection's credit. The
-/// workspace's rig runs one task at a time and cannot race the two, so that half of the
-/// guarantee is structural and no case produces it.
+/// [`crate::net::MAX_STREAM_BYTES`] twice over a real bound on the connection's credit.
 pub const MAX_RUNNING_TRANSFERS: usize = 2;
 
 /// How many transfers one peer may start per [`TRANSFER_START_WINDOW`].
@@ -504,7 +400,9 @@ impl Held {
 pub enum Stored {
     /// Every byte was taken, at the offset it was given.
     Accepted,
-    /// Not now: the sink is not ready and the transfer should ask again rather than block.
+    /// Not now: the sink is not ready and the transfer should ask again rather than block. A sink
+    /// that answers this stops this machine reading, which stops the sender through QUIC's flow
+    /// control instead of growing memory, dropping the file or stalling the pair's messages.
     NotNow,
     /// The sink will not take these bytes. The class travels and the sender is answered
     /// `store failed`; the product's own reason is its own, and stays where it is known.
@@ -604,12 +502,9 @@ pub enum TransferState {
         failure: TransferFailure,
     },
     /// The receiving machine asked this machine to wait before starting another transfer:
-    /// a limit on starts, with the delay it named. The transfer asks again when it passes.
-    ///
-    /// The delay is never longer than [`TRANSFER_THROTTLE_CAP`] and never shorter than a poll,
-    /// whatever the receiving machine wrote: a number from the peer is bounded here.
+    /// a limit on starts. The transfer asks again when it passes.
     Throttled {
-        /// How long the receiving machine asked this machine to wait.
+        /// How long this machine waits before asking again.
         retry_after: Duration,
     },
     /// A product stopped it: this machine's own on the sending side, the peer's on the
@@ -682,10 +577,11 @@ pub enum TransferFailure {
     Limit {
         /// Which one.
         which: TransferLimit,
-        /// How long the receiving machine last asked this one to wait before asking again, for
-        /// the start limit this machine kept meeting. `None` for a limit that only waits for
-        /// room — this machine's own count of running transfers, and a peer's limit on them,
-        /// carry no delay because nothing acts on one.
+        /// How long the receiving machine named as the wait when it refused the start, clamped to
+        /// what this machine honours. The transfer has ended, so nothing acts on it here: it is
+        /// what a product shows, and a retry started after it is a new transfer. `None` for a
+        /// limit that only waits for room — this machine's own count of running transfers, and a
+        /// peer's limit on them, carry no delay because nothing acts on one.
         retry_after: Option<Duration>,
     },
     /// A transfer under that name is already running on the receiving machine — a second
@@ -714,12 +610,8 @@ pub enum TransferFailure {
     /// offer it made, which is what a pair with no binding to decide under looks like from here, or
     /// every offer after the last one it answered. That last reading is the accepted residual: a
     /// pair that is present and answers nothing is reported this way, and it is not a claim that
-    /// the pair was absent. An answer that is not a bare limit keeps this reading off the start
-    /// window — it starts the count of unanswered offers again, so the limit the transfer then
-    /// meets is the limit it met, however slow the pair was to take the file. An answer that ends
-    /// the attempt without pacing it buys more time only by stating a further offset;
-    /// [`TRANSFER_STALL`] states what each kind of answered round spends. So a pair that answers
-    /// and then goes silent still ends this way at the wait bound.
+    /// the pair was absent. So a pair that answers and then goes silent still ends this way at the
+    /// wait bound.
     NoPair,
     /// The sending side's source could not be read: it ended early or failed. On the sending
     /// machine that is its own product; on the receiving one it is the peer's.
@@ -1062,10 +954,8 @@ impl Shared {
 enum Attempt {
     /// The connection could not be used at all: no stream to write the offer on, or the offer
     /// could not be written. Nothing left this machine, so the pair can hold nothing from this
-    /// attempt and it is not an offer: the flag that says an offer left is left as it was, so a
-    /// next attempt before any offer of this transfer left is still the first offer. Which is why
-    /// it goes where no connection at all goes, and why it is not [`Self::Unanswered`]: the pair
-    /// answered nothing because it was asked nothing.
+    /// attempt and it is not an offer. Which is why it goes where no connection at all goes, and
+    /// why it is not [`Self::Unanswered`]: the pair answered nothing because it was asked nothing.
     Unusable,
     /// The offer was written and nothing came back: no answer, no word, or a stream that went
     /// away before its answer did — what a pair with no binding to decide under looks like from
@@ -1530,9 +1420,7 @@ impl Transfers {
     /// is forgotten. Every peer's entries are swept, not only the one being asked about, so the
     /// wait bound really is what bounds the map: at most [`MAX_RUNNING_TRANSFERS`] of a peer's
     /// transfers are live at once, the start limit keeps the count small, and an ended one is
-    /// forgotten a wait bound after it ended. [`Self::incoming`], [`Self::stop_incoming`] and
-    /// the receiving side of an offer all run it, so the product never sees a dead transfer as a
-    /// quiet one and never sees one go from failed to absent without the wait bound passing.
+    /// forgotten a wait bound after it ended.
     fn expire(&self, now: Timestamp) {
         let mut remembered = self.remembered();
         for authorised in remembered.values_mut() {
@@ -1548,7 +1436,6 @@ impl Transfers {
         });
     }
 
-    /// The sender's whole life: wait for the pair, attempt, and repeat until it ends.
     #[expect(
         clippy::too_many_lines,
         reason = "the loop is the order of the waits: trust, the pair, its binding exchange, the stall bound, then one attempt, each with the bound that ends it"
@@ -1782,11 +1669,6 @@ impl Transfers {
     }
 
     /// Sleep out `after`, noticing a stop; `true` is stopped.
-    ///
-    /// The throttle and the retry backoff are the longest waits a transfer has outside a bound,
-    /// and a product's person may change their mind during one. Sleeping in polls is what lets
-    /// the transfer end then instead of holding one of this machine's places for the peer for
-    /// the whole wait.
     async fn pause(&self, shared: &Shared, after: Duration) -> bool {
         let until = self.runtime.now() + after;
         loop {
@@ -1803,11 +1685,6 @@ impl Transfers {
 
     /// Wait out `pause` in polls, noticing a stop, spend it on the wait bound, and answer the
     /// state that ends the wait once that bound has passed.
-    ///
-    /// The one spelling of every wait this transfer has for something that may never arrive: the
-    /// pair's connection, its binding exchange, this machine's own record, an offer nothing
-    /// answers. `ends` is what the transfer is reported as when the bound is spent; a caller that
-    /// also paces a retry doubles its own pause after this wait, up to [`TRANSFER_RETRY_CAP`].
     async fn wait_out(
         &self,
         shared: &Shared,
@@ -1825,10 +1702,6 @@ impl Transfers {
             .then_some(TransferState::Failed { failure: ends })
     }
 
-    /// One attempt on a live connection: offer, answer, bytes, verdict.
-    ///
-    /// `offered` says whether any offer of this transfer has already left this machine, which is
-    /// what tells the receiver's `running` answer apart: see the arm below.
     async fn attempt(
         &self,
         traffic: &Traffic,
@@ -1941,20 +1814,7 @@ impl Transfers {
     /// Read the receiver's verdict after the file's bytes, and the progress words a slow sink
     /// sends while it stores the tail.
     ///
-    /// The bound is [`TRANSFER_SENDER_BOUND`] from the last time the receiver's stated offset
-    /// *grew*: the receiving machine's own worst honest silence plus [`TRANSFER_GRACE`], which
-    /// states what that margin carries and what lies outside it. A receiver that has moved its
-    /// offset keeps the bound alive; one that has said nothing new for it is `no progress`, whether
-    /// it is silent or repeating itself.
-    /// `landed` is the furthest the receiver said it holds; it is carried out of the attempt so
-    /// that a word read here is not thrown away.
-    ///
-    /// The look is short and the bound is long, so a stop reaches the tail: the tail is where a
-    /// slow sink spends most of a transfer's life, and a product's person is most likely to
-    /// change their mind there.
-    ///
-    /// A look waits on the stream when there is nothing left to read, which is what yields. A
-    /// peer that floods words cannot buy itself time with them: the bound below is the runtime's
+    /// A peer that floods words cannot buy itself time with them: the bound below is the runtime's
     /// clock, checked on every look, and not a count of looks.
     async fn verdict(
         &self,
@@ -2006,10 +1866,6 @@ impl Transfers {
     }
 
     /// One look at the receiving side's half, in the terms both readers of it need.
-    ///
-    /// `landed` is the furthest offset the receiver has stated, and this is the one place it
-    /// grows: a `running` answer past it is [`Word::Progress`], and one that repeats it is
-    /// [`Word::Quiet`] — which is the whole of the progress rule, stated once in [`Bounds`].
     async fn word(&self, words: &mut Words<'_>, landed: &mut u64, length: u64) -> Word {
         match self.read_answer(words, TRANSFER_POLL).await {
             Heard::Answer(TransferAnswer::Running { have }) => {
@@ -2029,14 +1885,6 @@ impl Transfers {
     }
 
     /// Read one answer frame, bounded, continuing a frame an earlier look left half-read.
-    ///
-    /// An answer is recognised by its magic, which is read first: bytes that open with anything
-    /// else are a peer answering in another vocabulary — an older peer answers a transfer offer
-    /// with the message layer's `unreadable` — and a *whole* frame this build cannot decode is
-    /// the same "not understood". An unfinished frame is neither: a budget that passes with the
-    /// stream still open is [`Heard::Silent`], and the bytes so far are kept so the next look
-    /// carries on instead of reading the rest of the body as a new frame. A stream that ends or
-    /// is reset before the frame is whole is [`Heard::Gone`] — a lost attempt, never a refusal.
     async fn read_answer(&self, words: &mut Words<'_>, budget: Duration) -> Heard {
         let frame = read_frame(
             &*self.runtime,
@@ -2065,14 +1913,7 @@ impl Transfers {
     /// one — with the source answering "not now" when it does — is not a dial that carried
     /// nothing.
     ///
-    /// A write that parks is not a stall. The transport returns flow-control credit in large
-    /// steps, so a receiving side storing one chunk at a time can hold the writer at a stream
-    /// window's edge for minutes while it is working; while a write is parked, and while this
-    /// machine's own source is not ready, this listens on the receiver's half of the stream. The
-    /// offset the receiving side states there is the only thing that moves the stall clock (see
-    /// [`Bounds`]): a write the stream accepted is not the file getting further, so a peer that
-    /// reads one byte a minute cannot keep one attempt — and one of this machine's places for
-    /// the peer — alive for the length of the file.
+    /// A write that parks is not a stall.
     async fn send_bytes(
         &self,
         send: &mut SendStream,
@@ -2199,10 +2040,6 @@ impl Transfers {
 
     /// Listen on the receiving side's half of the stream while a write is parked or a source is
     /// not ready.
-    ///
-    /// The offset the receiving side states is folded into `landed` by [`Self::word`], so a word
-    /// that repeats one this machine has already seen is [`Look::Quiet`] and moves nothing — see
-    /// [`Bounds`] for why nothing else does.
     async fn listen(&self, words: &mut Words<'_>, landed: &mut u64, length: u64) -> Look {
         match self.word(words, landed, length).await {
             Word::Progress => Look::Grew,
@@ -2233,9 +2070,7 @@ impl Transfers {
     /// Answer one offer on `send`/`recv`, whose first bytes are `prefix`.
     ///
     /// The connection's presented key was checked by the inbox that called this, so `peer` is
-    /// the transport's attested sender. [`Self::judge`] makes the decision; what is here is the
-    /// stream: the frame, the one stream per name, the act recorded only for a transfer that
-    /// will move bytes, and the bytes themselves.
+    /// the transport's attested sender.
     pub(crate) async fn receive(
         &self,
         peer: PeerId,
@@ -2371,12 +2206,12 @@ impl Transfers {
 
     /// Judge one offer: whether a transfer runs, and from where.
     ///
-    /// The order is the module's: the start limit, the running limit, the right, the host's floor
-    /// (which is also where a product with no sink is refused), then what the sink already holds
-    /// — stated only after the transfer is authorised. A resume asks only whether the pair this
-    /// transfer was authorised under is still this machine's pair: a machine moved to another
-    /// assistant leaves that pair, so the transfer ends here rather than continuing under a pair
-    /// that inherits nothing.
+    /// The order is the start limit, the running limit, the right, the host's floor (which is
+    /// also where a product with no sink is refused), then what the sink already holds — stated
+    /// only after the transfer is authorised. A resume asks only whether the pair this transfer
+    /// was authorised under is still this machine's pair: a machine moved to another assistant
+    /// leaves that pair, so the transfer ends here rather than continuing under a pair that
+    /// inherits nothing.
     ///
     /// The running limit is counted here for the order of the answers, and again under the
     /// record's own lock in [`Self::occupy`], which is what makes it hold when two offers arrive
@@ -2502,9 +2337,6 @@ impl Transfers {
         })
     }
 
-    /// Record one allowed transfer on the log's part for peer-driven acts, before its first byte
-    /// moves: a person is never blocked by a peer, and a log that cannot take the entry means the
-    /// transfer is not run.
     fn record(
         &self,
         pair: &Pair,
@@ -2530,8 +2362,7 @@ impl Transfers {
     ///
     /// For a state that is not a running one: an offer answered as a conflict, already complete,
     /// a digest mismatch or a store failure is remembered so the product can see why it did not
-    /// land, and it holds none of this machine's places for the peer. A transfer that will move
-    /// bytes takes one through [`Self::occupy`] instead.
+    /// land, and it holds none of this machine's places for the peer.
     fn remember(
         &self,
         key: &(PeerId, TransferName),
@@ -2556,11 +2387,8 @@ impl Transfers {
     }
 
     /// How many transfers `key`'s peer has running under *other* names — the ones an offer of
-    /// `key` would be a third alongside.
-    ///
-    /// The one spelling of the question [`Self::judge`] asks for the order of its answers and
-    /// [`Self::occupy`] asks for the place itself. The entry under `key` is not counted, because a
-    /// new decision replaces it.
+    /// `key` would be a third alongside. The entry under `key` is not counted, because a new
+    /// decision replaces it.
     fn running_elsewhere(
         remembered: &BTreeMap<(PeerId, TransferName), Authorised>,
         key: &(PeerId, TransferName),
@@ -2575,11 +2403,6 @@ impl Transfers {
 
     /// Take one of this machine's running places for the peer — or, for a resume, keep the one the
     /// transfer already holds — and record it as running from `have`.
-    ///
-    /// The count and the record are one critical section, so two offers that arrive together
-    /// cannot both take the last place and [`MAX_RUNNING_TRANSFERS`] holds however the runtime
-    /// schedules them — which is what keeps "two transfers take half the connection's credit"
-    /// true. `false` is the limit: nothing was recorded, and the sender is answered `limit`.
     fn occupy(
         &self,
         key: &(PeerId, TransferName),
@@ -2621,13 +2444,6 @@ impl Transfers {
     /// `None` is no answer at all: the sending side stopped it, or the connection went away and
     /// the transfer is waiting for the pair — in both cases the sender already knows or will
     /// ask again.
-    ///
-    /// A chunk whose sink had to be asked twice for is reported to the sending side as a
-    /// `running` answer carrying how far this machine has got, and so is the offset once a poll
-    /// while the file keeps arriving. That is the only way a sender parked at the transport's
-    /// window edge learns that the file is still arriving: the transport returns credit in large
-    /// steps, so a slow sink would otherwise hold the writer for minutes with nothing to show for
-    /// it. A sink that takes every chunk at once still costs one word a poll, and no more.
     #[expect(
         clippy::too_many_lines,
         reason = "one chunk's life is the order: the stop, the read, the sink's three answers, the progress word and the one last look at the stream, each with the bound that ends it"
@@ -2837,16 +2653,6 @@ fn elapsed(now: Timestamp, earlier: Timestamp) -> Duration {
 }
 
 /// The delay a start limit names, when the answer is one.
-///
-/// A start limit is a throttle and never an end, wherever it is read: [`Transfers::attempt`]
-/// waits it out before asking again, [`Transfers::verdict`] and [`Transfers::listen`] end the
-/// attempt and leave the waiting to the transfer's own loop. So this is asked *before*
-/// [`state_of`] at every one of those places, which is what keeps one answer to one meaning.
-///
-/// It is also the one place the peer's number is bounded: a throttle waits at most
-/// [`TRANSFER_THROTTLE_CAP`] and never for nothing at all, so a peer can neither park a transfer
-/// for years nor make the retry a spin, and a start limit that names no delay is one look rather
-/// than an end.
 fn throttle_of(answer: &TransferAnswer) -> Option<Duration> {
     match *answer {
         TransferAnswer::Limit {
@@ -2862,9 +2668,6 @@ fn throttle_of(answer: &TransferAnswer) -> Option<Duration> {
 }
 
 /// What an answer leaves the transfer in.
-///
-/// Every reader takes a start limit as a throttle through [`throttle_of`] before asking this, so
-/// what reaches here is a limit on running transfers — terminal — and every other end.
 fn state_of(answer: &TransferAnswer, length: u64) -> TransferState {
     match answer {
         TransferAnswer::Complete | TransferAnswer::AlreadyComplete => {
@@ -2911,9 +2714,7 @@ fn failure_of(answer: &TransferAnswer) -> TransferFailure {
 /// word can still arrive. `Some(state)` is the transfer ending here with what the stream said;
 /// `None` is nothing that ends it, so the store's own failure stands — including a stream that
 /// ended cleanly, because a sending side that finished writing while this machine could not
-/// store the last chunk is this machine's failure and not the peer's source. The read goes into
-/// the chunk buffer the caller is about to discard, because the transfer is ending and the bytes
-/// with it.
+/// store the last chunk is this machine's failure and not the peer's source.
 async fn last_look(
     runtime: &dyn Runtime,
     recv: &mut RecvStream,
@@ -2962,9 +2763,7 @@ async fn answer(runtime: &dyn Runtime, send: SendStream, answer: &TransferAnswer
 ///
 /// The budget covers the whole frame, not one read: a peer that dribbles a byte at a time holds
 /// this stream — one of the sixteen the pair's messages and actions share — for the budget and
-/// not for a budget per byte. `read` is cancel-safe, so a budget that passes leaves the stream
-/// where it was and what arrived in `words.partial`, which is what lets the next look continue
-/// the frame instead of reading its tail as a new one.
+/// not for a budget per byte.
 async fn read_frame(
     runtime: &dyn Runtime,
     words: &mut Words<'_>,

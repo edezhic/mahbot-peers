@@ -29,9 +29,9 @@ use crate::identity::PeerId;
 use crate::identity::access::Insecurity;
 use crate::private::{self, PrivateFileError};
 
-/// The extension of the file a writer locks for one peer's read-modify-publish, so a second
-/// process on the same root cannot lose a write. It is never published or replaced, and it
-/// is not one of the layer's files: [`Files`]'s name is their extension.
+/// The extension of the file a writer locks for one peer's read-modify-publish. It is never
+/// published or replaced, and it is not one of the layer's files: [`Files`]'s name is their
+/// extension.
 const LOCK: &str = "lock";
 
 /// Why one peer's file could not be opened, read, locked or published.
@@ -55,9 +55,6 @@ pub(crate) enum Malformed {
 }
 
 /// A layer's per-peer file: its cap, its error and its own bytes.
-///
-/// The read-and-check order and the cap check before a publish are written once here; each
-/// layer supplies only the numbers and the codec.
 pub(crate) trait Coded: Sized {
     /// The most bytes the file may have.
     const CAP: u64;
@@ -83,7 +80,7 @@ pub(crate) struct Files {
     /// The layer's name: the directory's, and the extension of every file in it.
     name: &'static str,
     /// This process's one writer, held across a read-modify-publish so two files are never
-    /// written at once. The lock file covers a second process.
+    /// written at once.
     writer: Mutex<()>,
 }
 
@@ -140,8 +137,7 @@ impl Files {
         }
     }
 
-    /// Publish one peer's file atomically: a private temporary file beside the destination,
-    /// flushed, and published by one rename.
+    /// Publish one peer's file atomically.
     fn write(&self, peer: &PeerId, bytes: &[u8]) -> Result<(), Fault> {
         let path = self.path(peer);
         let prefix = format!(".{}.", self.name);

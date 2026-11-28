@@ -1,11 +1,5 @@
 //! The client half: one configured beacon, and one live session with it.
 //!
-//! A [`Beacon`] is the address, the pinned key, the runtime that measures every
-//! bound, and the identity the caller presents. A [`Session`] is one connection to
-//! it: register, look an id up, ask how this connection appears from outside, hand
-//! an introduction over, and take the introductions the beacon pushes while the
-//! session is open.
-//!
 //! The endpoint a [`Beacon`] is built over is the caller's, and it must be the
 //! endpoint the caller uses for peers: the address the beacon reports is the one
 //! it observes on *this* connection's path, and hole punching depends on that
@@ -13,10 +7,9 @@
 //!
 //! A session carries no state of its own: there is no mailbox to poll and no
 //! pending introduction to recover. If the connection is gone, the next need is
-//! a new [`Beacon::connect`] and a new `register`. A machine's one registration,
-//! and the one reader of what the beacon pushes to it, live in
-//! [`crate::peer::presence`]; a session that registers outside it displaces the
-//! machine's registration.
+//! a new [`Beacon::connect`] and a new `register`. A machine's one registration
+//! lives in [`crate::peer::presence`]; a session that registers outside it
+//! displaces the machine's registration.
 //!
 //! A request waits until the transport answers, and never longer than
 //! [`BEACON_REQUEST_TIMEOUT`] of the injected runtime's time: a beacon that is
@@ -124,9 +117,6 @@ pub struct Session {
 
 impl Session {
     /// Another handle to the same session: one connection, one registration.
-    ///
-    /// The presence holds the session it registered on and hands this out, so every request
-    /// travels the connection the beacon knows.
     pub(crate) fn handle(&self) -> Self {
         Self {
             connection: self.connection.clone(),
@@ -144,9 +134,6 @@ impl Session {
     }
 
     /// Complete when the connection this session is on closes, for whatever reason.
-    ///
-    /// The presence waits on it beside the refresh interval, so a session that goes away is
-    /// replaced at once rather than at the next refresh.
     pub(crate) async fn closed(&self) {
         self.connection.closed().await;
     }
@@ -211,20 +198,7 @@ impl Session {
 
     /// Hand `payload` to `to` on a live connection, signed by this machine's key.
     ///
-    /// The introduction is built by [`Introduction::signed`] — the same checked
-    /// constructor the recipient verifies against — and sent as its parts; the
-    /// beacon adds the sender's id from the connection, never from the frame.
-    ///
-    /// The beacon does not read the payload and does not store it. If `to` is not
-    /// registered, or its live connection cannot take the frame within the
-    /// server's exchange bound — a recipient that has left
-    /// [`crate::beacon::MAX_CONCURRENT_STREAMS`] introductions unread — the call
-    /// fails with [`BeaconError::UnknownPeer`] and nothing is kept for later. That
-    /// is the beacon's answer about the delivery: it does not distinguish the two,
-    /// so it is not a statement that the peer is not registered or not running.
-    /// `Delivered` means the frame was written to the addressee's connection, not
-    /// that its application read it. The call is bounded by
-    /// [`BEACON_REQUEST_TIMEOUT`], like every request.
+    /// The beacon does not act on the payload and does not store it.
     ///
     /// # Errors
     ///
@@ -319,9 +293,6 @@ impl Session {
     }
 
     /// One request on its own bidirectional stream, and the one answer to it.
-    ///
-    /// The exchange is bounded by [`BEACON_REQUEST_TIMEOUT`]: a beacon that is
-    /// gone answers nothing, and waiting on it must end.
     async fn request(&self, request: Request) -> Result<Response, BeaconError> {
         match timeout(
             &*self.runtime,

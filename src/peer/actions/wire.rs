@@ -27,12 +27,6 @@
 //! unknown tags are ignored. A missing required field is a refusal, and so is a body or a
 //! result longer than its cap — a frame is read whole or not at all. A known field that appears
 //! twice is read with the last occurrence winning, as the binding's fact is.
-//!
-//! # Why the body is opaque
-//!
-//! Nothing here reads a body. The body is bytes a product composed and bytes a product will be
-//! handed: this module checks its length and never its content, so no path leads from a body to
-//! a decision.
 
 use std::time::Duration;
 
@@ -69,9 +63,6 @@ mod answer_tag {
 }
 
 /// An action's bytes.
-///
-/// Infallible: an `Action` holds a body within [`MAX_ACTION_BODY_BYTES`], which fits the
-/// frame's own length field.
 pub(super) fn encode_action(action: &Action) -> Vec<u8> {
     let body = action.body();
     let mut bytes = Vec::with_capacity(32 + body.len());

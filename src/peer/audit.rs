@@ -42,9 +42,7 @@
 //! that entry it is a torn tail and the file is cut back to the last complete one — a
 //! process that died mid-append must not make the next process's entry the corruption
 //! that hides every entry after it. A malformed entry with complete entries after it
-//! is corruption, not a torn write, and is refused rather than quietly skipped. An
-//! entry whose length runs past the end of the file is a torn tail too: the length is
-//! written in the same call as the body, and a partial write can stop anywhere. A
+//! is corruption, not a torn write, and is refused rather than quietly skipped. A
 //! crash inside the log's own first write leaves less than the header, and the bytes
 //! there are the header's prefix: the file is given a whole header, because a
 //! half-written header that refused for ever would make the log — and with it every
@@ -111,8 +109,7 @@ const MAGIC: &[u8] = b"mahbot-peer-audit";
 /// prefix.
 const VERSION: u8 = 1;
 
-/// The most bytes one entry may have. A floor's reason is the only text that grows,
-/// and it is the host's own sentence, not a document.
+/// The most bytes one entry may have.
 const MAX_ENTRY_BYTES: u32 = 16 * 1024;
 
 /// The most bytes the whole log may have.
@@ -424,9 +421,7 @@ impl fmt::Display for WriteRefusal {
 /// The append-only log of one storage root.
 ///
 /// Cheap to clone: every clone names the same file. Nothing is held open between
-/// calls, so a restart and a second process see the same log. Each handle remembers
-/// the length it last left the log at, which is how an append checks only what
-/// another writer added since instead of walking the whole file.
+/// calls, so a restart and a second process see the same log.
 #[derive(Clone, Debug)]
 pub struct AuditLog {
     path: PathBuf,
@@ -449,7 +444,7 @@ impl AuditLog {
     /// The log's path under `root`.
     ///
     /// The log's name is this module's, so a caller that must name it without opening
-    /// it — a repair, a backup, a case that tears it on purpose — asks here instead of
+    /// it — a repair, a backup, a log that is already torn — asks here instead of
     /// spelling `audit.log`. Opening would create the file when it is absent and repair
     /// it when it is torn, which is not what such a caller is doing.
     #[must_use]
@@ -608,11 +603,6 @@ impl AuditLog {
 
     /// Cut a torn tail back to the last complete entry, and refuse corruption.
     ///
-    /// A file that holds less than the header is a create that was interrupted inside
-    /// the header — the bytes written so far are the header's own prefix, because one
-    /// `write_all` wrote them — and it holds no entry, so it is given the header rather
-    /// than refused. A file whose bytes are not the header's prefix is corruption.
-    ///
     /// The cut comes before the cap is judged: a torn tail can push a log that was
     /// under the cap past it, and refusing that log would make it unopenable for ever.
     /// The file is read up to [`READ_LIMIT`], which is as far past the cap as a torn
@@ -736,10 +726,6 @@ impl AuditLog {
     }
 
     /// Open the log through the privacy rule, naming this module's errors.
-    ///
-    /// Every open — the read, the append, the repair — goes through the rule on the
-    /// descriptor it then uses, so a log swapped for a link or re-permissioned after
-    /// it was created is refused rather than read from or written into.
     fn opened(
         &self,
         opening: Result<Option<File>, private::PrivateFileError>,

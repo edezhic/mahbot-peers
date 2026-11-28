@@ -18,9 +18,6 @@
 //!
 //! # Reasons to dial, and what starts a new episode
 //!
-//! This section is the contract; the other three places that describe it — the connection
-//! manager's module note, the README and the plan — summarise it and point here.
-//!
 //! Two different things arrive from outside the policy, and they are not the same:
 //!
 //! - *A fresh episode*, because the reason the last one went slow has gone: this machine's
@@ -44,9 +41,6 @@
 //! consumes a dial number — so a peer that dials in and drops cannot escape the cap by being
 //! the one who dialled. It does re-open a pair that stopped because it had nowhere to dial:
 //! the connection's source address is an address the record now holds.
-//!
-//! A stopped pair is woken by neither: trust is a person's business, and a stop re-opens only
-//! when its cause has gone.
 //!
 //! # What is retried and what is not
 //!
@@ -88,11 +82,6 @@ use crate::identity::{Fingerprint, PeerId};
 use crate::peer::connect::TRUST_POLL;
 
 /// Why the pair could not be connected.
-///
-/// The five failures of [`crate::peer::connect`]'s note, plus the two answers that are not a
-/// network state at all: [`Self::Nowhere`], which is configuration, and [`Self::Deferred`],
-/// which is this machine's own fault. The policy records the last of them beside a wait, so a
-/// caller can read why the pair is down without a second source.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectFailure {
@@ -111,13 +100,13 @@ pub enum ConnectFailure {
     /// `candidates` is every address the dial failed at, in the order it tried them and without
     /// repeats: a punch dials several at once and each of them is a place the peer was not. It is
     /// empty when every dial of this one completed a handshake and the pair kept none — there is
-    /// then no address to name. `cause` names only what this
-    /// machine has not ruled out: the text may have been written by the far side. What each
-    /// address did — a timeout, a failed handshake, no key — is a diagnostic and does not travel
-    /// with this set, because a product shows one honest cause beside the addresses; the beacon
-    /// failures carry no set, so theirs name the remembered addresses and their faults, which is
-    /// the only place those appear. The one per-address fault reported as its own answer is a key
-    /// that is not the peer's: that is [`Self::WrongPeer`], a security fact and not a network one.
+    /// then no address to name. `cause` names only what this machine has not ruled out: the text
+    /// may have been written by the far side. What each address did — a timeout, a failed
+    /// handshake, no key — is a diagnostic and does not travel with this set, because a product
+    /// shows one honest cause beside the addresses; the beacon failures carry no set, so theirs
+    /// name the remembered addresses and their faults, which is the only place those appear. The
+    /// one per-address fault reported as its own answer is a key that is not the peer's: that is
+    /// [`Self::WrongPeer`], a security fact and not a network one.
     NoDirectPath {
         peer: Fingerprint,
         /// Every address this dial failed at, in the order it tried them.
@@ -294,10 +283,10 @@ const RECHECK_SPREAD: Duration = Duration::from_secs(5);
 /// The slow re-check for this machine: [`RECOVERY_RECHECK`] less this machine's share of
 /// [`RECHECK_SPREAD`].
 ///
-/// The share is a pure function of the key — no ambient randomness, so a test that moves the
-/// clock controls it — and the same machine always takes the same share off. It is counted in
-/// microseconds only so that two machines' moments practically never coincide; the whole of
-/// the spread is still a bound a product may show.
+/// The share is a pure function of the key — no ambient randomness — and the same machine
+/// always takes the same share off. It is counted in microseconds only so that two machines'
+/// moments practically never coincide; the whole of the spread is still a bound a product may
+/// show.
 pub(crate) fn recheck(me: &PeerId) -> Duration {
     let key = me.as_bytes();
     let share = u64::from(u32::from_be_bytes([key[0], key[1], key[2], key[3]]));
@@ -349,7 +338,7 @@ fn gap(dial: u32) -> Duration {
 /// the moment is a field of the state.
 ///
 /// [`Self::Connected`] is the one state the policy never stores: the manager answers it from
-/// the connection it holds. The others are what the policy itself is doing.
+/// the connection it holds.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Recovery {

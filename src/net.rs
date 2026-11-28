@@ -1,11 +1,6 @@
 //! Endpoint construction over two injected seams: a datagram socket and a clock.
 //!
-//! Neither seam is optional and neither has a default, so no code path can
-//! quietly acquire a real socket or the wall clock. This crate enables no runtime
-//! feature on `quinn`: a binary passes a real UDP socket and the runtime of its
-//! choosing (quinn's `runtime-tokio`, enabled by the binary, or its own
-//! `quinn::Runtime`), and the test harness passes an in-memory socket and a clock
-//! the test drives.
+//! Neither seam is optional and neither has a default: the caller supplies both.
 
 use std::fmt;
 use std::io;

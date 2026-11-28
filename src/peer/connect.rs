@@ -1,5 +1,5 @@
 //! The per-machine connection manager: dialling, accepting, one connection per
-//! pair, the punch, and the five failures.
+//! pair, and the punch.
 //!
 //! # The order
 //!
@@ -33,21 +33,16 @@
 //! dialled and *when*.
 //!
 //! The set a punch dials is the beacon's observed address first, then the candidate list the peer
-//! sent, filtered by `crate::peer::traverse`'s rule, deduplicated, and capped at
-//! [`crate::peer::MAX_CANDIDATES`]. The candidate list travels in the signed, opaque introduction
-//! payload the beacon already relays, so the beacon gains no duty and no new frame: it carries a
-//! candidate list as it carries a ceremony flight. It is signed and not encrypted, so the beacon
-//! *can* read it — that exposure is named here rather than discovered, and it is the price of not
-//! adding a protocol the beacon would have to learn. The whole punch fits inside [`DIAL_BUDGET`]:
-//! one beacon exchange for the lookup and the introduction together, five seconds of waiting for
-//! the peer's list, and five seconds for the candidate dials themselves. A list the presence
-//! already holds is dialled at once unless it is older than `COORDINATION_FRESH`: a stale list is
-//! worth nothing, and waiting one window for a fresh one is the same punch a moment later.
-//!
-//! Candidates that arrive from the network are filtered; the caller's hint and the beacon's own
-//! observed address are not. A global address a paired peer names is still dialled, which is an
-//! accepted cost bounded by the ceiling and the re-arm interval. The rule is stated once, with
-//! the reasons, beside the filter itself in `crate::peer::traverse`.
+//! sent — filtered, deduplicated, and capped at [`crate::peer::MAX_CANDIDATES`]; which sources are
+//! filtered is [`Connections::declares`]'s rule. The candidate list travels in the signed, opaque
+//! introduction payload the beacon already relays, so the beacon gains no duty and no new frame:
+//! it carries a candidate list as it carries a ceremony flight. It is signed and not encrypted, so
+//! the beacon *can* read it — that exposure is named here rather than discovered, and it is the
+//! price of not adding a protocol the beacon would have to learn. The whole punch fits inside
+//! [`DIAL_BUDGET`]: one beacon session for the lookup and the introduction together, five seconds
+//! of waiting for the peer's list, and five seconds for the candidate dials themselves. A list the
+//! presence already holds is dialled at once unless it is older than `COORDINATION_FRESH`: a stale
+//! list is worth nothing, and waiting one window for a fresh one is the same punch a moment later.
 //!
 //! One rule governs sending a candidate list: it is never sent to a peer while a ceremony with
 //! that peer is running — the presence's `busy_with` — because an older build ends its ceremony on
@@ -77,9 +72,8 @@
 //! where that side's filter never decides. "Destination-dependent mapping" is address-dependent
 //! and address-and-port-dependent together: neither is the observed endpoint, and the model does
 //! not distinguish them in any row. Every combination of mapping, filtering and pooling the model
-//! can be configured with is in one of rows 1–11, the shapes that are not a mapping and filtering
-//! pair are rows 12–18, and each row is a recorded case or — for the one the rig cannot produce —
-//! a declared gap with its reason:
+//! can be configured with is in one of rows 1–11, and the shapes that are not a mapping and filtering
+//! pair are rows 12–18:
 //!
 //! | # | A | B | outcome |
 //! |---|---|---|---|
@@ -100,7 +94,7 @@
 //! | 15 | one machine behind two networks in a row, endpoint-independent mapping and filtering at each, the other behind one | | connects |
 //! | 16 | UDP blocked towards the peer only | | no direct path |
 //! | 17 | UDP blocked entirely | | the beacon is unreachable |
-//! | 18 | an address of another family (IPv6) | | not producible by this crate's tests here: the rig models IPv4 only |
+//! | 18 | an address of another family (IPv6) | | carried and tried like any other, with no preference stated |
 //!
 //! Rows 1–6 hold whatever the pooling: an endpoint-independent mapping is the observed endpoint,
 //! so all three filters admit it. The classes are named and not counted. Nothing in this crate
@@ -109,45 +103,17 @@
 //!
 //! # What is not attempted, and why
 //!
-//! - **Interface enumeration.** This crate is handed one socket and reads no ambient state, so it
-//!   cannot enumerate the machine's interfaces portably — and a machine's local addresses are the
-//!   product's knowledge, not the library's. The product hands them in with
-//!   [`Connections::declares`], and they travel in the candidate list.
+//! - **Interface enumeration.** This crate is handed one socket, so it cannot enumerate the
+//!   machine's interfaces portably — and a machine's local addresses are the product's knowledge,
+//!   not the library's. The product hands them in with [`Connections::declares`], and they travel
+//!   in the candidate list.
 //! - **Port mapping.** Asking a router to forward a port is a second protocol and a third-party
 //!   device, with no portable way to do it without a dependency this crate does not take.
 //! - **NAT classification.** The check is the handshake, and the outcome table above shows the
 //!   crate's behaviour does not branch on the class: a class would be a guess it cannot act on,
 //!   and a guess that costs a probe of its own.
 //!
-//! # Recovery
-//!
-//! A pair that has been acquainted recovers by itself: [`Connections::keep_connected`] is run
-//! once per paired peer and never returns while the pair is trusted and there is somewhere to
-//! dial. The policy it follows — episodes, growing gaps, the slow re-check, which reasons start
-//! a new episode and which only make the next dial due — is
-//! [`crate::peer::recovery`]'s module note, which is the one place that contract is stated; this
-//! note does not restate it. The state is readable at any time through
-//! [`Connections::recovery`]: dialling, waiting until a stated moment, or stopped and why, and
-//! [`Connections::watched`] says whether a keeper will act on it.
-//!
-//! A bounded, visible, paced retry is not the silent loop the design rules out. What it rules
-//! out is a loop nobody can see and nothing bounds; this one is bounded by the episode, paced
-//! by the gap, and readable while it runs. A connection that carried anything and then died is
-//! a link failure, and the dial that follows it is due at once: recovery, not a loop. Only
-//! dials that carried nothing are paced by the gap. What counts is stated on
-//! [`Connections::keep_connected`]: a transfer counts once it has moved a byte, and not when it
-//! was refused, unreadable or failed before one.
-//!
-//! # The connection level travels with the connection
-//!
-//! Every kept connection runs one small exchange after it is adopted: each side sends
-//! the binding it holds for the other — a [`crate::peer::access::Fact`], or nothing —
-//! and keeps what it is sent as a claim. It is the manager's own handshake, not the
-//! pair's traffic: a connection that only exchanged its binding and then died carried
-//! nothing, which is why the keeper measures the exchange's frames and does not count
-//! them. The exchange never delays adoption, never fails a connection and never closes
-//! one; a peer that does not answer costs its own budget and is tried again on the
-//! next connection.
+//! # A withdrawn trust, and a changed binding
 //!
 //! A machine whose trust was withdrawn is not one to keep: the keeper closes what is
 //! live and stops with [`NotTrustedCause::Withdrawn`], and the handshake refuses the
@@ -167,11 +133,6 @@
 //! only cuts it shorter — so that is the bound while a connection is up. Nothing here
 //! depends on the caller reloading, and nothing depends on the manager and the rights
 //! layer sharing a handle.
-//!
-//! The price is one small read per reach: a round that only watches a connection costs one, and
-//! a round that dials one more when the dial is weighed. A record is at most
-//! [`crate::peer::record::MAX_RECORD_BYTES`], usually under a kilobyte, and a keeper round is
-//! seconds apart.
 //!
 //! # A quiet pair, and how long a vanished peer goes unnoticed
 //!
@@ -234,9 +195,7 @@
 //! pinging answers — so the test cannot reset the accounting it is judged by. A reader that
 //! cannot be heard from — one that never started, or whose last pass is more than two polls
 //! ago — has measured nothing, and [`Connections::vanish_bound`] says so: the reading is
-//! [`Vanish::Unmeasured`], not merely a bound the code declines to apply. This paragraph is
-//! the one place the rule and its sampling are stated; `LIVENESS_POLL`, `Reader` and
-//! `Connections::start_liveness` give the period and the mechanics.
+//! [`Vanish::Unmeasured`], not merely a bound the code declines to apply.
 //!
 //! The choice between two live connections reads only the facts both sides share; when one
 //! side has observed a close the other has not, the two may briefly name different
@@ -254,35 +213,13 @@
 //!
 //! [`Connections::serve`] is the accept loop, and the caller runs it: the crate has
 //! no runtime of its own to spawn on, so the caller keeps the handle and decides
-//! when the loop stops. The loop does not wait for a handshake: it hands each incoming
-//! connection to a task of its own, so a burst of peers that open a connection and
-//! stall costs at most [`ACCEPT_IN_FLIGHT`] handshakes at once. When that many are in
-//! flight the loop stops pulling from the endpoint and looks again after one round of
-//! [`TRUST_POLL`], so a flood costs this machine a bounded number of tasks; the cost is
-//! that a full machine's next accept waits up to that round, never the length of a
-//! handshake. Accepting records the peer's authenticated source
-//! address — one small blocking file read, and a write only when the address changed —
-//! on the task that took the connection, not on the loop: this crate has no blocking
-//! pool to hand it to, and that task is the one place a blocking read costs nothing else.
-//! A dial writes the address it completed at the same way, on the caller's own task; the
-//! rule for what may be written is one rule for both, and it is
-//! [`crate::peer::PeerRecord::last_address`]'s.
-//!
-//! # The five failures
-//!
-//! The beacon cannot be reached; the beacon does not know the peer; the peer's
-//! address is known and no connection can be made; an address answered with a key
-//! that is not the peer's; the peer is not trusted. Each is reported as itself and
-//! none as another, and "not trusted" is decided here and only here: its refusal text
-//! is diagnostic and may be forged, so it drives neither trust nor a retry. A wrong
-//! key is the one per-address fault that becomes an answer of its own, because it is a
-//! security fact and not a network one; every other address fault stays on this machine in the
-//! punch's refusal, which names the addresses without it, while the beacon failures — which carry
-//! no set — name their addresses and their faults in the cause. One more answer,
-//! [`ConnectFailure::Nowhere`], is not a failure of the network at all, and
-//! [`ConnectFailure::Deferred`] is not a failure of the peer: it says this machine could
-//! not read the record just now. Which of them is retried and which never is
-//! [`crate::peer::recovery`]'s note, which is the one place that contract is stated.
+//! when the loop stops. The loop hands each incoming connection to a task of its own.
+//! Accepting records the peer's authenticated source address — one small blocking
+//! file read, and a write only when the address changed — on that task, not on the
+//! loop: this crate has no blocking pool to hand it to, and that task is the one
+//! place a blocking read costs nothing else. A dial writes the address it completed at
+//! the same way, on the caller's own task; the rule for what may be written is one rule
+//! for both, and it is [`crate::peer::PeerRecord::last_address`]'s.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -315,11 +252,6 @@ const DEFAULT_CONNECT_BUDGET: Duration = Duration::from_secs(10);
 /// for, so a dial a slow read delayed can still run to its own end. Public as one of the stated
 /// numbers a caller plans against, and as the product-facing bound on one dial: this is how long a
 /// caller waits before an honest failure, and the punch fits inside it rather than extending it.
-///
-/// The parts, in the order a dial spends them: ten seconds for the hint and ten again for the
-/// remembered set, which is dialled all at once, [`BEACON_REQUEST_TIMEOUT`] for the session and
-/// again for the lookup and the introduction together, the punch's own five-second window for the
-/// peer's candidates, and its five-second budget for the candidate dials.
 pub const DIAL_BUDGET: Duration = Duration::from_secs(
     (2 * DEFAULT_CONNECT_BUDGET.as_secs())
         + (2 * BEACON_REQUEST_TIMEOUT.as_secs())
@@ -393,9 +325,8 @@ pub const TRUST_POLL: Duration = Duration::from_secs(5);
 /// answering.
 ///
 /// Shorter than a keeper round, which is what makes [`Connections::vanish_bound`]'s two rounds
-/// cover it. The rule the reader serves is stated once in the module's note on liveness. Not
-/// public: a product cannot act on a sampling period, and `vanish_bound` states the total it
-/// needs.
+/// cover it. Not public: a product cannot act on a sampling period, and `vanish_bound` states the
+/// total it needs.
 const LIVENESS_POLL: Duration = Duration::from_secs(1);
 
 /// The TLS exporter label the same-starter tie-break reads. Both sides of one
@@ -425,10 +356,7 @@ struct Live {
 ///
 /// The frame counters at adoption, and the frames written since then that belong to
 /// the binding exchange — the manager's handshake and not the pair's use: a connection
-/// that only exchanged its binding and then died carried nothing. The message, action and
-/// transfer layers add their own measurement: a round is an offer, an action request or a
-/// transfer attempt in flight, `quiet` is where the frames stood when the last one finished,
-/// and `taken` is a request the peer accepted.
+/// that only exchanged its binding and then died carried nothing.
 #[derive(Debug)]
 struct Watch {
     carried_from: Frames,
@@ -857,12 +785,8 @@ impl fmt::Display for Vanish {
 
 /// The connection manager of one machine.
 ///
-/// It runs three kinds of task on the injected runtime: one reader that samples whether each
-/// live connection's peer is still answering (the module's note on liveness states the rule),
-/// one binding exchange per connection it keeps, and one task per incoming connection it
-/// accepts. Everything else — the accept loop and one keeper per paired peer — is a future the
-/// caller spawns and decides when to drop; the machine's presence, when the caller keeps one,
-/// runs its own.
+/// The accept loop and one keeper per paired peer are futures the caller spawns and
+/// decides when to drop; the machine's presence, when the caller keeps one, runs its own.
 pub struct Connections {
     me: PeerId,
     store: RecordStore,
@@ -990,12 +914,20 @@ impl Connections {
     /// Declare addresses this machine has, beyond the socket's own: the product's knowledge of
     /// its own machine.
     ///
-    /// They travel in the coordination payload, and they are the only way a private address a
-    /// peer names may be dialled — the filter admits a private candidate only when this machine
-    /// holds an address in the same RFC 1918 block. This is the product's set and nothing else:
-    /// the punch composes the endpoint's own local address after it when the list has room, so a
-    /// declared set that fills [`crate::peer::MAX_CANDIDATES`] leaves the socket's own address
-    /// out, and an unspecified one is never sent.
+    /// They travel in the coordination payload, and they are the only way a private address a peer
+    /// names may be dialled — the filter admits a private candidate only when this machine holds
+    /// an address in the same block: the /8 of 10/8, the /12 of 172.16/12, the /16 of 192.168/16,
+    /// the /10 of the carrier-shared 100.64/10, or the /7 of fc00::/7. This is the product's set
+    /// and nothing else: the punch composes the endpoint's own local address after it when the
+    /// list has room, so a declared set that fills [`crate::peer::MAX_CANDIDATES`] leaves the
+    /// socket's own address out, and an unspecified one is never sent.
+    ///
+    /// Candidates that arrive from the network are filtered; the caller's hint and the beacon's
+    /// own observed address are not. The hint is the product's knowledge of its own machine, and a
+    /// product may legitimately redial a private or local address; the beacon's answer is the
+    /// beacon's observation of where the peer appears, not a claim the peer made about itself. A
+    /// global address a paired peer names is still dialled, which is an accepted cost bounded by
+    /// the ceiling and the re-arm interval.
     ///
     /// Each call states the whole set: a later call replaces what an earlier one declared,
     /// repeats are dropped, and the list is cut at [`crate::peer::MAX_CANDIDATES`]. Nothing here
@@ -1171,14 +1103,11 @@ impl Connections {
     /// observe: this is how a product hands in a "try now", and it is the same reason a hint
     /// carrying a fresh address is news.
     ///
-    /// A stopped pair is not woken — trust is a person's business, and a pair with nowhere to
-    /// dial has nothing to dial; [`Self::ensure`] re-opens a stop whose cause has gone, and
+    /// A stopped pair is not woken; [`Self::ensure`] re-opens a stop whose cause has gone, and
     /// this call makes it ask at once rather than after the round it would otherwise have
-    /// waited. A connected, dialling or unwatched one is left alone: a connection that works is
-    /// not replaced because something arrived, and a pair no keeper watches has no episode for
-    /// news to start. A standing reason, like a message waiting, is not news and is handed in
-    /// without resetting the episode, so a peer that keeps dropping a connection cannot have
-    /// the queue re-arm it.
+    /// waited. A connected, dialling or unwatched pair is left alone. A standing reason, like a
+    /// message waiting, is not news and is handed in without resetting the episode, so a peer
+    /// that keeps dropping a connection cannot have the queue re-arm it.
     pub fn wake(&self, peer: &PeerId) {
         // A dial nobody finished is settled first: a reason to start over cannot be weighed
         // against a state that is only still "dialling" because its caller went away.
@@ -1294,15 +1223,13 @@ impl Connections {
 
     /// Connect to `peer`, trying `hint` first.
     ///
-    /// The order after the hint is the module's: the hint, then every address the record
-    /// remembers, then the beacon and its punch. `hint` is an address the peer sent
-    /// in an introduction — its own, as the beacon observed it — and it is
-    /// self-asserted: the handshake still proves the key. It is the carrier for "a fresh
-    /// address for that peer", which is one of the reasons a fresh episode starts, so a hinted
-    /// call hands it in through [`Self::wake`] before it dials. It is not proof that the
+    /// `hint` is an address the peer sent in an introduction — its own, as the beacon observed
+    /// it — and it is self-asserted: the handshake still proves the key. It is the carrier for "a
+    /// fresh address for that peer", which is one of the reasons a fresh episode starts, so a
+    /// hinted call hands it in through [`Self::wake`] before it dials. It is not proof that the
     /// address works — an introduction may be stale — so a pair that stopped because it had
-    /// nowhere to dial is re-opened by the dial that reaches the peer, not by the hint.
-    /// A call with no hint adds no reason of its own to the policy — only a hint starts a fresh
+    /// nowhere to dial is re-opened by the dial that reaches the peer, not by the hint. A call
+    /// with no hint adds no reason of its own to the policy — only a hint starts a fresh
     /// episode — but it still reads the record, and a read that fails this instant is folded in as
     /// the deferral it is, which moves the next dial to the deferral's own moment. The answer is
     /// then the state's own reason, so a fault never stands in for what the last dial met; a state
@@ -1575,10 +1502,6 @@ impl Connections {
     }
 
     /// The third step: the beacon, the punch it asks for, and the failures it can answer with.
-    ///
-    /// One exchange for the lookup and our candidate list together, so neither can abort the
-    /// other; a wait for the peer's list, unless one is already here or a ceremony with the peer
-    /// is running; and then the whole dial set at once.
     async fn punch(
         &self,
         endpoint: &Endpoint,
@@ -1712,9 +1635,8 @@ impl Connections {
     /// The session the beacon stage speaks on: the machine's one registration when there is a
     /// presence, and one session of the manager's own otherwise.
     ///
-    /// The two failures of this step are the ones the module's note names: nothing configured at
-    /// all, which is configuration rather than a network state, and a beacon that would not open a
-    /// session.
+    /// The two failures of this step: nothing configured at all, which is configuration rather
+    /// than a network state, and a beacon that would not open a session.
     async fn beacon_leg<'a>(
         &'a self,
         peer: &Fingerprint,
@@ -1921,28 +1843,18 @@ impl Connections {
     /// without a second handshake. A connection that outlives [`KEEPER_SETTLE`] is
     /// settled the same way: the pair got to use it, so its loss is ordinary churn.
     ///
-    /// The message, action and transfer layers' requests are measured with the exchange: a
-    /// request in flight, and one that finished, are not the pair's traffic, so a peer that
-    /// keeps dropping a connection after one unanswered request is not mistaken for a live
-    /// pair.
-    /// A request the peer accepted is: it is the peer acting, so the connection carried
-    /// something and its loss is a link failure. So is a message the peer answered
-    /// `already taken`: the peer's own account says it took that one before. A transfer
-    /// counts as carried once it has moved a byte, and not when it was refused, unreadable or
-    /// failed before the first byte: a file that never started is not the pair being used.
-    ///
     /// Only a dial whose connection ends before the pair carried anything, inside
     /// [`KEEPER_SETTLE`] and for a reason other than a timeout, is a strike. A timeout is
     /// the peer going quiet — a NAT mapping expiring, a laptop closing — so it is a
     /// redial at once and never a strike, which is what keeps a peer built with a shorter
     /// idle timeout than this machine's from turning an ordinary quiet drop into a
-    /// refusal. A run of strikes is bounded by
-    /// [`crate::peer::RECOVERY_DIALS`] like any other failed dial, so a peer that
-    /// takes a connection and drops it is not re-dialled in a loop; a strike is counted
-    /// even when another dialer has connected by then, because a dial that produced a
-    /// connection which died at once is exactly the signature the bound is for. A dial
-    /// that fails outright while the pair is connected is the other way round and is not
-    /// counted: a pair that is connected has nothing to recover from.
+    /// refusal. A run of strikes is bounded by [`crate::peer::RECOVERY_DIALS`] like any
+    /// other failed dial, so a peer that takes a connection and drops it is not re-dialled
+    /// in a loop; a strike is counted even when another dialer has connected by then,
+    /// because a dial that produced a connection which died at once is exactly the
+    /// signature the bound is for. A dial that fails outright while the pair is connected
+    /// is the other way round and is not counted: a pair that is connected has nothing to
+    /// recover from.
     pub async fn keep_connected(&self, endpoint: &Endpoint, peer: &Fingerprint) -> StopCause {
         let peer_id = peer.peer_id();
         // For as long as this future lives the pair has a keeper, and a state that says a
@@ -2728,17 +2640,13 @@ impl Connections {
     /// Run this machine's half of the binding exchange on a kept connection, on its
     /// own task.
     ///
-    /// The exchange is the manager's handshake, not the pair's traffic: it never
-    /// delays adoption, never fails a connection and never closes one. What it writes
-    /// is measured and kept in the connection's [`Watch`], so a connection that only
-    /// exchanged its binding and then died is judged as one that carried nothing. The
-    /// measurement starts from the frames the connection had when it was adopted — the
-    /// exchange's own stream is opened at that moment — so nothing the exchange writes
-    /// is counted as the pair's. The local fact is read from the store this manager
-    /// holds, which the reach that adopted the connection has just re-read from disk: a
-    /// binding written before the connection is what travels. A binding changed while
-    /// the connection is up is a reconnection, and [`Self::disconnect`] is how the
-    /// caller makes it one.
+    /// The exchange is the manager's handshake, not the pair's traffic: it never delays adoption,
+    /// never fails a connection and never closes one. What it writes is measured and kept in the
+    /// connection's [`Watch`], so a connection that only exchanged its binding and then died is
+    /// judged as one that carried nothing. The local fact is read from the store this manager
+    /// holds, which the reach that adopted the connection has just re-read from disk: a binding
+    /// written before the connection is what travels. A binding changed while the connection is up
+    /// is a reconnection, and [`Self::disconnect`] is how the caller makes it one.
     fn start_exchange(
         &self,
         peer: PeerId,
@@ -3231,13 +3139,8 @@ fn unreachable(detail: String, error: &BeaconError) -> String {
 
 /// The set a punch dials: the beacon's observed address first and unfiltered, then the peer's
 /// candidates, filtered by [`traverse::acceptable`] and deduplicated, cut at
-/// [`crate::peer::MAX_CANDIDATES`].
-///
-/// The beacon's answer is not filtered because it is the beacon's own observation of where this
-/// peer appears, and not a claim the peer made about itself: filtering it would change what a
-/// machine behind one router can do today. A candidate is a claim, so it is filtered, against
-/// the addresses the product declared — not against the socket's own, which is not a
-/// declaration and opens no private gate.
+/// [`crate::peer::MAX_CANDIDATES`]. Which sources are filtered, and why, is
+/// [`Connections::declares`]'s rule.
 fn punch_set(
     observed: Option<SocketAddr>,
     theirs: Option<&Candidates>,

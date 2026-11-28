@@ -3,13 +3,7 @@
 //! Every format this crate writes spells it — a record's fields, an audit entry's fields, a
 //! fact's fields, a queue or action file's fields (and those of the records inside one), and
 //! the message, action and answer frames — and each reader must refuse a length that runs
-//! past the end the same way. This is the one place the framing is written and walked, so a
-//! field is framed once and its frame's faults are named once.
-//!
-//! [`FramingFault`] is the four faults a file and a frame share. It lives here because every
-//! reader of this framing answers with them; a layer's own malformed type adds the faults only
-//! a file can have, so a fault a frame cannot produce is not expressible where a frame's reason
-//! is expected.
+//! past the end the same way.
 
 use std::fmt;
 

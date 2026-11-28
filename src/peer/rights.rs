@@ -89,10 +89,6 @@ impl fmt::Display for Step {
 }
 
 /// Why the answer is no.
-///
-/// One variant per reason, and the step each belongs to is [`Refusal::step`]'s: no
-/// step's refusal can be reported as another's, because the step is derived from the
-/// reason and never carried beside it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refusal {
     /// The connection did not prove the pair's machine.
@@ -173,9 +169,6 @@ pub enum Decision {
 
 impl Decision {
     /// The right that allowed it, if it did.
-    ///
-    /// The product's capability asks this before it acts; a refusal is read through the
-    /// [`Decision::Refused`] variant, whose [`Refusal`] names the step and the reason.
     #[must_use]
     pub const fn allowed(&self) -> Option<&Right> {
         match self {
@@ -363,8 +356,7 @@ impl Rights {
 
     /// Decide the one question, in the plan's order.
     ///
-    /// The record is re-read first, so the answer never comes from a stale view. A
-    /// refusal is appended to the log before it is returned — unless the log's room
+    /// A refusal is appended to the log before it is returned — unless the log's room
     /// for a person's acts is all that is left, in which case the refusal is answered
     /// without an entry: nothing changed, and a peer must not be able to fill the log
     /// and take away the acts that stop it. An allowance is not appended: it changes
@@ -442,10 +434,8 @@ impl Rights {
     /// the pair and the receiver decides, so the claim alone allows. `Unbound` when
     /// neither a binding nor a claim has arrived.
     ///
-    /// The floor is not applied: the floor is what this machine allows others to do,
-    /// and a message this machine offers is its own act. Nothing is written and nothing
-    /// is recorded — the answer changes no state, and the entry that matters is the
-    /// receiver's.
+    /// Nothing is written and nothing is recorded — the answer changes no state, and
+    /// the entry that matters is the receiver's.
     ///
     /// # Errors
     ///
@@ -524,8 +514,8 @@ impl Rights {
     /// that holds only the default is refused at the right step and learns nothing
     /// about what this machine holds. The capability is fixed here and never comes
     /// from the transfer's name or its bytes, which is what the
-    /// `transfers.name_decides_nothing` invariant scans for: the layer above names
-    /// the permission only through the right this answer returns.
+    /// `transfers.name_decides_nothing` invariant scans for: the layer above names the
+    /// permission only through the right this answer returns.
     ///
     /// The decision is asked once, when a transfer is authorised: a transfer that
     /// resumes after a reconnect is the same transfer, and a right withdrawn while it
@@ -889,9 +879,7 @@ impl Rights {
     /// answers [`Restored`] with a `Granted` entry and no `TrustRestored` — the right is
     /// owed, and the return is the act that owes it. That entry names the row's own
     /// issuer: the default when the default created the right, the person when a row
-    /// that person already wrote is reused. That is not a way to grant a right to the
-    /// wrong peer: the pair is the binding's, so a caller passing a claim-derived pair
-    /// after a rebind still issues for the pair this machine is bound to.
+    /// that person already wrote is reused.
     ///
     /// # What still stands
     ///

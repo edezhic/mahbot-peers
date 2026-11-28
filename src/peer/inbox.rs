@@ -2,20 +2,15 @@
 //! hand it to the layer that owns it.
 //!
 //! A pair's connection carries one bidirectional stream per message offer, one per action
-//! request, one per file transfer, and the binding exchange's first stream. [`Inbox::serve`]
-//! runs the receiving half of the services for one peer: it watches the pair's live connection,
-//! starts one reader per connection, and hands every stream after the binding exchange to
-//! [`Messages`], [`Actions`] or [`Transfers`] by the frame's magic. A message is therefore
-//! never taken for an action, nor an action for a message, nor either for a transfer, in
-//! either direction, and no service can starve or misread another.
+//! request, one per file transfer, and the binding exchange's first stream. A message is
+//! therefore never taken for an action, nor an action for a message, nor either for a
+//! transfer, in either direction, and no service can starve or misread another.
 //!
 //! The same task also runs the message layer's offer loop, so one service per peer answers for
-//! every layer it was opened with and one ending reaches whoever started it. It compacts the action
-//! memory every `SWEEP_EVERY`; the clearing itself is the record's, so a person's trust withdrawal
-//! makes everything recorded before its moment gone on the next look, whether or not this task ever
-//! runs. The services share one fault: a queue, record or log this machine cannot read or write
-//! ends the service instead of being stepped over, and a connection that does not present the
-//! peer's key ends it rather than receiving nothing under the pair's name.
+//! every layer it was opened with and one ending reaches whoever started it. The services share
+//! one fault: a queue, record or log this machine cannot read or write ends the service instead
+//! of being stepped over, and a connection that does not present the peer's key ends it rather
+//! than receiving nothing under the pair's name.
 //!
 //! # Why one reader
 //!
@@ -124,12 +119,6 @@ impl Inbox {
     }
 
     /// Serve one peer: offer its queued messages and answer every service on the connection.
-    ///
-    /// An infinite loop, one per paired peer, run by the caller. Each round notices whether the
-    /// pair's connection changed and starts a reader for the new one; the message layer's offer
-    /// loop runs in the same task. A fault any service meets — a queue, memory, record or log
-    /// this machine cannot read or write, or a connection that does not present the peer's key —
-    /// ends the service and is returned to whoever started it.
     ///
     /// Dropping this future stops the readers it started: every wait the crate makes in them is
     /// bounded, so they reach the top of their loop and find the service gone. The waits that

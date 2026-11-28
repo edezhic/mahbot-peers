@@ -46,11 +46,9 @@
 //!
 //! The two file capabilities are different rights and are named so a person cannot
 //! confuse them: "put files on me" is a peer landing a file on this machine, and
-//! "take files from me" is a peer fetching one from it. Only the first is served by
-//! anything, and by [`crate::peer::transfer`] alone: "take files from me" is inert
-//! until a peer may ask this machine for a file of its own, and granting it changes
-//! nothing today. "Put files on me" is byte `5`, a value no reader has used, so an
-//! older reader cannot read a file-ingress grant as permission to take files.
+//! "take files from me" is a peer fetching one from it. "Put files on me" is byte `5`, a
+//! value no reader has used, so an older reader cannot read a file-ingress grant as
+//! permission to take files.
 //!
 //! The automatic default at a pair's coming-into-being is "write to me" and nothing
 //! else: it covers messages and the addressed reply, and it never authorises a file
@@ -81,16 +79,13 @@ use crate::peer::tlv;
 /// account, instance or assistant name the product supplies.
 pub const MAX_LABEL_BYTES: usize = 128;
 
-/// The bytes a [`Fact`] opens with. Its version and fields are stated where it is
-/// encoded, below.
+/// The bytes a [`Fact`] opens with.
 const FACT_MAGIC: &[u8] = b"mahbot-peer-binding";
 
-/// The fact format this build writes. A fact of a higher version is read as this
-/// version's prefix: its known fields are read and its unknown ones are ignored,
-/// because a fact is never rewritten by the receiver.
+/// The fact format this build writes.
 const FACT_VERSION: u8 = 1;
 
-/// The fact's field tags. Unknown tags are ignored, not refused.
+/// The fact's field tags.
 mod fact_tag {
     pub const ACCOUNT: u8 = 0x01;
     pub const INSTANCE: u8 = 0x02;
@@ -223,8 +218,7 @@ impl fmt::Display for Label {
 
 /// Define a role's label: the product's own word for one role, kept a distinct type so
 /// an account cannot be passed where an instance is meant. The crate never reads one to
-/// decide anything; a role label is shown, and nothing else. The first argument names
-/// the role in the accessors' docs.
+/// decide anything; a role label is shown, and nothing else.
 macro_rules! label_role {
     ($role:literal, $(#[$doc:meta])* $name:ident) => {
         $(#[$doc])*
@@ -349,7 +343,7 @@ impl Capability {
     pub const TAKE_FILES: Self = Self(2);
     /// Work on me: run a tool, act on this machine.
     pub const WORK: Self = Self(3);
-    /// See the screen: one capability covering watching and acting.
+    /// See the screen: one capability covering watching and acting. Inert: nothing serves it.
     pub const SEE_SCREEN: Self = Self(4);
     /// Put files on me: a peer lands a file on this machine, through
     /// [`crate::peer::transfer`]. Never granted by the default.
@@ -359,10 +353,6 @@ impl Capability {
     pub const PUT_FILES: Self = Self(5);
 
     /// Every capability this build knows, in the order the plan lists them.
-    ///
-    /// A product shows this list to a person; a case that has to cover "no other
-    /// capability" iterates it instead of naming the others by hand, so a sixth
-    /// capability cannot slip past either.
     pub const ALL: [Self; 5] = [
         Self::WRITE,
         Self::TAKE_FILES,
@@ -388,10 +378,6 @@ impl Capability {
     }
 
     /// The capability a stored byte names, known or not.
-    ///
-    /// Only a decoder uses this: a right or an audit entry a newer build wrote for a
-    /// capability this build does not know is kept and shown as "capability N", and no
-    /// question this build can ask matches it.
     pub(crate) const fn from_raw(byte: u8) -> Self {
         Self(byte)
     }
@@ -486,8 +472,7 @@ pub struct Right {
 }
 
 impl Right {
-    /// A right as a write builds it. The record's store is the only caller that
-    /// publishes one, and [`crate::peer::rights`] is the only caller of the store.
+    /// A right as a write builds it.
     pub(crate) fn new(
         assistant: Label,
         capability: Capability,
@@ -757,9 +742,6 @@ pub struct Claim {
 
 impl Claim {
     /// The fact the deciding machine sent, as this build read it.
-    ///
-    /// A claim is a fact and nothing else: the account, the instance, the assistant and
-    /// the moment are [`Fact`]'s, and this type adds only the machine it came from.
     #[must_use]
     pub const fn fact(&self) -> &Fact {
         &self.fact
